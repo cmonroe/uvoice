@@ -31,8 +31,9 @@ for archive in /tmp/uvoice/calltrace/*.tar.gz; do
 	# The library can exit when no bundle directory exists.
 	(my_cp_file "$archive")
 done
+# No archive is the normal state and no omission. A line in OMITTED.txt marks
+# the bundle as truncated.
 if [ "$found" = 0 ]; then
 	printf 'no completed call trace available\n'
-	techlog_omit 'no completed call trace available'
 fi
 exit 0

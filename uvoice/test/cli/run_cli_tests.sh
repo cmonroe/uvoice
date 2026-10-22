@@ -2802,24 +2802,23 @@ calltrace_wire_tests
 
 calltrace_techlog_test() {
 	if ! command -v bash >/dev/null 2>&1; then
-		skip 'calltrace/techlog records an absent archive' 'no bash command'
+		skip 'calltrace/techlog notes absent archive, omits nothing' \
+			'no bash command'
 		return
 	fi
 	mkdir -p /usr/srg/scripts/techlog /tmp/uvoice/calltrace "$tmp/no-traces"
 	mount --bind "$tmp/no-traces" /tmp/uvoice/calltrace ||
 		bail 'cannot isolate completed archives for techlog'
-	ct_techlog_rec=$tmp/techlog.omissions
-	export ct_techlog_rec
 	cat > /usr/srg/scripts/techlog/techlog.src <<'EOF'
 techlog_cmd_capture() { return 0; }
 my_cp_file() { return 0; }
-techlog_omit() { printf '%s\n' "$*" >> "$ct_techlog_rec"; }
+techlog_omit() { printf 'OMITTED: %s\n' "$*"; }
 EOF
 	bash "$uvoice_dir/files/techlog-uvoice.sh" > "$tmp/techlog.out" 2>&1
 	ct_techlog_rc=$?
-	check_eq 'calltrace/techlog records an absent archive' \
+	check_eq 'calltrace/techlog notes absent archive, omits nothing' \
 		'0 no completed call trace available' \
-		"$ct_techlog_rc $(cat "$ct_techlog_rec" 2>/dev/null)"
+		"$ct_techlog_rc $(cat "$tmp/techlog.out")"
 	umount /tmp/uvoice/calltrace || bail 'cannot release the techlog fixture'
 }
 calltrace_techlog_test
