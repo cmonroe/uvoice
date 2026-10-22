@@ -1203,8 +1203,8 @@ static void region_profile_print(const struct udsp_region *r)
 	       cid->ack_timeout_ms);
 	printf("seizure_bits = %u\nmark_bits = %u\n", cid->seizure_bits,
 	       cid->mark_bits);
-	printf("dtas_ms = %u\nrpas_ms = %u\nlr_pause_ms = %u\n", cid->dtas_ms,
-	       cid->rpas_ms, cid->lr_pause_ms);
+	printf("dtas_ms = %u\nrpas_ms = %u\nlr_pause_ms = %u\nring_gap_ms = %u\n",
+	       cid->dtas_ms, cid->rpas_ms, cid->lr_pause_ms, cid->ring_gap_ms);
 	printf("\n[hook]\npulse_enable = %s\npulse_invert = %s\n",
 	       h->pulse_enable ? "on" : "off", h->pulse_invert ? "on" : "off");
 	printf("debounce_ms = %u\n", h->debounce_ms);

@@ -259,6 +259,7 @@ static void golden_test(void)
 	CHECK_UINT(r.cid.dtas_ms, LINE_DTAS_MS);
 	CHECK_UINT(r.cid.rpas_ms, LINE_RPAS_MS);
 	CHECK_UINT(r.cid.lr_pause_ms, LINE_LR_PAUSE_MS);
+	CHECK_UINT(r.cid.ring_gap_ms, LINE_RING_GAP_MS);
 
 	CASE("USA hook timing");
 	CHECK(r.hook.pulse_enable);
@@ -335,6 +336,7 @@ static void gbr_golden_test(void)
 	CHECK_UINT(r.cid.mwi_format, UDSP_CIDF_ETSI_LR_DTAS);
 	CHECK_UINT(r.cid.lr_pause_ms, 250);
 	CHECK_UINT(r.cid.dtas_ms, 100);
+	CHECK_UINT(r.cid.ring_gap_ms, 250);
 	CHECK(!r.hook.pulse_enable);
 	CHECK_UINT(r.hook.flash_min_ms, 35);
 	CHECK_UINT(r.hook.flash_max_ms, 145);
@@ -880,6 +882,17 @@ static void then_key_test(void)
 	CASE("an explicit dtas_ms overrides the default");
 	CHECK_UINT(work_parse(&r, &err), 0);
 	CHECK_UINT(r.cid.dtas_ms, 120);
+
+	memset(&r, 0, sizeof(r));
+	work_reset();
+	CHECK(work_replace("[cid]\nformat", "[cid]\nring_gap_ms = 300\nformat"));
+	CASE("an explicit ring_gap_ms overrides the default");
+	CHECK_UINT(work_parse(&r, &err), 0);
+	CHECK_UINT(r.cid.ring_gap_ms, 300);
+
+	work_reset();
+	CHECK(work_replace("[cid]\nformat", "[cid]\nring_gap_ms = 10\nformat"));
+	error_case("a ring_gap_ms under the floor is an error", "bad ring_gap_ms");
 
 	work_reset();
 	CHECK(work_replace("mark_bits = 180", "mark_bits = 180\nbogus_cid = 1"));

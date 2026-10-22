@@ -15,7 +15,10 @@
  * The CID window opens in the break whose index equals cid_at_ring, holds the
  * cadence, and closes when the sequencer raises gate->complete or when the
  * liveness cap runs out. Holding the break is the only correct behaviour: the
- * next burst must not cut the message.
+ * next burst must not cut the message. A window before the first burst leaves
+ * a gap in the gate, and the close turns phase 0 into a break of that length:
+ * the standards need ringing 200 ms or more after the data, and phase 0 is
+ * otherwise zero-length.
  *
  * The cap is not a caller timing. cid_wait_ms is the delay from the break to
  * the burst, a phase the sequencer runs inside this window; reading it as the
@@ -62,6 +65,7 @@ static void ring_end(struct line_ring *r, uint32_t now_ms,
 	if (gate) {
 		gate->request = false;
 		gate->complete = false;
+		gate->gap_ms = 0;
 	}
 	r->stage = LINE_RING_OFF;
 	r->cid_open = false;
@@ -133,6 +137,10 @@ static void cid_window_run(struct line_ring *r, uint32_t now_ms,
 	r->cid_done = true;
 	gate->request = false;
 	gate->complete = false;
+	if (r->bursts == 0 && gate->gap_ms) {
+		r->phase_ms = now_ms;
+		r->phase_len_ms = gate->gap_ms;
+	}
 }
 
 static void silence_run(struct line_ring *r, uint32_t now_ms,
@@ -196,6 +204,7 @@ int line_ring_start(struct line_ring *r, const struct udsp_ring *cfg, uint32_t n
 	if (gate) {
 		gate->request = false;
 		gate->complete = false;
+		gate->gap_ms = 0;
 	}
 	line_ring_tick(r, now_ms, NULL, gate, out);
 	return 0;

@@ -37,7 +37,9 @@
  * machine raises request at the CID point and holds the break. The sequencer
  * runs and raises complete. The ring machine sees complete on the next tick and
  * resumes. That resume costs one tick, 10 ms, against a break measured in
- * seconds, and it keeps the two modules independent.
+ * seconds, and it keeps the two modules independent. The sequencer also leaves
+ * gap_ms in the gate, and a window that opened before the first burst makes
+ * the ring machine hold burst 1 for that long after the close.
  *
  *
  * 4. Timing boundaries. Every window is inclusive at both ends. An open of
@@ -84,6 +86,15 @@
 #define LINE_DTAS_MS		100	/* EN 300 659-1 DT-AS 88..110 ms */
 #define LINE_RPAS_MS		250	/* EN 300 659-1 RP-AS pulse 200..300 ms */
 #define LINE_LR_PAUSE_MS	250	/* SIN 227 line reversal to DT-AS gap */
+/*
+ * The break between the close of a caller identity window before the first
+ * burst and that burst. SIN 227 puts ringing more than 200 ms after the V.23
+ * signals, and EN 300 659-1 T2 bounds the gap at 200 to 500 ms. On the line
+ * the gap gains the playback drain before burst-done and the handshake tick
+ * plus the SLIC write after it, about 80 ms measured, so 250 falls near
+ * 330 ms, inside the ETSI window at both ends.
+ */
+#define LINE_RING_GAP_MS	250
 /*
  * What a pre-message pause adds when a relay-off starts it: a ring burst that
  * ends the break, or the RP-AS pulse. The sequencer times the pause from the
@@ -185,10 +196,11 @@ struct udsp_region_ring {
 	uint8_t first_count;
 };
 
-/* dtas_ms, rpas_ms and lr_pause_ms are optional keys; a zero means the file
- * omitted them and the LINE_*_MS default applies. mwi_format is optional too,
- * but the parser folds an omitted key to format, so a parsed region always
- * carries a valid value. */
+/* dtas_ms, rpas_ms, lr_pause_ms and ring_gap_ms are optional keys. The parser
+ * fills an omitted key with its LINE_*_MS default before it returns a region,
+ * and the sequencer applies the same default to a zero in a region built in
+ * code. mwi_format is optional too, but the parser folds an omitted key to
+ * format, so a parsed region always carries a valid value. */
 struct udsp_region_cid {
 	uint8_t format;			/* enum udsp_cid_format */
 	uint8_t mwi_format;		/* enum udsp_cid_format */
@@ -199,6 +211,7 @@ struct udsp_region_cid {
 	uint16_t dtas_ms;
 	uint16_t rpas_ms;
 	uint16_t lr_pause_ms;
+	uint16_t ring_gap_ms;
 };
 
 struct udsp_region_hook {
@@ -533,6 +546,10 @@ struct line_cid_gate {
 	/* ring machine: the window opened in the break after a burst, so the
 	 * relay went off on the tick it opened (LINE_RING_TAIL_MS) */
 	bool after_burst;
+	/* sequencer: the break the ring machine holds between the close of
+	 * this window and burst 1, when the window opened before the first
+	 * burst (LINE_RING_GAP_MS); 0 holds nothing */
+	uint16_t gap_ms;
 };
 
 struct line_ring {

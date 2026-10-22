@@ -5,8 +5,8 @@
  * Author: Chad Monroe <chad.monroe@adtran.com>
  *
  * Region file parser. The grammar is fixed. It carries the optional keys [tone]
- * then, [cid] mwi_format, dtas_ms, rpas_ms and lr_pause_ms, and [hook]
- * pulse_enable and pulse_invert. The library never reads two keys: the
+ * then, [cid] mwi_format, dtas_ms, rpas_ms, lr_pause_ms and ring_gap_ms, and
+ * [hook] pulse_enable and pulse_invert. The library never reads two keys: the
  * required [hook] flash_service word exists for the region read-back, and only
  * udsp-cli reads the optional [ring] first cadence. The hook machine reads
  * [hook] pulse_invert to tag each pulse train it reports. This file is the
@@ -170,9 +170,10 @@ static const struct key_def hook_key_defs[] = {
 };
 
 /* format is bit 0 but takes a name, and the optional mwi_format takes the
- * same names, so cid_key_apply keeps both out of the table. The three alert
- * timings carry bit -1: they are optional and set no completeness bit, so an
- * absent key leaves a zero the sequencer defaults. */
+ * same names, so cid_key_apply keeps both out of the table. The four optional
+ * timings carry bit -1, three alert timings and the ring gap: they set no
+ * completeness bit, and an absent key leaves a zero that the completion block
+ * fills. */
 static const struct key_def cid_key_defs[] = {
 	{ "wait_ms", 1, 0, 5000,
 	  offsetof(struct udsp_region_cid, wait_ms) },
@@ -188,6 +189,8 @@ static const struct key_def cid_key_defs[] = {
 	  offsetof(struct udsp_region_cid, rpas_ms) },
 	{ "lr_pause_ms", -1, 20, 2000,
 	  offsetof(struct udsp_region_cid, lr_pause_ms) },
+	{ "ring_gap_ms", -1, 20, 2000,
+	  offsetof(struct udsp_region_cid, ring_gap_ms) },
 };
 
 const char *line_region_tone_name(enum udsp_tone tone)
@@ -971,7 +974,7 @@ static int region_check(struct parse_ctx *p)
 		return parse_fail(p, "missing [hook] section", NULL);
 	if (p->hook_keys != HOOK_KEYS_ALL)
 		return parse_fail(p, "missing [hook] key", hook_missing_key(p));
-	/* A parsed region is complete: the optional alert timings take their
+	/* A parsed region is complete: the optional timings take their
 	 * defaults here rather than at every use. */
 	if (!p->region.cid.dtas_ms)
 		p->region.cid.dtas_ms = LINE_DTAS_MS;
@@ -979,6 +982,8 @@ static int region_check(struct parse_ctx *p)
 		p->region.cid.rpas_ms = LINE_RPAS_MS;
 	if (!p->region.cid.lr_pause_ms)
 		p->region.cid.lr_pause_ms = LINE_LR_PAUSE_MS;
+	if (!p->region.cid.ring_gap_ms)
+		p->region.cid.ring_gap_ms = LINE_RING_GAP_MS;
 	if (!p->cid_mwi_seen)
 		p->region.cid.mwi_format = p->region.cid.format;
 	for (i = 1; i < UDSP_REGION_TONE_MAX; i++) {

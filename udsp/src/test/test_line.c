@@ -19,6 +19,7 @@
  * into the modulator stub, to prove that the record carries exactly those
  * bytes. The suite must therefore never link dsp/cid.c or dsp/fsk_mod.c.
  */
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -1464,6 +1465,7 @@ static void ring_cid_window_test(void)
 	CHECK_UINT(rec_stamp(cmd_find(0, LINE_CMD_LINEFEED)), 2100);
 	CHECK_UINT(rec_stamp(cmd_find(0, LINE_CMD_FSK)), 2100 + 500 + LINE_RING_TAIL_MS);
 	CHECK_UINT(rec_stamp(ev_find(0, UDSP_EV_CID_SENT)), 2910);
+	/* An after-burst window takes no ring gap: the break remainder is it. */
 	CHECK_UINT(rec_stamp(relay_nth(1, true)), 6100);
 	CHECK_UINT(ev_total(UDSP_EV_RING_START), 1);
 
@@ -1489,6 +1491,13 @@ static void ring_cid_window_test(void)
 	CHECK_UINT(rec_stamp(cmd_find(0, LINE_CMD_FSK)) -
 		   rec_stamp(cmd_find(0, LINE_CMD_LINEFEED)), 500);
 	CHECK(rec_stamp(relay_nth(0, true)) > rec_stamp(cmd_find(0, LINE_CMD_FSK)));
+	/* The restore and the event stay on the burst-done tick; the ring
+	 * machine then holds burst 1 for the gap after it closes the window. */
+	CHECK_UINT(rec_stamp(ev_find(0, UDSP_EV_CID_SENT)), 910);
+	CHECK_UINT(rec_stamp(cmd_find((unsigned)cmd_find(0, LINE_CMD_LINEFEED) + 1u,
+				      LINE_CMD_LINEFEED)), 910);
+	CHECK_UINT(rec_stamp(relay_nth(0, true)), 910 + 10 + LINE_RING_GAP_MS);
+	CHECK_UINT(ev_total(UDSP_EV_RING_START), 1);
 
 	/*
 	 * The cap is the liveness bound and nothing else: the burst here never
@@ -1514,6 +1523,24 @@ static void ring_cid_window_test(void)
 	CHECK(rec_stamp(ev_find(0, UDSP_EV_CID_SENT)) <= 7110);
 	CHECK((int8_t)journal[ev_find(0, UDSP_EV_CID_SENT)].u.event.u.cid_sent.status
 	      < 0);
+
+	/* The sequencer never reset, so the gate carries no gap when the cap
+	 * closes the window, and the burst follows the close at once. */
+	sim_init(&s, 10, false);
+	sim_to(&s, false, 90);
+	journal_reset();
+	ring_cfg_fill(&ring, 2000, 1000);
+	ring.cid_present = true;
+	ring.cid_at_ring = 0;
+	CHECK_UINT(line_cidseq_arm(&s.cid, UDSP_CID_TYPE1, &cid, &region,
+				   UDSP_LF_FWD_ACTIVE, true, LINE_CID_MWI_NONE, 0), 0);
+	ring_start_at(&s, &ring);
+	sim_to(&s, false, 9000);
+	CASE("a window the cap closes before the first burst takes no gap");
+	CHECK_UINT(rec_stamp(relay_nth(0, true)), 100 + LINE_CID_WINDOW_MAX_MS);
+	CHECK(rec_stamp(ev_find(0, UDSP_EV_CID_SENT)) <= 100 + LINE_CID_WINDOW_MAX_MS + 10);
+	CHECK(ev_find(0, UDSP_EV_CID_SENT) >= 0 &&
+	      (int8_t)journal[ev_find(0, UDSP_EV_CID_SENT)].u.event.u.cid_sent.status < 0);
 
 	/*
 	 * A delay the break cannot hold is refused at arm, not truncated at
@@ -1632,6 +1659,147 @@ static void ring_cid_multi_burst_test(void)
 	CHECK_UINT(rec_stamp(cmd_find(0, LINE_CMD_LINEFEED)), 5700);
 	CHECK_UINT(rec_stamp(cmd_find(0, LINE_CMD_FSK)), 5700 + 500 + LINE_RING_TAIL_MS);
 	CHECK_UINT(ev_total(UDSP_EV_CID_SENT), 1);
+}
+
+/*
+ * A window before the first burst, with the record and the ring of the caller:
+ * the session starts at 100, the sequence runs, and burst_done lands on the
+ * tick after done_ms, so the restore and the event are stamped done_ms + 10.
+ */
+static void gap_run(struct line_sim *s, const struct udsp_region *region,
+		    const struct udsp_cid *cid, const struct udsp_ring *ring,
+		    uint32_t done_ms)
+{
+	sim_init(s, 10, false);
+	sim_to(s, false, 90);
+	journal_reset();
+	CHECK_UINT(line_cidseq_arm(&s->cid, UDSP_CID_TYPE1, cid, region,
+				   UDSP_LF_FWD_ACTIVE, true, LINE_CID_MWI_NONE, 0), 0);
+	ring_start_at(s, ring);
+	sim_to(s, false, done_ms);
+	line_cidseq_burst_done(&s->cid);
+}
+
+static int ring_end_state(void)
+{
+	int index = ev_find(0, UDSP_EV_RING_END);
+
+	return index >= 0 ? (int)journal[index].u.event.u.line.state : -1;
+}
+
+/*
+ * The gap between a window before the first burst and that burst, which the
+ * ring machine holds after the sequencer's restore (line.h LINE_RING_GAP_MS).
+ */
+static void ring_cid_gap_test(void)
+{
+	struct udsp_region region;
+	struct udsp_ring ring;
+	struct line_sim s;
+	struct udsp_cid cid;
+	int polarity, forward, relay, index;
+
+	region_test_fill(&region);
+	memset(&cid, 0, sizeof(cid));
+	cid.format = UDSP_CIDF_ETSI_LR_DTAS;
+	stub_msg_len = 20;
+	ring_cfg_fill(&ring, 400, 200);
+	ring.cid_present = true;
+	ring.cid_at_ring = 0;
+
+	gap_run(&s, &region, &cid, &ring, 1200);
+	sim_to(&s, false, 1210);
+	CASE("lr-dtas before the first burst restores, then the ring waits for the gap");
+	polarity = cmd_find(0, LINE_CMD_POLARITY);
+	CHECK_UINT(rec_stamp(polarity), 100);
+	CHECK_UINT(rec_stamp(cmd_find(0, LINE_CMD_TONE)), 100 + LINE_LR_PAUSE_MS);
+	CHECK_UINT(rec_stamp(cmd_find(0, LINE_CMD_FSK)),
+		   100 + LINE_LR_PAUSE_MS + LINE_DTAS_MS + 500);
+	forward = cmd_find((unsigned)(polarity >= 0 ? polarity : 0) + 1u,
+			   LINE_CMD_POLARITY);
+	CHECK(forward >= 0);
+	CHECK_UINT(rec_stamp(forward), 1210);
+	CHECK_UINT(journal[forward >= 0 ? forward : 0].u.cmd.u.polarity.state,
+		   UDSP_POL_FORWARD);
+	index = ev_find(0, UDSP_EV_CID_SENT);
+	CHECK_UINT(rec_stamp(index), 1210);
+	CHECK_UINT(journal[index >= 0 ? index : 0].u.event.u.cid_sent.status, 0);
+	CHECK(!line_cidseq_busy(&s.cid));
+	CHECK(relay_nth(0, true) < 0);
+	sim_to(&s, false, 2000);
+	relay = relay_nth(0, true);
+	CHECK_UINT(rec_stamp(relay), 1210 + 10 + LINE_RING_GAP_MS);
+	CHECK(forward >= 0 && relay > forward);
+	CHECK_UINT(ev_total(UDSP_EV_RING_START), 1);
+
+	region.cid.ring_gap_ms = 400;
+	gap_run(&s, &region, &cid, &ring, 1200);
+	sim_to(&s, false, 2000);
+	CASE("a region ring_gap_ms replaces the default");
+	CHECK_UINT(rec_stamp(relay_nth(0, true)), 1210 + 10 + 400);
+	region.cid.ring_gap_ms = 0;
+
+	cid.format = UDSP_CIDF_BELLCORE_FSK;
+	ring_cfg_fill(&ring, 2000, 4000);
+	ring.cid_present = true;
+	ring.cid_at_ring = 0;
+
+	gap_run(&s, &region, &cid, &ring, 900);
+	sim_to(&s, true, 1100);
+	CASE("an off-hook edge inside the gap trips the ring with one event");
+	CHECK_UINT((unsigned)ring_end_state(), LINE_RING_ANSWERED);
+	index = ev_find(0, UDSP_EV_RING_END);
+	CHECK_UINT(journal[index >= 0 ? index : 0].u.event.u.line.ring_count, 0);
+	CHECK_UINT(ev_total(UDSP_EV_RING_START), 0);
+	CHECK_UINT(ev_total(UDSP_EV_CID_SENT), 1);
+	CHECK_UINT(cmd_total(LINE_CMD_LINEFEED), 2);
+	CHECK(relay_balanced());
+
+	gap_run(&s, &region, &cid, &ring, 900);
+	sim_to(&s, false, 1000);
+	line_ring_stop(&s.ring, s.now, LINE_RING_STOPPED, &s.gate, &s.out);
+	journal_drain(&s.out);
+	sim_to(&s, false, 2000);
+	CASE("a ring stop inside the gap ends the session with one event");
+	CHECK_UINT((unsigned)ring_end_state(), LINE_RING_STOPPED);
+	CHECK_UINT(ev_total(UDSP_EV_RING_START), 0);
+	CHECK_UINT(ev_total(UDSP_EV_CID_SENT), 1);
+
+	/* The shape of a failed restore write: the engine aborts the sequence,
+	 * which is idle, so the call returns and the ring keeps its break. */
+	gap_run(&s, &region, &cid, &ring, 900);
+	sim_to(&s, false, 1000);
+	line_cidseq_abort(&s.cid, -EIO, s.now, &s.gate, &s.out);
+	journal_drain(&s.out);
+	sim_to(&s, false, 2000);
+	CASE("an engine abort inside the gap changes nothing");
+	CHECK_UINT(ev_total(UDSP_EV_CID_SENT), 1);
+	CHECK_UINT(rec_stamp(relay_nth(0, true)), 910 + 10 + LINE_RING_GAP_MS);
+
+	ring.duration_ms = 1000;
+	gap_run(&s, &region, &cid, &ring, 900);
+	sim_to(&s, false, 2000);
+	CASE("the duration cap inside the gap ends the session with no burst");
+	CHECK_UINT((unsigned)ring_end_state(), LINE_RING_EXPIRED);
+	CHECK_UINT(rec_stamp(ev_find(0, UDSP_EV_RING_END)), 1100);
+	CHECK_UINT(ev_total(UDSP_EV_RING_START), 0);
+	CHECK_UINT(ev_total(UDSP_EV_CID_SENT), 1);
+	ring.duration_ms = 0;
+
+	/* sim_init zeroes the gate, so only a second session on the same
+	 * simulator shows that the session start and end clear the gap. */
+	gap_run(&s, &region, &cid, &ring, 900);
+	sim_to(&s, false, 2000);
+	CHECK_UINT(rec_stamp(relay_nth(0, true)), 910 + 10 + LINE_RING_GAP_MS);
+	line_ring_stop(&s.ring, s.now, LINE_RING_STOPPED, &s.gate, &s.out);
+	journal_drain(&s.out);
+	CHECK_UINT(line_cidseq_arm(&s.cid, UDSP_CID_TYPE1, &cid, &region,
+				   UDSP_LF_FWD_ACTIVE, true, LINE_CID_MWI_NONE, 0), 0);
+	ring_start_at(&s, &ring);
+	sim_to(&s, false, 8000);
+	CASE("a new session clears the gap of the last one");
+	CHECK_UINT(rec_stamp(relay_nth(1, true)), 2010 + LINE_CID_WINDOW_MAX_MS);
+	CHECK_UINT(ev_total(UDSP_EV_CID_SENT), 2);
 }
 
 /* --- CID sequencer cases --- */
@@ -1753,6 +1921,12 @@ static void cid_lr_dtas_test(void)
 	CHECK(polarity >= 0);
 	CHECK_UINT(journal[polarity >= 0 ? polarity : 0].u.cmd.u.polarity.state,
 		   UDSP_POL_FORWARD);
+	/* A standalone burst owns no window: the simulator passes a gate, as
+	 * the engine does, and the sequence leaves no gap in it. */
+	CHECK_UINT(rec_stamp(polarity), 1210);
+	CHECK_UINT(rec_stamp(ev_find(0, UDSP_EV_CID_SENT)), 1210);
+	CHECK_UINT(s.gate.gap_ms, 0);
+	CHECK(!line_cidseq_busy(&s.cid));
 }
 
 static void cid_rpas_test(void)
@@ -2103,6 +2277,7 @@ int main(void)
 	ring_restart_test();
 	ring_cid_window_test();
 	ring_cid_multi_burst_test();
+	ring_cid_gap_test();
 	cid_bellcore_test();
 	cid_lr_dtas_test();
 	cid_rpas_test();

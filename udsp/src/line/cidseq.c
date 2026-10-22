@@ -18,6 +18,10 @@
  *   dtmf-dtas               OHT + DT-AS -> wait_ms -> DTMF string
  *   ntt                     reversal + OHT -> wait_ms -> FSK
  *
+ * A chain that runs before the first ring leaves a ring gap in the gate when it
+ * ends (seq_reset), and the ring machine holds burst 1 for it: the region
+ * ring_gap_ms, or LINE_RING_GAP_MS.
+ *
  * Type 2 (UDSP_CID_TYPE2) runs mid-call: mute -> CAS -> acknowledgement window
  * -> FSK on the type 2 profile (no channel seizure) -> unmute. The far end must
  * hear none of it, so the mute records bracket the whole sequence. This module
@@ -148,8 +152,13 @@ static void seq_reset(struct line_cidseq *c, struct line_cid_gate *gate)
 	c->step = LINE_CID_IDLE;
 	c->burst_done = false;
 	c->ack_seen = false;
-	if (gate)
-		gate->complete = true;
+	if (!gate)
+		return;
+	/* The engine passes the gate to a standalone sequence too; only the
+	 * sequence that owns the window leaves the gap. */
+	if (c->wait_ring)
+		gate->gap_ms = cfg_ms(c->cfg.ring_gap_ms, LINE_RING_GAP_MS);
+	gate->complete = true;
 }
 
 static void seq_finish(struct line_cidseq *c, int status, uint32_t now_ms,

@@ -1104,7 +1104,8 @@ static bool tc_up(struct eh *t, const char *region)
  * A region whose caller-identity burst is short enough that the whole type 1
  * sequence still fits in the fake's 64-row journal, which the 10 ms hook poll
  * otherwise fills in well under a second. Only the [cid] timings move; every
- * tone and the hook plan stay the shipped USA ones.
+ * tone and the hook plan stay the shipped USA ones. The ring gap is shortened
+ * for the same reason; test_region asserts its production default.
  *
  * wait_ms is a parameter because the [cid] pre-message pause is the one timing
  * a case may need at its shipped value: a caller delay equal to that pause is
@@ -1153,7 +1154,7 @@ static bool tc_region_make(unsigned wait_ms)
 
 	const struct region_edit edit[] = {
 		{ NULL, "seizure_bits = 300", "seizure_bits = 0  " },
-		{ NULL, "mark_bits = 180", "mark_bits = 20 " },
+		{ NULL, "mark_bits = 180", "mark_bits = 20\nring_gap_ms = 20" },
 		{ NULL, "wait_ms = 500", wait_to },
 		{ NULL, "iso3 = USA", "iso3 = FST" },
 	};
