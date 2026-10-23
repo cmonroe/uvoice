@@ -78,7 +78,9 @@ static uint64_t reg_now(const struct sip_reg *reg)
 }
 
 static void attempt_start(struct sip_reg *reg);
-static void reg_fail(struct sip_reg *reg, uint32_t code, uint32_t delay_s, bool credential);
+static void reg_fail(struct sip_reg *reg, uint32_t code,
+		     enum sip_reg_fail_origin origin, uint32_t delay_s,
+		     bool credential);
 static void rebind_giveup(struct sip_reg *reg);
 
 /* the removal a Contact correction deferred, which no longer has an owner */
@@ -840,7 +842,7 @@ static void attempt_resend(struct sip_reg *reg)
 	if (attempt_send(reg))
 		return;
 
-	reg_fail(reg, 503, 0, false);
+	reg_fail(reg, 503, SIP_REG_FAIL_TRANSPORT, 0, false);
 }
 
 /*
@@ -1066,7 +1068,9 @@ static void old_contact_giveup(struct sip_reg *reg, uint32_t code)
 		  "the old binding expires on its own", code);
 }
 
-static void reg_fail(struct sip_reg *reg, uint32_t code, uint32_t delay_s, bool credential)
+static void reg_fail(struct sip_reg *reg, uint32_t code,
+		     enum sip_reg_fail_origin origin, uint32_t delay_s,
+		     bool credential)
 {
 	/* A delay that arrived with the failure is one the server named, and
 	 * the credential backoff protects the account; the ladder is ours. */
@@ -1134,6 +1138,7 @@ static void reg_fail(struct sip_reg *reg, uint32_t code, uint32_t delay_s, bool 
 
 	reg->retry_fixed = fixed;
 	reg->next_retry_s = delay_s;
+	reg->fail_origin = origin;
 	reg_trace(reg, "failed with %u, next attempt in %u s", code, delay_s);
 	if (reg->cb.failed)
 		reg->cb.failed(reg, code, delay_s, reg->priv);
@@ -1159,6 +1164,7 @@ static void rebind_giveup(struct sip_reg *reg)
 	timer_arm(reg, SIP_REG_T_RETRY, delay);
 	reg->retry_fixed = false;
 	reg->next_retry_s = delay;
+	reg->fail_origin = SIP_REG_FAIL_RESPONSE;
 	reg_trace(reg, "contact moved %u times in a row, backing off %u s", reg->rebind_run,
 		  delay);
 
@@ -1446,7 +1452,7 @@ static void resp_auth(struct sip_reg *reg, const struct sip_msg *msg, uint32_t c
 	}
 
 	if (!resend) {
-		reg_fail(reg, code, 0, true);
+		reg_fail(reg, code, SIP_REG_FAIL_RESPONSE, 0, true);
 		return;
 	}
 
@@ -1464,19 +1470,19 @@ static void resp_min_expires(struct sip_reg *reg, const struct sip_msg *msg)
 	 */
 	if (reg->unregistering || reg->removing) {
 		reg_trace(reg, "423 to a REGISTER that removes a binding");
-		reg_fail(reg, 423, 0, false);
+		reg_fail(reg, 423, SIP_REG_FAIL_RESPONSE, 0, false);
 		return;
 	}
 
 	if (!hdr_uint_get(msg, SIP_HDR_MIN_EXPIRES, &min) || !min) {
 		reg_trace(reg, "423 without a usable Min-Expires");
-		reg_fail(reg, 423, 0, false);
+		reg_fail(reg, 423, SIP_REG_FAIL_RESPONSE, 0, false);
 		return;
 	}
 
 	if (min <= reg->req_expires || reg->min_expires_retry >= SIP_REG_MIN_EXPIRES_MAX) {
 		reg_trace(reg, "423 makes no progress at %u s", min);
-		reg_fail(reg, 423, 0, false);
+		reg_fail(reg, 423, SIP_REG_FAIL_RESPONSE, 0, false);
 		return;
 	}
 
@@ -1496,7 +1502,7 @@ static void resp_unavailable(struct sip_reg *reg, const struct sip_msg *msg)
 	if (!hdr_retry_after_get(msg, &secs, NULL))
 		secs = 0;
 
-	reg_fail(reg, 503, secs, false);
+	reg_fail(reg, 503, SIP_REG_FAIL_RESPONSE, secs, false);
 }
 
 /*
@@ -1584,7 +1590,7 @@ void sip_reg_txn_resp(struct sip_reg *reg, uint32_t txn, const struct sip_msg *m
 	else if (code == 503)
 		resp_unavailable(reg, msg);
 	else
-		reg_fail(reg, code, 0, code == 403);
+		reg_fail(reg, code, SIP_REG_FAIL_RESPONSE, 0, code == 403);
 
 	retarget_settle(reg);
 }
@@ -1598,7 +1604,10 @@ void sip_reg_txn_done(struct sip_reg *reg, uint32_t txn, enum sip_txn_reason rea
 	if (reason == SIP_TXN_DONE_TIMEOUT)
 		reg->stat.timeout++;
 
-	reg_fail(reg, reason == SIP_TXN_DONE_TRANSPORT ? 503 : 408, 0, false);
+	if (reason == SIP_TXN_DONE_TRANSPORT)
+		reg_fail(reg, 503, SIP_REG_FAIL_TRANSPORT, 0, false);
+	else
+		reg_fail(reg, 408, SIP_REG_FAIL_TIMEOUT, 0, false);
 	retarget_settle(reg);
 }
 
@@ -1780,6 +1789,11 @@ uint32_t sip_reg_expires(const struct sip_reg *reg)
 const char *sip_reg_contact(const struct sip_reg *reg)
 {
 	return reg->contact_uri;
+}
+
+enum sip_reg_fail_origin sip_reg_fail_origin(const struct sip_reg *reg)
+{
+	return reg->fail_origin;
 }
 
 const struct sip_txn_dst *sip_reg_binding_dst(const struct sip_reg *reg)

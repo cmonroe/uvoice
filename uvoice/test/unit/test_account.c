@@ -6960,6 +6960,7 @@ static const char *const fam_move_titles[] = {
 	"move: a failed IPv4 target that advances to IPv6 moves the line",
 	"move: an IPv4 address change does not re-register an IPv6 line",
 	"move: a move after a failed attempt sends nothing itself",
+	"move: the refused send warns once with the local 503 in words",
 	"move: and the retry timer carries the attempt in the new family",
 	"move: a line draining its Expires 0 stays where it is",
 	"move: a transport the new family cannot open leaves the Contact alone",
@@ -7195,12 +7196,20 @@ static void test_family_move(void)
 	uloop_run_timeout(20);
 	CHECK(!fam_peek(fam_fd6, wire, sizeof(wire)));
 	mark = fam_regs6;
+	warn_capture_begin();
 	CHECK(account_register_cmd(1));
 	CHECK(fam_is(1, "family", "ipv6"));
 	CHECK(fam_is(1, "state", "backoff"));
 	CHECK(!fam_peek(fam_fd4, wire, sizeof(wire)));
 	CHECK(!fam_peek(fam_fd6, wire, sizeof(wire)));
 	CHECK_UINT(fam_regs6, mark);
+
+	/* a bare 503 would read as a refusal by the registrar */
+	CASE(fam_move_titles[t++]);
+	CHECK_UINT(warn_capture_count("line 1 registration failed, send failed "
+				      "(local 503), next attempt in "), 1);
+	CHECK_UINT(warn_capture_count("line 1 registration failed, code"), 0);
+	warn_capture_end();
 
 	CASE(fam_move_titles[t++]);
 	CHECK(fam_count_wait(&fam_regs6, mark + 1));
@@ -9991,18 +10000,31 @@ static void test_flap_outage(void)
 	CHECK(fam_is(1, "state", "registered"));
 
 	/*
-	 * The outage puts line 1 in backoff: its attempt ends 640 ms after it
-	 * leaves and the ladder holds the next one for 20 s. The failure took
-	 * the binding with it, so the address change on top of that rebuilds
-	 * the line, and the attempt leaves with the answer of its resolution,
-	 * long before the ladder would have sent it.
+	 * The outage puts line 1 in backoff: timer F ends its attempt 640 ms
+	 * after it leaves, and the ladder holds the next one for 20 s. The
+	 * warning names the local timeout, because a bare code 408 reads as a
+	 * refusal by the registrar.
+	 */
+	CASE("flap: the timeout at a silent registrar warns of no response, "
+	     "not of code 408");
+	fam_registrar_answers(&fam_ufd4, false);
+	fam_drain(fam_fd4);
+	warn_capture_begin();
+	status46_inject(V6_DEV2, "192.0.2.50", NULL, 0);
+	CHECK(fam_wait(1, "state", "backoff"));
+	CHECK_UINT(warn_capture_count("line 1 registration failed, no response "
+				      "(local timeout), next attempt in 20 s"),
+		   1);
+	CHECK_UINT(warn_capture_count("code 408"), 0);
+	warn_capture_end();
+
+	/*
+	 * The failure took the binding with it, so the address change on top
+	 * of that rebuilds the line, and the attempt leaves with the answer of
+	 * its resolution, long before the ladder would have sent it.
 	 */
 	CASE("flap: an address change while the line waits out its backoff "
 	     "registers at once");
-	fam_registrar_answers(&fam_ufd4, false);
-	fam_drain(fam_fd4);
-	status46_inject(V6_DEV2, "192.0.2.50", NULL, 0);
-	CHECK(fam_wait(1, "state", "backoff"));
 	fam_drain(fam_fd4);
 	status46_inject(V6_DEV2, "192.0.2.60", NULL, 0);
 	snprintf(want, sizeof(want), "<sip:5551001@192.0.2.60:%u>",

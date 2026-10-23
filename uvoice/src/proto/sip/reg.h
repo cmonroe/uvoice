@@ -189,6 +189,17 @@ enum sip_reg_state {
 const char *sip_reg_state_name(enum sip_reg_state state);
 
 /*
+ * The local codes 408 and 503 read as answers of a registrar, so a failure
+ * also names where it ended: in a final response, on timer F, or at a send
+ * the transport refused.
+ */
+enum sip_reg_fail_origin {
+	SIP_REG_FAIL_RESPONSE = 0,
+	SIP_REG_FAIL_TIMEOUT,
+	SIP_REG_FAIL_TRANSPORT,
+};
+
+/*
  * Every string must outlive the registration. reg.c copies nothing from here:
  * the account copies its configuration strings at start, and this struct is
  * that copy's address book.
@@ -234,6 +245,8 @@ struct sip_reg_cfg {
  * failed       an attempt failed. code is the SIP status, 408 for a timeout
  *              and 503 for a transport failure; retry_s is when the next
  *              attempt runs, 0 when there will not be one.
+ *              sip_reg_fail_origin() tells the two local codes from a
+ *              response that carried the same code.
  * rolled_back  a move failed and the selection went back to the server that
  *              holds the binding. The registration itself never went down, so
  *              this is no failure report: it tells an owner that followed the
@@ -328,6 +341,7 @@ struct sip_reg {
 	uint32_t granted;		/* accepted expiry of the live binding */
 	uint32_t fail_run;		/* consecutive failed attempts */
 	uint32_t next_retry_s;
+	enum sip_reg_fail_origin fail_origin;
 
 	/* the absolute deadline of the armed refresh, so a rollback re-arms
 	 * the refresh of the binding it goes back to where it stood */
@@ -510,6 +524,13 @@ void sip_reg_stop(struct sip_reg *reg, bool unregister);
 enum sip_reg_state sip_reg_state(const struct sip_reg *reg);
 uint32_t sip_reg_expires(const struct sip_reg *reg);
 const char *sip_reg_contact(const struct sip_reg *reg);
+
+/*
+ * The origin of the failure that the last failed() report carried. The cap of
+ * a Contact chase reads SIP_REG_FAIL_RESPONSE, because the registrar answered
+ * every request of the chase.
+ */
+enum sip_reg_fail_origin sip_reg_fail_origin(const struct sip_reg *reg);
 
 /*
  * The server whose 2xx granted the binding the line holds, or NULL when no

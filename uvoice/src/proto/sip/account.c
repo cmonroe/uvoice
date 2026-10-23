@@ -1134,6 +1134,31 @@ static void reg_unregistered_cb(struct sip_reg *reg, void *priv)
 		vr.host->shutdown_done(vr.host->ctx);
 }
 
+/* A bare 408 or 503 reads as a refusal by the registrar, so the warning names
+ * the two local failures in words. */
+static void acct_reg_fail_log(const struct account *a,
+			      enum sip_reg_fail_origin origin, uint32_t code,
+			      uint32_t retry_s)
+{
+	switch (origin) {
+	case SIP_REG_FAIL_TIMEOUT:
+		ULOG_WARN("line %u registration failed, no response "
+			  "(local timeout), next attempt in %u s\n",
+			  a->line, retry_s);
+		return;
+	case SIP_REG_FAIL_TRANSPORT:
+		ULOG_WARN("line %u registration failed, send failed "
+			  "(local 503), next attempt in %u s\n",
+			  a->line, retry_s);
+		return;
+	case SIP_REG_FAIL_RESPONSE:
+		break;
+	}
+
+	ULOG_WARN("line %u registration failed, code %u, "
+		  "next attempt in %u s\n", a->line, code, retry_s);
+}
+
 static void reg_failed_cb(struct sip_reg *reg, uint32_t code, uint32_t retry_s, void *priv)
 {
 	struct account *a = priv;
@@ -1142,8 +1167,7 @@ static void reg_failed_cb(struct sip_reg *reg, uint32_t code, uint32_t retry_s, 
 
 	a->last_code = code;
 	a->refresh_at_ms = 0;
-	ULOG_WARN("line %u registration failed, code %u, next attempt in %u s\n", a->line,
-		  code, retry_s);
+	acct_reg_fail_log(a, sip_reg_fail_origin(reg), code, retry_s);
 	acct_reg_state_post(a->line, false, NULL, true);
 
 	/*

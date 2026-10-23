@@ -286,6 +286,19 @@ static void register_ok(void)
 	reply(200, NULL, "Expires: 3600\r\n");
 }
 
+static void contact_chase_run(void)
+{
+	unsigned int i;
+
+	for (i = 0; i <= SIP_REG_REBIND_MAX; i++) {
+		char via[64];
+
+		snprintf(via, sizeof(via), ";received=203.0.113.9;rport=%u",
+			 50001 + i);
+		reply(200, via, "Expires: 3600\r\n");
+	}
+}
+
 /* ------------------------------------------------------------ basic flow */
 
 static void flow_tests(void)
@@ -2541,6 +2554,71 @@ static void failure_tests(void)
 	CHECK_UINT(sip_reg_state(&reg), SIP_REG_BACKOFF);
 }
 
+/* -------------------------------------------------------- failure origin */
+
+/*
+ * A timeout and a refused send fail with the local codes 408 and 503, and a
+ * registrar can answer with both codes too. sip_reg_fail_origin() tells the
+ * owner where a failure ended, so the account's warning can name a local
+ * failure in words. Every case expects an origin other than the one that stood
+ * before the failure, so a failure that stores nothing fails the case.
+ */
+static void fail_origin_tests(void)
+{
+	CASE("origin: timer F reads as a local timeout");
+	fake_reset();
+	sip_reg_target_add(&reg, "192.0.2.10", 5060);
+	sip_reg_start(&reg);
+	fake_advance(32 * 1000 + 100);
+	CHECK_UINT(fk.failed, 1);
+	CHECK_UINT(fk.last_code, 408);
+	CHECK_UINT(sip_reg_fail_origin(&reg), SIP_REG_FAIL_TIMEOUT);
+
+	CASE("origin: a 403 after the timeout reads as a response");
+	fake_advance(6 * 1000);
+	reply(403, NULL, NULL);
+	CHECK_UINT(fk.failed, 2);
+	CHECK_UINT(fk.last_code, 403);
+	CHECK_UINT(sip_reg_fail_origin(&reg), SIP_REG_FAIL_RESPONSE);
+
+	CASE("origin: a refused first send reads as a transport failure");
+	fake_reset();
+	sip_reg_target_add(&reg, "192.0.2.10", 5060);
+	fk.send_fail = true;
+	sip_reg_start(&reg);
+	CHECK_UINT(fk.sends, 0);
+	CHECK_UINT(fk.failed, 1);
+	CHECK_UINT(fk.last_code, 503);
+	CHECK_UINT(sip_reg_fail_origin(&reg), SIP_REG_FAIL_TRANSPORT);
+
+	CASE("origin: a refused credential resend reads as a transport "
+	     "failure");
+	fake_reset();
+	sip_reg_target_add(&reg, "192.0.2.10", 5060);
+	sip_reg_start(&reg);
+	fk.send_fail = true;
+	reply(401, NULL, chal_2069());
+	CHECK_UINT(fk.sends, 1);
+	CHECK_UINT(fk.failed, 1);
+	CHECK_UINT(fk.last_code, 503);
+	CHECK_UINT(sip_reg_fail_origin(&reg), SIP_REG_FAIL_TRANSPORT);
+
+	/* the cap reports failed() outside the ordinary failure path */
+	CASE("origin: a Contact chase that reaches the cap after a timeout "
+	     "reads as a response");
+	fake_reset();
+	sip_reg_target_add(&reg, "192.0.2.10", 5060);
+	sip_reg_start(&reg);
+	fake_advance(32 * 1000 + 100);
+	CHECK_UINT(sip_reg_fail_origin(&reg), SIP_REG_FAIL_TIMEOUT);
+	fake_advance(6 * 1000);
+	contact_chase_run();
+	CHECK_UINT(reg.stat.rebind_capped, 1);
+	CHECK_UINT(fk.failed, 2);
+	CHECK_UINT(fk.last_code, 200);
+	CHECK_UINT(sip_reg_fail_origin(&reg), SIP_REG_FAIL_RESPONSE);
+}
+
 /* ------------------------------------------------------- retry on recovery */
 
 /*
@@ -2875,7 +2953,6 @@ static void lifetime_tests(void)
 static void sol_tests(void)
 {
 	struct req_info ri;
-	unsigned int i;
 
 	/*
 	 * A registrar that challenges first and a proxy in front of it that
@@ -2970,12 +3047,7 @@ static void sol_tests(void)
 	fake_reset();
 	sip_reg_target_add(&reg, "192.0.2.10", 5060);
 	sip_reg_start(&reg);
-	for (i = 0; i <= SIP_REG_REBIND_MAX; i++) {
-		char via[64];
-
-		snprintf(via, sizeof(via), ";received=203.0.113.9;rport=%u", 50001 + i);
-		reply(200, via, "Expires: 3600\r\n");
-	}
+	contact_chase_run();
 	CHECK_UINT(fk.sends, SIP_REG_REBIND_MAX + 1);
 	CHECK_UINT(fk.registered, 0);
 	CHECK_UINT(fk.failed, 1);
@@ -3783,6 +3855,7 @@ int main(void)
 	move_tests();
 	service_route_tests();
 	failure_tests();
+	fail_origin_tests();
 	retry_now_tests();
 	stop_tests();
 	sol_tests();
