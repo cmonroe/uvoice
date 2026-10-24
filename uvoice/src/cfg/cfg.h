@@ -30,6 +30,14 @@
 /* The 2 channel cap of the deployed schema. */
 #define CFG_CHANNEL_MAX		2
 #define CFG_STR_MAX		64
+
+#define CFG_STR_(x)	#x
+#define CFG_STR(x)	CFG_STR_(x)
+
+/* the schema default of keepalive_interval; the round of a udp line with
+ * keepalive off runs at this value too (proto/sip/keepalive.h
+ * SIP_KA_ROUND_DEFAULT_S), and account.c asserts the two equal */
+#define CFG_KEEPALIVE_INTERVAL_DEF	60
 /* tls_cert_path holds an FTP, HTTP or HTTPS URL, which outgrows CFG_STR_MAX */
 #define CFG_TLS_PATH_MAX	128
 #define CFG_HAL_PATH_MAX	128
@@ -481,7 +489,8 @@ struct cfg {
 	 */
 	bool srtp_enabled;
 	char region[CFG_STR_MAX];		/* default US */
-	/* accepted for D2, no effect in uvoice; cfg_dump() reports it */
+	/* accepted for the other voice stack, no effect in uvoice; cfg_dump()
+	 * reports it */
 	unsigned int restrict_source;
 	unsigned int options_interval;
 	unsigned int keepalive_interval;

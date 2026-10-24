@@ -40,7 +40,6 @@
 #include "cfg/cfg.h"
 #include "event.h"
 #include "hal/hal.h"
-#include "net/conntrack.h"
 #include "net/iface.h"
 #include "net/ports.h"
 #include "proto/proto.h"
@@ -111,9 +110,8 @@ static void base_default(void)
 }
 
 /*
- * The start and the reload of the account layer in the order main.c runs them
- * around the core services: the tracker takes the config first, then the
- * protocol does.
+ * Start and reload of the account layer in main.c order: the tracker takes the
+ * config first, then the protocol.
  */
 static void core_start(const struct cfg *cfg)
 {
@@ -680,140 +678,126 @@ static void test_apply_class(void)
 	base_default();
 }
 
-/* ------------------------------------- the refresher bound of a udp line */
-
-static unsigned int ct_file_read(const char *path, unsigned int def)
-{
-	FILE *f = fopen(path, "r");
-	unsigned int v;
-	int n;
-
-	if (!f)
-		return def;
-
-	n = fscanf(f, "%u", &v);
-	fclose(f);
-
-	return n == 1 ? v : def;
-}
-
-/* what the procfs read must answer on this host: the smaller of the two
- * values, with the shipped default in place of a file that is not there */
-static unsigned int ct_host_bound(void)
-{
-	unsigned int t = ct_file_read("/proc/sys/net/netfilter/"
-				      "nf_conntrack_udp_timeout", 60);
-	unsigned int s = ct_file_read("/proc/sys/net/netfilter/"
-				      "nf_conntrack_udp_timeout_stream", 180);
-
-	return t < s ? t : s;
-}
+/* --------------------------------------- the refresher round of a udp line */
 
 /*
- * The inbound service of a udp line depends on the conntrack entry and set
- * element of each pinged destination. Both last for the conntrack udp bound.
- * A udp line therefore refreshes its SIP tuple inside half the conntrack udp
- * bound, whatever the keepalive options say
- * (acct_ka_interval_effective). The test hook fixes the bound, so the
- * conntrack values of the host play no part. The derive log line is the
- * second observable, because derive returns a config and not a diagnosis.
+ * Inbound service of a udp line depends on the set element of each pinged
+ * destination, and only the round writes elements again. A udp line therefore
+ * runs its round whatever the keepalive options say
+ * (acct_ka_interval_effective): the configured interval with the pair on,
+ * SIP_KA_ROUND_DEFAULT_S with it off. The derive log line is a second
+ * observable, because derive returns a config and no diagnosis.
  */
-static void test_refresher_bound(void)
+static void test_refresher_rule(void)
 {
 	struct cfg_channel ch;
 	struct acct_cfg c, d;
 	bool forced;
 
-	net_ct_udp_bound_test_set(60, 180);
 	base_default();
 	chan_default(&ch, 0);
 	snprintf(ch.sip_username, sizeof(ch.sip_username), "5551000");
 	snprintf(ch.sip_proxy, sizeof(ch.sip_proxy), "sip.example.com");
 
-	CASE("bound: a udp line with a disabled keepalive is forced on at half "
-	     "the bound");
+	CASE("rule: a udp line with a disabled keepalive runs the 60 s default "
+	     "and says why");
 	base.keepalive_enabled = false;
 	base.keepalive_interval = 0;
 	base.options_interval = 0;
 	warn_capture_begin();
 	acct_cfg_derive(&base, &ch, &c);
-	CHECK_UINT(warn_capture_count("sip keepalive forced to 30 s"), 1);
-	CHECK_UINT(warn_capture_count("60 s conntrack udp timeout"), 1);
-	CHECK_UINT(acct_ka_interval_effective(&c, 60, &forced), 30);
+	CHECK_UINT(warn_capture_count("sip keepalive off: the round runs every "
+				      "60 s to keep its set elements"), 1);
+	CHECK_UINT(SIP_KA_ROUND_DEFAULT_S, 60);
+	CHECK_UINT(acct_ka_interval_effective(&c, &forced),
+		   SIP_KA_ROUND_DEFAULT_S);
 	CHECK(forced);
 
-	CASE("bound: a faster keepalive is kept");
+	CASE("rule: a disabled keepalive does not read its interval");
+	base.keepalive_interval = 300;
+	warn_capture_begin();
+	acct_cfg_derive(&base, &ch, &c);
+	CHECK_UINT(warn_capture_count("the round runs every 60 s"), 1);
+	CHECK_UINT(acct_ka_interval_effective(&c, &forced), 60);
+	CHECK(forced);
+
+	CASE("rule: an enabled keepalive runs its own interval");
 	base.keepalive_enabled = true;
 	base.keepalive_interval = 15;
 	warn_capture_begin();
 	acct_cfg_derive(&base, &ch, &c);
-	CHECK_UINT(warn_capture_count("sip keepalive forced"), 0);
-	CHECK_UINT(acct_ka_interval_effective(&c, 60, &forced), 15);
+	CHECK_UINT(warn_capture_count("sip keepalive off"), 0);
+	CHECK_UINT(acct_ka_interval_effective(&c, &forced), 15);
 	CHECK(!forced);
 
-	CASE("bound: a slower keepalive is clamped to half the bound");
-	base.keepalive_interval = 45;
+	CASE("rule: a slow enabled keepalive runs as written");
+	base.keepalive_interval = 300;
 	warn_capture_begin();
 	acct_cfg_derive(&base, &ch, &c);
-	CHECK_UINT(warn_capture_count("sip keepalive forced to 30 s"), 1);
-	CHECK_UINT(acct_ka_interval_effective(&c, 60, &forced), 30);
-	CHECK(forced);
+	CHECK_UINT(warn_capture_count("sip keepalive off"), 0);
+	CHECK_UINT(acct_ka_interval_effective(&c, &forced), 300);
+	CHECK(!forced);
 
-	CASE("bound: half the bound itself is no force");
-	base.keepalive_interval = 30;
+	/* keepalive.c caps its timer at SIP_KA_INTERVAL_MAX, so element timeout
+	 * and status must use the capped value */
+	CASE("rule: an interval over a day runs at the cap");
+	base.keepalive_interval = SIP_KA_INTERVAL_MAX + 1;
+	acct_cfg_derive(&base, &ch, &c);
+	CHECK_UINT(acct_ka_interval_effective(&c, &forced), SIP_KA_INTERVAL_MAX);
+	CHECK(!forced);
+	base.keepalive_interval = 2000000000u;
+	acct_cfg_derive(&base, &ch, &c);
+	CHECK_UINT(acct_ka_interval_effective(&c, &forced), SIP_KA_INTERVAL_MAX);
+
+	CASE("rule: an enabled keepalive of 0 s runs the default");
+	base.keepalive_interval = 0;
 	warn_capture_begin();
 	acct_cfg_derive(&base, &ch, &c);
-	CHECK_UINT(warn_capture_count("sip keepalive forced"), 0);
-	CHECK_UINT(acct_ka_interval_effective(&c, 60, &forced), 30);
-	CHECK(!forced);
-
-	CASE("bound: the clamp follows the bound it is given");
-	CHECK_UINT(acct_ka_interval_effective(&c, 180, &forced), 30);
-	CHECK(!forced);
-	CHECK_UINT(acct_ka_interval_effective(&c, 20, &forced), 10);
+	CHECK_UINT(warn_capture_count("the round runs every 60 s"), 1);
+	CHECK_UINT(acct_ka_interval_effective(&c, &forced), 60);
 	CHECK(forced);
 
-	/* the OPTIONS ping reaches the sticky target alone, so a fast one no
-	 * longer stands in for the round */
-	CASE("bound: a fast OPTIONS ping does not stand in for the keepalive");
+	/* an OPTIONS ping goes to the sticky target only, so it cannot replace
+	 * the round */
+	CASE("rule: a fast OPTIONS ping does not stand in for the keepalive");
 	base.keepalive_enabled = false;
 	base.options_interval = 20;
 	warn_capture_begin();
 	acct_cfg_derive(&base, &ch, &c);
-	CHECK_UINT(warn_capture_count("sip keepalive forced to 30 s"), 1);
+	CHECK_UINT(warn_capture_count("the round runs every 60 s"), 1);
 	CHECK_UINT(c.options_interval, 20);
 	base.options_interval = 0;
 	warn_capture_end();
 
 	/*
-	 * A stream line holds the pinhole with the connection itself and
-	 * refreshes it with SO_KEEPALIVE, so the udp bound does not apply and
-	 * the configured pair stands.
+	 * A stream line keeps its connection open with SO_KEEPALIVE, so it
+	 * needs no round and keeps the configured pair.
 	 */
-	CASE("bound: a tcp line keeps the pair off and says why");
+	CASE("rule: a tcp line keeps the pair off and says why");
 	base.keepalive_enabled = false;
 	base.keepalive_interval = 0;
 	snprintf(base.transport, sizeof(base.transport), "tcp");
 	warn_capture_begin();
 	acct_cfg_derive(&base, &ch, &c);
 	CHECK(!c.ka_enabled);
-	CHECK_UINT(warn_capture_count("sip keepalive forced"), 0);
+	CHECK_UINT(warn_capture_count("sip keepalive off"), 0);
 	CHECK_UINT(warn_capture_count("keepalive refreshes it"), 1);
 
-	CASE("bound: a tls line keeps a slow pair and reads the same");
+	CASE("rule: a tls line keeps a slow pair and reads the same");
 	snprintf(base.transport, sizeof(base.transport), "tls");
 	base.keepalive_enabled = true;
 	base.keepalive_interval = 300;
 	warn_capture_begin();
 	acct_cfg_derive(&base, &ch, &c);
 	CHECK_UINT(c.ka_interval, 300);
-	CHECK_UINT(warn_capture_count("sip keepalive forced"), 0);
+	CHECK_UINT(warn_capture_count("sip keepalive off"), 0);
 	CHECK_UINT(warn_capture_count("over tls"), 1);
 	warn_capture_end();
 	snprintf(base.transport, sizeof(base.transport), "udp");
 
-	/* uvoice accepts the D2 option and derives nothing from it */
-	CASE("bound: restrict_source moves no account field");
+	/* uvoice accepts the option for the other voice stack and derives
+	 * nothing from it */
+	CASE("rule: restrict_source moves no account field");
 	base.keepalive_enabled = false;
 	base.keepalive_interval = 0;
 	base.restrict_source = 1;
@@ -821,49 +805,10 @@ static void test_refresher_bound(void)
 	base.restrict_source = 0;
 	acct_cfg_derive(&base, &ch, &d);
 	CHECK(acct_apply_class(&c, &d) == ACCT_APPLY_NONE);
-	CHECK_UINT(acct_ka_interval_effective(&d, 60, &forced), 30);
+	CHECK_UINT(acct_ka_interval_effective(&d, &forced), 60);
 	base.restrict_source = 2;
 	acct_cfg_derive(&base, &ch, &d);
 	CHECK(acct_apply_class(&c, &d) == ACCT_APPLY_NONE);
-	base.restrict_source = 1;
-
-	CASE("bound: 1 s floors the keepalive at 1 s and warns");
-	net_ct_udp_bound_test_set(1, 180);
-	warn_capture_begin();
-	acct_cfg_derive(&base, &ch, &c);
-	CHECK_UINT(warn_capture_count("under a 1 s conntrack udp timeout"), 1);
-	CHECK_UINT(warn_capture_count("sip keepalive forced to 1 s"), 1);
-	CHECK_UINT(acct_ka_interval_effective(&c, 1, &forced), 1);
-	CHECK(forced);
-
-	CASE("bound: 2 s is the shortest bound the floor can meet");
-	net_ct_udp_bound_test_set(2, 180);
-	warn_capture_begin();
-	acct_cfg_derive(&base, &ch, &c);
-	CHECK_UINT(warn_capture_count("conntrack udp timeout:"), 0);
-	CHECK_UINT(warn_capture_count("sip keepalive forced to 1 s"), 1);
-	warn_capture_end();
-
-	CASE("bound: the smaller of the two timeouts is the bound");
-	net_ct_udp_bound_test_set(60, 20);
-	CHECK_UINT(net_ct_udp_bound_s(), 20);
-	net_ct_udp_bound_test_set(60, 180);
-	CHECK_UINT(net_ct_udp_bound_s(), 60);
-
-	CASE("bound: a timeout that cannot be read takes the shipped value");
-	net_ct_udp_bound_test_set(0, 500);
-	CHECK_UINT(net_ct_udp_bound_s(), 60);
-	net_ct_udp_bound_test_set(500, 0);
-	CHECK_UINT(net_ct_udp_bound_s(), 180);
-	net_ct_udp_bound_test_set(0, 500);
-	warn_capture_begin();
-	acct_cfg_derive(&base, &ch, &c);
-	CHECK_UINT(warn_capture_count("sip keepalive forced to 30 s"), 1);
-	warn_capture_end();
-
-	CASE("bound: the procfs read answers the files of this host");
-	net_ct_udp_bound_test_set(0, 0);
-	CHECK_UINT(net_ct_udp_bound_s(), ct_host_bound());
 
 	base_default();
 }
@@ -1039,10 +984,9 @@ static void test_derive_endpoint(void)
 /* --------------------------------------------------- the transport of a line */
 
 /*
- * Transport is base only (account.h). The base value is the only one that
- * reaches an account, and a channel that names another is reported and
- * ignored. It is the one option of the schema whose channel row is not an
- * alias, so the derive reports it.
+ * Transport is base only (account.h). It is the one schema option whose
+ * channel row is not an alias, so the derive reports a channel value that
+ * differs.
  */
 static void test_derive_transport(void)
 {
@@ -3581,7 +3525,6 @@ static void test_reg_events(void)
 
 /* ----------------------------------------------------- the pre-start window */
 
-/* every call the protocol made into the host table so far */
 static unsigned int phf_calls(void)
 {
 	unsigned int i, n = 0;
@@ -3599,11 +3542,11 @@ static unsigned int phf_calls(void)
  * that main.c holds. A build here would repeat over the same struct and drop
  * the first socket.
  *
- * Observable: the host table. A reload that reaches a line calls the core at
- * least once, for its recovery settle, and the fake counts each call.
- * The case is the last class of the pre-start window. The next
- * class, test_tls_cert_trigger(), calls accounts_start(), and no call clears
- * the vr.started flag that it sets.
+ * Observable: the host table. A reload past the start gate calls the core at
+ * least once, for its recovery settle, and the fake counts each call. This
+ * class is the last of the pre-start window: the next class,
+ * test_tls_cert_trigger(), calls accounts_start(), and nothing clears the
+ * vr.started flag that it sets.
  */
 static void test_early_reload(void)
 {
@@ -4277,8 +4220,8 @@ static void test_ipv6_gate(void)
  * It needs no ubus and no HAL. netifd_query() returns at once without a ubus
  * context, accounts_init() builds only the transport, the TLS holder, the
  * stream pool and the resolver, and account.c names no hal_ symbol anywhere.
- * The event publisher runs in its no-spawn test mode, the host fake records
- * the set elements and runs no nft, and the proxy is a literal, so the
+ * The event publisher runs in its no-spawn test mode, and the host fake
+ * records set elements and runs no nft. The proxy is a literal, so the
  * resolver delivers it without a lookup.
  *
  * uloop is driven one pass at a time. uloop_run_timeout() with a non-negative
@@ -4430,9 +4373,9 @@ static const char *registrar_extra;
 
 /*
  * Every udp line runs the CRLF round, so its pings reach the fake registrars
- * beside its requests. A ping is no request: the registrars read it away
- * before they read or count a request, and a case that asks about the
- * round reads the pings itself (ping_waiting(), fam_peek_raw()).
+ * beside its requests. A ping is no request: the registrar helpers discard
+ * pings before they read or count a request. A case that checks the round
+ * reads the pings itself (ping_waiting(), fam_peek_raw()).
  */
 static void fam_pings_drop(int fd)
 {
@@ -4538,9 +4481,9 @@ static unsigned int status_line0(char *state, size_t slen)
 }
 
 /*
- * Whether a request is waiting at the registrar, read without a uloop pass.
- * The window's timer is armed at 0, so a pass would fire it and close the
- * window; a peek answers "did a request leave the daemon" on the spot.
+ * Whether a request waits at the registrar, read without a uloop pass. The
+ * window's timer is armed at 0, so a pass would fire it and close the window.
+ * A peek answers at once whether a request left the daemon.
  */
 static bool registrar_pending(void)
 {
@@ -4870,7 +4813,6 @@ static bool fam_peek_raw(int fd, char *out, size_t olen)
 	return true;
 }
 
-/* the request waiting, with the pings ahead of it read away */
 static bool fam_peek(int fd, char *out, size_t olen)
 {
 	fam_pings_drop(fd);
@@ -4898,7 +4840,7 @@ static void fam_registrar_answers(struct uloop_fd *u, bool on)
 
 /*
  * Every datagram waiting at a socket, read and discarded, and how many of the
- * requests among them carried the text the caller asks about. A NULL needle
+ * requests among them carried the text the caller asks about. A NULL user
  * counts every request. Both lines of a fixture send to one registrar, so the
  * Contact user is what says which line a request came from.
  */
@@ -6709,9 +6651,8 @@ static struct blob_attr *table_find(struct blob_attr *tbl, const char *name)
 	return NULL;
 }
 
-/* one counter of the keepalive table of one line (account_ka_dump), 0 when
- * the line or the table is absent */
-/* a u32 member of the keepalive table, the shape interval and ct_bound use */
+/* one u32 member of the keepalive table of one line (interval), 0 when
+ * absent */
 static uint32_t ka_u32(unsigned int line, const char *key)
 {
 	struct blob_buf b;
@@ -6797,6 +6738,8 @@ static unsigned int status_array_count(unsigned int line, const char *key)
 	return count;
 }
 
+/* one counter of the keepalive table of one line (account_ka_dump), 0 when
+ * the line or the table is absent */
 static uint64_t ka_stat(unsigned int line, const char *key)
 {
 	struct blob_buf b;
@@ -6931,24 +6874,24 @@ static const char *const round_titles[] = {
 	"round: a moved answer pings at once and a redraw does not",
 	"round: a live dialog destination outside the set joins the round",
 	"round: and leaves it when the call ends",
-	"round: a bound that moves under the line re-arms inside the new one",
 	"round: an address change primes the udp line",
-	"round: a live keepalive reload reads the bound of the moment",
+	"round: a live keepalive reload moves the interval at once",
 };
 
 /*
- * The round of a udp line on the wire. The fixture has real
- * sockets, a loopback registrar of each family, a second IPv4 target and a
- * proxy that the answer never named. The test hook fixes the bound, so the
- * conntrack values of the host play no part. The changed answers that prepare the round
- * carry no re-register (dns_cache_update_mode off), so a REGISTER never sits
- * beside a ping. The mixed answer binds ::1, so the class skips by name
- * without an IPv6 loopback.
+ * The round of a udp line on the wire. The fixture has real sockets, a
+ * loopback registrar per family, a second IPv4 target and a proxy that no
+ * answer names. The keepalive pair is off, so the line runs the 60 s default
+ * round, and no timed round fires during the class. The changed answers that
+ * prepare the round carry no re-register (dns_cache_update_mode off), so no
+ * REGISTER arrives next to a ping. The mixed answer binds ::1, so the class
+ * skips by name on a host without IPv6 loopback.
  */
 static void test_refresher_round(void)
 {
 	static struct cfg live;
 	static struct cfg moved;
+	static struct cfg faster;
 	static struct cfg none;
 	static struct cfg parked;
 	struct sip_dns_result res;
@@ -7003,7 +6946,6 @@ static void test_refresher_round(void)
 
 	event_test_mode(true);
 	accounts_hal_features_set(HAL_FEAT_IPV6_MEDIA);
-	net_ct_udp_bound_test_set(60, 180);
 
 	base_default();
 	live = base;
@@ -7108,33 +7050,6 @@ static void test_refresher_round(void)
 	CHECK(!ping_waiting(second_fd));
 
 	/*
-	 * The bound moves under the running line, the way a conntrack reload
-	 * moves it. The round the next inject primes reads the new bound at
-	 * its index 0, says so, and re-arms one second out instead of thirty.
-	 */
-	CASE(round_titles[t++]);
-	net_ct_udp_bound_test_set(2, 180);
-	sent = ka_stat(0, "crlf_sent");
-	warn_capture_begin();
-	fam_answer(&res, v4pair, 2, true);	/* the growth primes the round */
-	acct_dns_result_inject(0, &res);
-	CHECK_UINT(warn_capture_count("conntrack udp timeout 60 s -> 2 s"), 1);
-	CHECK_UINT(warn_capture_count("sip keepalive every 1 s"), 1);
-	warn_capture_end();
-	CHECK_UINT(ka_stat(0, "crlf_sent"), sent + 2);
-	CHECK(ka_stat_wait(0, "crlf_sent", sent + 4));
-	/* the bound goes back, and the round after the next re-read runs
-	 * thirty seconds out again; the shrink then primes one more round and
-	 * puts the list back to the single target the cases below expect */
-	net_ct_udp_bound_test_set(60, 180);
-	sent = ka_stat(0, "crlf_sent");
-	CHECK(ka_stat_wait(0, "crlf_sent", sent + 2));
-	sent = ka_stat(0, "crlf_sent");
-	fam_answer(&res, v4only, 1, true);
-	acct_dns_result_inject(0, &res);
-	CHECK_UINT(ka_stat(0, "crlf_sent"), sent + 1);
-
-	/*
 	 * The IPv4 address moves. The rebind puts the socket on the new address
 	 * and the round runs at once, ahead of the REGISTER that refreshes the
 	 * binding of the line in place: the registrar reads the ping first.
@@ -7152,21 +7067,30 @@ static void test_refresher_round(void)
 	CHECK(fam_wait(0, "state", "registered"));
 
 	/*
-	 * A live reload of the keepalive options derives the interval from
-	 * the bound of the moment, not from the one the last round read, so
-	 * the timer it re-arms sits inside a bound that moved between rounds.
+	 * A live reload of the keepalive options derives the interval at once:
+	 * from the 60 s default (pair off) to 1 s, to 2 s and back to 60 s. The
+	 * status reads the interval of the re-armed timer. A reload to a longer
+	 * round sends a round now, because elements of the last round expire
+	 * before the re-armed timer fires. A reload to a shorter round waits.
 	 */
 	CASE(round_titles[t++]);
 	moved = live;
-	moved.keepalive_interval = 20;
-	net_ct_udp_bound_test_set(2, 180);
+	moved.keepalive_enabled = true;
+	moved.keepalive_interval = 1;
+	faster = moved;
+	faster.keepalive_interval = 2;
+	sent = ka_stat(0, "crlf_sent");
 	core_reload(&live, &moved);
-	CHECK_UINT(ka_u32(0, "ct_bound"), 2);
 	CHECK_UINT(ka_u32(0, "interval"), 1);
-	net_ct_udp_bound_test_set(60, 180);
-	core_reload(&moved, &live);
-	CHECK_UINT(ka_u32(0, "ct_bound"), 60);
-	CHECK_UINT(ka_u32(0, "interval"), 30);
+	CHECK_UINT(ka_stat(0, "crlf_sent"), sent);
+	sent = ka_stat(0, "crlf_sent");
+	core_reload(&moved, &faster);
+	CHECK_UINT(ka_u32(0, "interval"), 2);
+	CHECK_UINT(ka_stat(0, "crlf_sent"), sent + 1);
+	sent = ka_stat(0, "crlf_sent");
+	core_reload(&faster, &live);
+	CHECK_UINT(ka_u32(0, "interval"), 60);
+	CHECK_UINT(ka_stat(0, "crlf_sent"), sent + 1);
 	CHECK(fam_is(0, "state", "registered"));
 
 	parked = none;
@@ -7178,7 +7102,6 @@ static void test_refresher_round(void)
 	CHECK_UINT(status_line0(NULL, 0), 0);
 	calls_done();
 	accounts_hal_features_set(0);
-	net_ct_udp_bound_test_set(0, 0);
 
 	uloop_fd_delete(&fam_ufd4);
 	uloop_fd_delete(&fam_ufd6);
@@ -7663,7 +7586,6 @@ static void test_linger_round(void)
 	CHECK(uloop_fd_add(&fam_ufd4, ULOOP_READ) == 0);
 
 	event_test_mode(true);
-	net_ct_udp_bound_test_set(60, 180);
 
 	base_default();
 	live = base;
@@ -7692,9 +7614,8 @@ static void test_linger_round(void)
 	acct_dns_result_inject(0, &res);
 	CHECK_UINT(ka_stat(0, "crlf_sent"), sent);
 
-	CASE("status: the cadence, the bound and both lists reach the dump");
-	CHECK_UINT(ka_u32(0, "interval"), 30);
-	CHECK_UINT(ka_u32(0, "ct_bound"), 60);
+	CASE("status: the cadence and both lists reach the dump");
+	CHECK_UINT(ka_u32(0, "interval"), 60);
 	CHECK_UINT(status_array_count(0, "resolved"), 1);
 	CHECK_UINT(status_array_count(0, "linger"), 1);
 
@@ -7787,7 +7708,6 @@ static void test_linger_round(void)
 	for (i = 0; i < 400 && status_line0(NULL, 0); i++)
 		uloop_run_timeout(20);
 	CHECK_UINT(status_line0(NULL, 0), 0);
-	net_ct_udp_bound_test_set(0, 0);
 
 	uloop_fd_delete(&fam_ufd4);
 	close(fam_fd4);
@@ -7798,9 +7718,10 @@ static void test_linger_round(void)
 }
 
 /*
- * Retention expiry on its own. Under a 600 s bound a udp line runs its next
- * round 300 s out. No answer follows either, so only the linger timer can
- * empty its status list when its window ends.
+ * Retention expiry on its own. With the keepalive pair off, a udp line runs
+ * its next round 60 s out, past the end of the class. No answer follows
+ * either, so only the linger timer can empty its status list when its window
+ * ends.
  */
 static void test_linger_timer(void)
 {
@@ -7825,7 +7746,6 @@ static void test_linger_timer(void)
 	CHECK(uloop_fd_add(&fam_ufd4, ULOOP_READ) == 0);
 
 	event_test_mode(true);
-	net_ct_udp_bound_test_set(600, 1800);
 
 	base_default();
 	live = base;
@@ -7860,7 +7780,6 @@ static void test_linger_timer(void)
 	for (i = 0; i < 400 && status_line0(NULL, 0); i++)
 		uloop_run_timeout(20);
 	CHECK_UINT(status_line0(NULL, 0), 0);
-	net_ct_udp_bound_test_set(0, 0);
 
 	uloop_fd_delete(&fam_ufd4);
 	close(fam_fd4);
@@ -7871,8 +7790,9 @@ static void test_linger_timer(void)
 /* ------------------------------------------------- the uvoice set elements */
 
 /*
- * The admits the fake recorded since the case zeroed phf.nadmit, for one
- * address: device lo, IPv4, the line's port and the 2 s bound of the test.
+ * Count of admits recorded since the case zeroed phf.nadmit for one address:
+ * device lo, IPv4, the given port and a 2 s timeout (twice the 1 s test
+ * round).
  */
 static unsigned int peer_admits(const char *host, uint16_t port)
 {
@@ -7892,8 +7812,8 @@ static unsigned int peer_admits(const char *host, uint16_t port)
 /*
  * The set elements a udp line asks the core for, read off the host fake,
  * which records them and runs no nft. Line 0 names "lo", so its socket is
- * scoped and every element carries that device. The test fixes the bound at
- * 2 s, so a round runs every second. 127.0.0.2 to 127.0.0.4 route over lo,
+ * scoped and every element carries that device. The keepalive pair is on at
+ * 1 s, so a round runs every second. 127.0.0.2 to 127.0.0.4 route over lo,
  * and a datagram ping to them needs no listener. The caller of the dialog
  * sends from 127.0.0.4, an address that no target has, so the dialog gets
  * an element of its own.
@@ -7926,13 +7846,14 @@ static void test_peer_udp(void)
 	CHECK(uloop_fd_add(&fam_ufd4, ULOOP_READ) == 0);
 
 	event_test_mode(true);
-	net_ct_udp_bound_test_set(2, 6);
 
 	base_default();
 	live = base;
 	live.channels = 1;
 	live.dns_cache_update_mode = false;
 	live.dns_linger = 30;
+	live.keepalive_enabled = true;
+	live.keepalive_interval = 1;
 	fam_channel(&live, 0, "127.0.0.1", reg_a, local_port);
 	snprintf(live.channel[0].local_interface,
 		 sizeof(live.channel[0].local_interface), "lo");
@@ -7946,8 +7867,8 @@ static void test_peer_udp(void)
 	CHECK(fam_count_wait(&fam_regs4, 1));
 	CHECK(fam_wait(0, "state", "registered"));
 
-	/* 127.0.0.3 leaves with the second answer and lingers; each changed
-	 * answer runs the round from the inject itself */
+	/* 127.0.0.3 leaves with the second answer and lingers; a changed
+	 * answer runs the round inside acct_dns_result_inject() */
 	pool[0].host = "127.0.0.1";
 	pool[0].port = reg_a;
 	pool[1].host = "127.0.0.3";
@@ -7964,6 +7885,11 @@ static void test_peer_udp(void)
 	CHECK_UINT(peer_admits("127.0.0.2", local_port), 1);
 	CHECK_UINT(peer_admits("127.0.0.3", local_port), 1);
 	CHECK_UINT(phf.n[PHF_PEER_HOLD], holds);
+
+	CASE("set: each element lives twice the round interval");
+	CHECK_UINT(ka_u32(0, "interval"), 1);
+	for (i = 0; i < phf.nadmit; i++)
+		CHECK_UINT(phf.admit[i].timeout_s, 2 * ka_u32(0, "interval"));
 
 	CASE("set: and the next round writes the same elements again");
 	phf.nadmit = 0;
@@ -8018,7 +7944,6 @@ static void test_peer_udp(void)
 	for (i = 0; i < 400 && status_line0(NULL, 0); i++)
 		uloop_run_timeout(20);
 	CHECK_UINT(status_line0(NULL, 0), 0);
-	net_ct_udp_bound_test_set(0, 0);
 
 	uloop_fd_delete(&fam_ufd4);
 	close(fam_fd4);
@@ -8755,9 +8680,8 @@ static void test_flap_outage(void)
 
 	/*
 	 * The outage puts line 1 in backoff: timer F ends its attempt 640 ms
-	 * after it leaves, and the ladder holds the next one for 20 s. The
-	 * warning names the local timeout, because a bare code 408 reads as a
-	 * refusal by the registrar.
+	 * after it leaves, and the ladder holds the next attempt for 20 s. The
+	 * warning must name the local timeout (acct_reg_fail_log()).
 	 */
 	CASE("flap: the timeout at a silent registrar warns of no response, "
 	     "not of code 408");
@@ -8773,9 +8697,9 @@ static void test_flap_outage(void)
 	warn_capture_end();
 
 	/*
-	 * The failure took the binding with it, so the address change on top
-	 * of that rebuilds the line, and the attempt leaves with the answer of
-	 * its resolution, long before the ladder would have sent it.
+	 * The failure drops the binding, so the address change rebuilds the
+	 * line. The rebuilt line sends its attempt when its resolution answers,
+	 * before the backoff ends.
 	 */
 	CASE("flap: an address change while the line waits out its backoff "
 	     "registers at once");
@@ -10857,7 +10781,7 @@ int main(void)
 	test_derive_tls_port();
 	test_derive_dns_kind();
 	test_transport_token();
-	test_refresher_bound();
+	test_refresher_rule();
 	test_srtp_transport_warn();
 	test_host_port();
 	test_derive_endpoint();

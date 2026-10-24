@@ -835,7 +835,7 @@ static void test_host_build(void)
 	      h->net_iface_ipv6_served_set && h->net_iface_recover_settle);
 	CHECK(h->net_port_range && h->net_port_range_eq && h->net_port_alloc &&
 	      h->net_port_free);
-	CHECK(h->net_ct_udp_bound_s && h->net_ct_punch_interval_ms);
+	CHECK(h->net_ct_punch_interval_ms);
 	CHECK(h->peer_admit && h->peer_hold && h->peer_release);
 	CHECK(h->cdr_call_started && h->cdr_call_seq && h->cdr_call_correlate &&
 	      h->cdr_call_answered && h->cdr_call_conferenced &&
@@ -1369,8 +1369,8 @@ static void fdns_close(void)
 	close(fdns.ufd.fd);
 }
 
-/* The unit up to its start on the config the caller filled, whose resolver
- * asks the DNS server of the suite. */
+/* Init the unit on the config that the caller filled, and point its resolver
+ * at the DNS server of the suite; the caller starts it. */
 static void mgcp_named_boot(const struct proto_ops *ops)
 {
 	struct sip_txn_dst srv;
@@ -1617,8 +1617,8 @@ static unsigned int holds_live(void)
 /*
  * Set elements of the MGCP socket (net/peer.h), read off the fake, which
  * records them and runs no nft. The fake answers "lo" as bound device, and the
- * unit takes a free port. The socket therefore opens scoped, and each element
- * carries both.
+ * case configures a free local port. The socket therefore opens scoped, and
+ * each element carries that device and port.
  */
 static void test_mgcp_holds(const struct proto_ops *ops)
 {

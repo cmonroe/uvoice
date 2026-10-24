@@ -149,9 +149,8 @@ struct acct_cfg {
 	uint8_t sip_tos;
 
 	/*
-	 * The transport the line runs on, and the only place it is stored. The
-	 * four Via and Contact writers take the token acct_transport_token()
-	 * maps it to.
+	 * Transport of the line, stored here alone. The four Via and Contact
+	 * writers take the token that acct_transport_token() maps it to.
 	 */
 	enum acct_transport transport;
 
@@ -184,21 +183,21 @@ struct acct_cfg {
 	 * effective options_interval after the channel alias rule). All three
 	 * are the schema LIVE class: a change updates the running instance in
 	 * place through sip_ka_cfg_update(). A udp line runs the CRLF keepalive
-	 * whatever the pair says, inside half the conntrack udp bound
-	 * (acct_ka_interval_effective), and every destination of the round gets
-	 * a set element.
+	 * whatever the pair says (acct_ka_interval_effective). Each round
+	 * writes the set elements of its destinations, and nothing else writes
+	 * them again.
 	 */
 	bool ka_enabled;
 	uint32_t ka_interval;
 	uint32_t options_interval;
 
 	/*
-	 * uci dns_linger (base scope, LIVE): seconds an address a resolver
-	 * answer named keeps its inbound admission after it leaves the answer.
-	 * The keepalive round of a udp line pings it and writes its set
-	 * element, because a pool that rotates one record per query sends
-	 * inbound requests from members the current answer does not name. 0
-	 * turns the retention off.
+	 * uci dns_linger (base scope, LIVE). Seconds that a proxy address keeps
+	 * its inbound admission after it drops out of the resolver answer.
+	 * During that window the keepalive round of a udp line pings the
+	 * address and writes its set element. 0 turns the retention off. A pool
+	 * that publishes one rotating record per query needs it, because
+	 * inbound requests can come from any pool member.
 	 */
 	unsigned int linger_s;
 
@@ -206,24 +205,21 @@ struct acct_cfg {
 };
 
 /*
- * The CRLF interval of a udp line, against the conntrack udp bound of
- * net/conntrack.h (net_ct_udp_bound_s):
- * max(1, min(configured, bound_s / 2)), where configured is ka_interval when
- * the pair is on and bound_s / 2 otherwise. forced reports that the answer
- * differs from the configured pair, because it was off or slower. Exported so
- * test_account.c pins the clamp without a live line.
+ * The CRLF interval of a udp line: ka_interval when the pair is on, else
+ * SIP_KA_ROUND_DEFAULT_S, and never over SIP_KA_INTERVAL_MAX. forced reports
+ * that the pair is off or its interval is 0. Exported so test_account.c
+ * checks the rule without a live line.
  */
-unsigned int acct_ka_interval_effective(const struct acct_cfg *c,
-					unsigned int bound_s, bool *forced);
+unsigned int acct_ka_interval_effective(const struct acct_cfg *c, bool *forced);
 
 /*
  * The dns_linger retention: every recently resolved proxy endpoint and when
- * an answer last named it. Every answer notes its endpoints, an endpoint that
- * stops appearing expires after the window, and until then the keepalive
- * round of a udp line pings it and writes its set element. A
- * pool that rotates one record per query sends inbound requests from members
- * the current answer does not name; without the retention exactly one member
- * is admissible at a time.
+ * an answer last named it. Each answer notes its endpoints. An endpoint that
+ * stops appearing expires after the window; until then the keepalive round of
+ * a udp line pings it and writes its set element. A pool that rotates one
+ * record per query sends inbound requests from members the current answer
+ * does not name; without the retention exactly one member is admissible at a
+ * time.
  *
  * The cap matches SIP_REG_TARGET_MAX: an answer that fills it makes the
  * retention equal to the target list. A full list evicts the entry an answer
@@ -579,11 +575,10 @@ struct sip_transport *acct_transport_test(void);
 void accounts_init(void);
 
 /*
- * The core services of the daemon (proto/proto.h struct proto_host): the netifd
- * tracker, the uvoice set elements, the conntrack bound, the registration
- * events, the TLS bundle fetch, the message waiting store and the trace. The
- * graceful stop reports its end through host->shutdown_done. Bound before
- * accounts_init().
+ * Core services of the daemon (proto/proto.h struct proto_host): netifd
+ * tracker, uvoice set elements, media punch cadence, registration events, TLS
+ * bundle fetch, message waiting store and trace. The graceful stop reports
+ * its end through host->shutdown_done. Bind it before accounts_init().
  */
 struct proto_host;
 void accounts_host_bind(const struct proto_host *host);

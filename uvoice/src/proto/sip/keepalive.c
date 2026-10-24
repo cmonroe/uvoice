@@ -124,8 +124,8 @@ static void ping_send(struct sip_ka *ka, const struct sip_txn_dst *dst,
 
 /*
  * One round: a ping to every destination the callback lists, index 0 first.
- * The busy flag spans the callback too, because the account may update the
- * config from inside it (sip/keepalive.h, sip_ka_cfg_update).
+ * The busy flag spans the callback too, so that sip_ka_cfg_update() stays
+ * safe from inside it (sip/keepalive.h).
  */
 static void crlf_round(struct sip_ka *ka)
 {
@@ -381,8 +381,8 @@ typedef uint32_t (*ka_secs_of)(const struct sip_ka *ka);
 
 /*
  * One side of an update. A side that keeps running keeps the time it already
- * waited, so a reload burst cannot push the next ping out indefinitely, and a
- * bound that shrinks under a running line is met at once. A side inside its
+ * waited. A burst of reloads therefore cannot delay the next ping without
+ * limit, and a shorter interval takes effect at once. A side inside its
  * own send is left alone: its fire re-arms from the new interval after the
  * send returns, and a second send from here would double the round. A round
  * this update fires can re-enter the update from the destination callback,

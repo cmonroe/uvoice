@@ -6,19 +6,19 @@
  *
  * Licensed under GPL-2.0-only with the linking exception stated in LICENSE.
  *
- * Unit tests for the writer of the uvoice nft sets (src/net/peer.c).
+ * Unit tests for the writer of the uvoice nft sets (src/net/peer.c), and for
+ * the conntrack udp bound that its holds take (src/net/conntrack.c).
  *
  * The suite runs the device path: the spawn of spawn_run.h and the
  * uloop_process reap. UVOICE_NFT names a generated script in place of nft.
- * That script appends its arguments to a file as one line, and exits with the
- * code in UVOICE_NFT_EXIT. With UVOICE_NFT_FIFO set, it first waits on that
- * fifo, so a case decides when the write ends. Each case reads its writes
- * back from that file. Reason: a recorder inside the layer proves only itself.
+ * That script appends its arguments to a file as one line. With
+ * UVOICE_NFT_FIFO set, it then waits on that fifo, so a case decides when the
+ * write ends. It exits with the code in UVOICE_NFT_EXIT. Each case reads its
+ * writes back from that file. Reason: a recorder inside the layer proves only
+ * itself.
  *
  * net_ct_udp_bound_test_set() puts a conntrack bound of 2 s in place, so a
  * hold writes again every second. Every wait drives uloop to a deadline.
- * Each case uses keys of its own, because the layer keeps the deadline of
- * each write for the length of the run.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -150,7 +150,6 @@ static unsigned int out_count(void)
 	return out_lines(got);
 }
 
-/* passes once the queue is empty and no child runs, or fails after 2 s */
 static bool peer_idle_wait(void)
 {
 	unsigned int i;
@@ -164,7 +163,6 @@ static bool peer_idle_wait(void)
 	return false;
 }
 
-/* passes once a child runs, or fails after 2 s */
 static bool peer_busy_wait(void)
 {
 	unsigned int i;
@@ -173,6 +171,58 @@ static bool peer_busy_wait(void)
 		uloop_pump(10);
 
 	return net_peer_test_busy();
+}
+
+static unsigned int ct_file_read(const char *path, unsigned int def)
+{
+	FILE *f = fopen(path, "r");
+	unsigned int v;
+	int n;
+
+	if (!f)
+		return def;
+
+	n = fscanf(f, "%u", &v);
+	fclose(f);
+
+	return n == 1 ? v : def;
+}
+
+/* what the procfs read must answer on this host: the smaller of the two
+ * values, with the shipped default in place of a file that is not there */
+static unsigned int ct_host_bound(void)
+{
+	unsigned int t = ct_file_read("/proc/sys/net/netfilter/"
+				      "nf_conntrack_udp_timeout", 60);
+	unsigned int s = ct_file_read("/proc/sys/net/netfilter/"
+				      "nf_conntrack_udp_timeout_stream", 180);
+
+	return t < s ? t : s;
+}
+
+/*
+ * The bound is the smaller conntrack udp timeout (net/conntrack.c gives the
+ * reason). The class restores the 2 s bound of the suite at its end.
+ */
+static void test_bound(void)
+{
+	CASE("bound: the smaller of the two timeouts is the bound");
+	net_ct_udp_bound_test_set(60, 20);
+	CHECK_UINT(net_ct_udp_bound_s(), 20);
+	net_ct_udp_bound_test_set(60, 180);
+	CHECK_UINT(net_ct_udp_bound_s(), 60);
+
+	CASE("bound: a timeout that cannot be read takes the shipped value");
+	net_ct_udp_bound_test_set(0, 500);
+	CHECK_UINT(net_ct_udp_bound_s(), 60);
+	net_ct_udp_bound_test_set(500, 0);
+	CHECK_UINT(net_ct_udp_bound_s(), 180);
+
+	CASE("bound: the procfs read answers the files of this host");
+	net_ct_udp_bound_test_set(0, 0);
+	CHECK_UINT(net_ct_udp_bound_s(), ct_host_bound());
+
+	net_ct_udp_bound_test_set(2, 6);
 }
 
 /*
@@ -237,9 +287,9 @@ static void test_writes(void)
 }
 
 /*
- * The queue writes one element per key, in request order. It never ends an
- * element sooner than its last write, because an add with "expires" replaces
- * the expiry.
+ * The queue writes one element per key, in request order. A request after
+ * the write carries its own timeout: an add with "expires" replaces the
+ * expiry, and the requester writes again within that timeout.
  */
 static void test_queue(void)
 {
@@ -277,75 +327,43 @@ static void test_queue(void)
 	CHECK(strstr(got[0], " 192.0.2.16 . 5060 timeout 45s expires 45s }") !=
 	      NULL);
 
-	CASE("queue: a shorter timeout after a write of 60 s writes nothing");
+	CASE("queue: a shorter timeout after a write of 60 s writes again");
 	out_reset();
 	CHECK(net_peer_admit("lo", "192.0.2.21", false, 5060, 60));
 	CHECK(peer_idle_wait());
 	CHECK_UINT(out_count(), 1);
 	CHECK(net_peer_admit("lo", "192.0.2.21", false, 5060, 10));
-	CHECK_UINT(net_peer_test_queued(), 0);
-	uloop_pump(50);
+	CHECK_UINT(net_peer_test_queued(), 1);
 	CHECK(peer_idle_wait());
-	CHECK_UINT(out_count(), 1);
+	CHECK_UINT(out_lines(got), 2);
+	CHECK(strstr(got[1], " 192.0.2.21 . 5060 timeout 10s expires 10s }") !=
+	      NULL);
 }
 
 /*
- * nft sets the expiry when it runs, after the spawn, so the layer counts the
- * deadline of a write from the end of its child. The child here ends 1.5 s
- * after its spawn. A 59 s request then reaches past a deadline counted from
- * the spawn, but not past one counted from the end.
- */
-static void test_late_end(void)
-{
-	CASE("late end: a 60 s write whose child ends 1.5 s after its spawn");
-	out_reset();
-	setenv("UVOICE_NFT_FIFO", nft_fifo, 1);
-	CHECK(net_peer_admit("lo", "192.0.2.61", false, 5060, 60));
-	CHECK(peer_busy_wait());
-	unsetenv("UVOICE_NFT_FIFO");
-	uloop_pump(1500);
-	CHECK(net_peer_test_busy());
-	CHECK(nft_release_wait());
-	CHECK(peer_idle_wait());
-	CHECK_UINT(out_count(), 1);
-
-	CASE("late end: a 59 s request after that end writes nothing");
-	CHECK(net_peer_admit("lo", "192.0.2.61", false, 5060, 59));
-	CHECK_UINT(net_peer_test_queued(), 0);
-	uloop_pump(50);
-	CHECK(peer_idle_wait());
-	CHECK_UINT(out_count(), 1);
-
-	CASE("late end: a 60 s request after that end writes");
-	CHECK(net_peer_admit("lo", "192.0.2.61", false, 5060, 60));
-	CHECK(peer_idle_wait());
-	CHECK_UINT(out_count(), 2);
-}
-
-/*
- * A request for the key of the running child compares with the deadline of
- * that child, because the child replaces the expiry when it ends.
+ * A request that matches the key of the running child queues, and writes after
+ * that child ends.
  */
 static void test_running_child(void)
 {
-	CASE("running child: a shorter request for its key is dropped");
+	char got[OUT_LINES_MAX][OUT_LINE_LEN];
+
+	CASE("running child: a request for its key is queued");
 	out_reset();
 	setenv("UVOICE_NFT_FIFO", nft_fifo, 1);
 	CHECK(net_peer_admit("lo", "192.0.2.71", false, 5060, 60));
 	CHECK(peer_busy_wait());
 	unsetenv("UVOICE_NFT_FIFO");
 	CHECK(net_peer_admit("lo", "192.0.2.71", false, 5060, 59));
-	CHECK_UINT(net_peer_test_queued(), 0);
-
-	CASE("running child: an equal request for its key is queued");
-	CHECK(net_peer_admit("lo", "192.0.2.71", false, 5060, 60));
 	CHECK_UINT(net_peer_test_queued(), 1);
 
-	CASE("running child: after the release, the equal request writes");
+	CASE("running child: after the release, the queued request writes");
 	CHECK(net_peer_test_busy());
 	CHECK(nft_release_wait());
 	CHECK(peer_idle_wait());
-	CHECK_UINT(out_count(), 2);
+	CHECK_UINT(out_lines(got), 2);
+	CHECK(strstr(got[1], " 192.0.2.71 . 5060 timeout 59s expires 59s }") !=
+	      NULL);
 }
 
 /*
@@ -447,10 +465,10 @@ static void test_failure_log(void)
 }
 
 /*
- * net_peer_done() empties the queue and the holds, stops the timers and
- * reaps the running child before it returns. The child waits on the fifo
- * until the release, and the loop does not run after the release, so only
- * net_peer_done() can reap it.
+ * net_peer_done() empties queue and holds, stops both timers and reaps a
+ * running child before it returns. The child exits after its fifo release,
+ * and uloop does not run after that release, so only net_peer_done() can reap
+ * it.
  */
 static void test_done(void)
 {
@@ -491,10 +509,10 @@ int main(void)
 	SUITE_CHECK(nft_fixture_make());
 	setenv("UVOICE_NFT", nft_script, 1);
 
+	test_bound();
 	test_refusals();
 	test_writes();
 	test_queue();
-	test_late_end();
 	test_running_child();
 	test_hold();
 	test_hold_period();

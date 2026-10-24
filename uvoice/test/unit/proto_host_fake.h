@@ -17,11 +17,11 @@
  *
  *   PHF_NET_PORTS  the four net_port entries reach the real pool of
  *                  net/ports.c, which the suite compiles in.
- *   PHF_NET_CORE   the tracker, the conntrack bounds and the two event
- *                  entries reach the core functions of proto/proto.c's own
- *                  adapters (net/iface.h, net/conntrack.h, event.h,
- *                  calltrace_event), which the suite compiles in or records
- *                  itself.
+ *   PHF_NET_CORE   tracker, media punch cadence and both event entries
+ *                  reach the core functions behind the adapters of
+ *                  proto/proto.c (net/iface.h, net/conntrack.h, event.h,
+ *                  calltrace_event). The suite compiles them in or records
+ *                  them itself.
  *
  * The three peer entries stay recorders under both groups, so a suite reads
  * the set elements a protocol asks for and no nft runs.
@@ -97,7 +97,6 @@ enum phf_entry {
 	PHF_NET_PORT_RANGE_EQ,
 	PHF_NET_PORT_ALLOC,
 	PHF_NET_PORT_FREE,
-	PHF_NET_CT_UDP_BOUND_S,
 	PHF_NET_CT_PUNCH_INTERVAL_MS,
 	PHF_PEER_ADMIT,
 	PHF_PEER_HOLD,
@@ -192,7 +191,6 @@ struct phf_rec {
 	const struct cfg *cfg;
 	uint32_t config_generation;
 	uint32_t cdr_seq;
-	unsigned int ct_udp_bound_s;
 	uint16_t punch_interval_ms;
 	/* end the uloop in shutdown_done, the way proto/proto.c does */
 	bool shutdown_ends_loop;

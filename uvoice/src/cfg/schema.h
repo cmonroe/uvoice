@@ -12,6 +12,8 @@
 #include <limits.h>
 #include <stddef.h>
 
+#include "cfg.h"
+
 enum cfg_type {
 	CFG_BOOL,
 	CFG_INT,
@@ -136,7 +138,7 @@ static const struct cfg_option_desc cfg_base_options[] = {
 		 APPLY_RESTART_DAEMON, SUP_SUPPORTED, NULL),
 	CFG_DESC("srtp_enabled", CFG_BOOL, "0", 0, 1, cfg_bool_vals, APPLY_RESTART_ALL, SUP_SUPPORTED, NULL),
 	CFG_DESC("keepalive_enabled", CFG_BOOL, "1", 0, 1, cfg_bool_vals, APPLY_LIVE, SUP_SUPPORTED, NULL),
-	CFG_DESC("keepalive_interval", CFG_INT, "30", 1, INT_MAX, NULL, APPLY_LIVE, SUP_SUPPORTED, NULL),
+	CFG_DESC("keepalive_interval", CFG_INT, CFG_STR(CFG_KEEPALIVE_INTERVAL_DEF), 1, INT_MAX, NULL, APPLY_LIVE, SUP_SUPPORTED, NULL),
 	CFG_DESC("dns_cache_update_mode", CFG_BOOL, "1", 0, 1, cfg_bool_vals, APPLY_REREG, SUP_SUPPORTED, NULL),
 	CFG_DESC("dns_move_unregister", CFG_BOOL, "1", 0, 1, cfg_bool_vals, APPLY_REREG, SUP_SUPPORTED, NULL),
 	CFG_DESC("dns_srv_mode", CFG_ENUM, "auto", 0, 0, cfg_dns_srv_mode_vals, APPLY_REREG, SUP_SUPPORTED, NULL),

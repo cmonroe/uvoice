@@ -9,6 +9,7 @@
  * The writer of the uvoice nft sets. See net/peer.h for the contract.
  */
 #include <errno.h>
+#include <net/if.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,8 +29,7 @@
 #define NET_PEER_SNIPPET	"/usr/share/nftables.d/table-pre/20-uvoice.nft"
 #define NET_PEER_PATH_MAX	128
 
-/* IFNAMSIZ: the width of the ifname part of a set key */
-#define NET_PEER_DEV_MAX	16
+#define NET_PEER_DEV_MAX	IFNAMSIZ
 #define NET_PEER_HOST_MAX	INET6_ADDRSTRLEN
 
 /* nft add element inet fw4 <set> { <dev> . <host> . <port> timeout <t>
@@ -61,18 +61,6 @@ struct peer_req {
 	unsigned int timeout_s;
 };
 
-/*
- * The last successful write of a key, on the monotonic clock: when it ended,
- * and that end plus its timeout. nft sets the expiry while it runs, so a
- * deadline counted from the end is never earlier than the kernel's.
- */
-struct peer_written {
-	struct peer_key key;
-	uint64_t deadline_ms;
-	uint64_t at_ms;
-	bool used;
-};
-
 struct peer_hold {
 	struct peer_key key;
 	bool used;
@@ -89,13 +77,11 @@ struct peer_argv {
 static struct {
 	struct peer_req queue[NET_PEER_QUEUE_MAX];
 	unsigned int queued;
-	struct peer_written written[NET_PEER_QUEUE_MAX];
 	struct peer_hold hold[NET_PEER_HOLD_MAX];
 	struct uloop_timeout start;
 	struct uloop_timeout tick;
 	struct uloop_process proc;
 	struct peer_req cur;
-	uint64_t cur_deadline_ms;
 	bool busy;
 	bool failing;
 } peer;
@@ -164,60 +150,6 @@ static bool peer_nft_ready(void)
 	return false;
 }
 
-static uint64_t peer_deadline(unsigned int timeout_s)
-{
-	return mono_ms() + (uint64_t)timeout_s * 1000;
-}
-
-static struct peer_written *peer_written_find(const struct peer_key *key)
-{
-	unsigned int i;
-
-	for (i = 0; i < NET_PEER_QUEUE_MAX; i++) {
-		struct peer_written *w = &peer.written[i];
-
-		if (w->used && peer_key_eq(&w->key, key))
-			return w;
-	}
-
-	return NULL;
-}
-
-/* the record of key, else a free one, else the one written longest ago */
-static struct peer_written *peer_written_slot(const struct peer_key *key)
-{
-	struct peer_written *w = peer_written_find(key);
-	unsigned int i, oldest = 0;
-
-	if (w)
-		return w;
-
-	for (i = 0; i < NET_PEER_QUEUE_MAX; i++) {
-		if (!peer.written[i].used)
-			return &peer.written[i];
-		if (peer.written[i].at_ms < peer.written[oldest].at_ms)
-			oldest = i;
-	}
-
-	return &peer.written[oldest];
-}
-
-/*
- * An add with "expires" replaces the expiry of an existing element, so a
- * write whose deadline falls before the last one, or before the one the
- * running child writes, would end the element sooner.
- */
-static bool peer_shortens(const struct peer_key *key, uint64_t deadline)
-{
-	const struct peer_written *w = peer_written_find(key);
-
-	if (w && w->deadline_ms > deadline)
-		return true;
-
-	return peer.busy && peer_key_eq(&peer.cur.key, key) &&
-	       peer.cur_deadline_ms > deadline;
-}
-
 static struct peer_req *peer_queue_find(const struct peer_key *key)
 {
 	unsigned int i;
@@ -236,13 +168,6 @@ static bool peer_enqueue(const struct peer_key *key, unsigned int timeout_s)
 {
 	struct peer_req *q;
 
-	if (peer_shortens(key, peer_deadline(timeout_s))) {
-		TRACE(TRACE_FSM, "firewall: %s element of %s port %u lives "
-		      "longer, kept", peer_set_name[key->set], key->dev,
-		      key->port);
-		return true;
-	}
-
 	q = peer_queue_find(key);
 	if (q) {
 		if (timeout_s > q->timeout_s)
@@ -260,7 +185,8 @@ static bool peer_enqueue(const struct peer_key *key, unsigned int timeout_s)
 	q->key = *key;
 	q->timeout_s = timeout_s;
 
-	/* from the loop, so the requests of one frame share the queue */
+	/* start from uloop, so all requests of one callback queue before the
+	 * first spawn */
 	if (!peer.busy) {
 		peer.start.cb = peer_start_cb;
 		uloop_timeout_set(&peer.start, 0);
@@ -300,8 +226,9 @@ static void peer_argv_build(const struct peer_req *r, struct peer_argv *a)
 }
 
 /*
- * A failed write most often meets a set that fw4 never loaded, so the first
- * failure of a run names the snippet and the rest of the run traces only.
+ * A failed write most often means that fw4 did not load the uvoice sets. The
+ * first failure of a run warns and names the snippet; later failures trace
+ * only.
  */
 static void peer_fail(const struct peer_req *r, const char *what)
 {
@@ -327,7 +254,6 @@ static void peer_status_text(int status, char *out, size_t olen)
 
 static void peer_complete(int status)
 {
-	struct peer_written *w;
 	char what[32];
 
 	if (!WIFEXITED(status) || WEXITSTATUS(status)) {
@@ -335,12 +261,6 @@ static void peer_complete(int status)
 		peer_fail(&peer.cur, what);
 		return;
 	}
-
-	w = peer_written_slot(&peer.cur.key);
-	w->key = peer.cur.key;
-	w->deadline_ms = peer_deadline(peer.cur.timeout_s);
-	w->at_ms = mono_ms();
-	w->used = true;
 
 	if (!peer.failing)
 		return;
@@ -358,7 +278,6 @@ static void peer_proc_cb(struct uloop_process *p, int ret)
 	peer_run();
 }
 
-/* Leaves peer.busy set while the child runs, clear when it ended here. */
 static void peer_spawn(void)
 {
 	const struct peer_key *k = &peer.cur.key;
@@ -386,6 +305,8 @@ static void peer_spawn(void)
 		return;
 	}
 
+	/* If uloop cannot track the child, reap it here so that the queue
+	 * moves on. */
 	if (waitpid(pid, &status, 0) == pid)
 		peer_complete(status);
 }
@@ -397,13 +318,6 @@ static void peer_run(void)
 		peer.queued--;
 		memmove(&peer.queue[0], &peer.queue[1],
 			peer.queued * sizeof(peer.queue[0]));
-
-		/* a write that ended after the request was queued may cover
-		 * this key for longer now */
-		peer.cur_deadline_ms = peer_deadline(peer.cur.timeout_s);
-		if (peer_shortens(&peer.cur.key, peer.cur_deadline_ms))
-			continue;
-
 		peer_spawn();
 	}
 }

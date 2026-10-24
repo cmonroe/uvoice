@@ -115,11 +115,6 @@ struct account {
 	struct sip_ka ka;
 	bool ka_inited;
 
-	/* the conntrack udp bound the keepalive interval was derived under; a
-	 * udp line re-reads it on every round (acct_pinhole_bound_sync), and
-	 * its set elements live that long */
-	unsigned int ct_bound_s;
-
 	/* the message waiting subscription; the NOTIFY intake needs no client */
 	struct sip_sub sub;
 	bool sub_inited;
@@ -328,9 +323,6 @@ int acct_dns_kind(enum cfg_dns_srv_mode mode, bool port_named)
 }
 
 /*
- * Transport is base only (account.h). The channel value is read only to report
- * that it was ignored.
- *
  * An empty base token is udp, and that guard is required, not defensive: the
  * Via writers default on a NULL token alone, so an empty string must never
  * reach them. An unknown token is udp with a warning; the schema enum
@@ -360,35 +352,33 @@ static enum acct_transport acct_transport_derive(const struct cfg *base,
 	return tp;
 }
 
-unsigned int acct_ka_interval_effective(const struct acct_cfg *c,
-					unsigned int bound_s, bool *forced)
+_Static_assert(SIP_KA_ROUND_DEFAULT_S == CFG_KEEPALIVE_INTERVAL_DEF,
+	       "the forced round must equal the schema default of keepalive_interval");
+
+unsigned int acct_ka_interval_effective(const struct acct_cfg *c, bool *forced)
 {
-	bool on = c->ka_enabled && c->ka_interval;
-	unsigned int half = bound_s / 2;
-	unsigned int configured = on ? c->ka_interval : half;
-	unsigned int secs = configured < half ? configured : half;
+	unsigned int secs = SIP_KA_ROUND_DEFAULT_S;
 
-	if (secs < SIP_KA_INTERVAL_MIN)
-		secs = SIP_KA_INTERVAL_MIN;
+	*forced = !c->ka_enabled || !c->ka_interval;
+	if (!*forced)
+		secs = c->ka_interval;
 
-	*forced = !c->ka_enabled || !c->ka_interval || secs != c->ka_interval;
-
-	return secs;
+	/* keepalive.c caps its timer at SIP_KA_INTERVAL_MAX too, so element
+	 * timeout and status match the round that runs */
+	return secs > SIP_KA_INTERVAL_MAX ? SIP_KA_INTERVAL_MAX : secs;
 }
 
 /*
- * What the conntrack pinhole asks of the signalling refresher, said once per
- * derive. A udp line runs the CRLF keepalive inside half the conntrack udp
- * bound whatever the configuration says (acct_ka_interval_effective), and the
- * derive reports when that overrode the configured pair, or when the bound is
- * too short for the SIP_KA_INTERVAL_MIN floor to meet. A stream line needs no
- * refresher: the connection itself is the pinhole, conntrack holds it as an
- * established tcp entry, and SO_KEEPALIVE refreshes that entry from the kernel
- * (sip/stream.h, SIP_STREAM_KA_IDLE_S).
+ * Logs once per derive what keeps inbound SIP open for a line. A udp line
+ * always runs the CRLF round, because each round writes the set elements that
+ * admit inbound SIP. If the keepalive pair is off, the log names the default
+ * interval; a udp line with the pair on logs nothing. A stream line needs no
+ * round: conntrack tracks its connection as an established tcp entry, and
+ * SO_KEEPALIVE refreshes it (sip/stream.h, SIP_STREAM_KA_IDLE_S).
  */
 static void acct_refresher_report(const struct acct_cfg *c)
 {
-	unsigned int bound, secs;
+	unsigned int secs;
 	bool forced;
 
 	if (c->transport != ACCT_TP_UDP) {
@@ -399,17 +389,10 @@ static void acct_refresher_report(const struct acct_cfg *c)
 		return;
 	}
 
-	bound = vr.host->net_ct_udp_bound_s(vr.host->ctx);
-	secs = acct_ka_interval_effective(c, bound, &forced);
-	if (bound < 2)
-		ULOG_WARN("line %u under a %u s conntrack udp timeout: the %u s "
-			  "floor of the SIP keepalive cannot refresh the pinhole "
-			  "in time\n", c->line, bound,
-			  (unsigned int)SIP_KA_INTERVAL_MIN);
+	secs = acct_ka_interval_effective(c, &forced);
 	if (forced)
-		ULOG_INFO("line %u sip keepalive forced to %u s: the SIP "
-			  "pinhole needs a refresher inside the %u s "
-			  "conntrack udp timeout\n", c->line, secs, bound);
+		ULOG_INFO("line %u sip keepalive off: the round runs every %u s "
+			  "to keep its set elements\n", c->line, secs);
 }
 
 /*
@@ -1433,13 +1416,13 @@ static void acct_ka_cfg_make(const struct account *a, struct sip_ka_cfg *kc)
 	kc->crlf_interval_s = a->cfg.ka_interval;
 	kc->options_interval_s = a->cfg.options_interval;
 
-	/* nothing but the round holds the SIP tuple of a udp line open */
+	/* only the round writes the set elements that admit inbound SIP on a
+	 * udp line */
 	if (acct_stream(&a->cfg))
 		return;
 
 	kc->crlf_enabled = true;
-	kc->crlf_interval_s = acct_ka_interval_effective(&a->cfg, a->ct_bound_s,
-							 &forced);
+	kc->crlf_interval_s = acct_ka_interval_effective(&a->cfg, &forced);
 }
 
 static void account_ka_update(struct account *a)
@@ -1451,32 +1434,6 @@ static void account_ka_update(struct account *a)
 
 	acct_ka_cfg_make(a, &kc);
 	sip_ka_cfg_update(&a->ka, &kc);
-}
-
-/*
- * The conntrack udp bound of the moment, read again on every round of a udp
- * line: /etc/config/conntrack can move it under a running daemon, and a
- * keepalive derived under the old value could then run outside the new one.
- * A move re-derives the interval and re-arms the timer inside it; the update
- * is safe from inside the round (sip/keepalive.h, sip_ka_cfg_update).
- */
-static void acct_pinhole_bound_sync(struct account *a)
-{
-	unsigned int bound, secs;
-	bool forced;
-
-	if (acct_stream(&a->cfg))
-		return;
-
-	bound = vr.host->net_ct_udp_bound_s(vr.host->ctx);
-	if (bound == a->ct_bound_s)
-		return;
-
-	secs = acct_ka_interval_effective(&a->cfg, bound, &forced);
-	ULOG_INFO("line %u conntrack udp timeout %u s -> %u s, sip keepalive "
-		  "every %u s\n", a->line, a->ct_bound_s, bound, secs);
-	a->ct_bound_s = bound;
-	account_ka_update(a);
 }
 
 /* whether a destination is one of the line's resolved targets, any family */
@@ -1569,9 +1526,10 @@ uint64_t acct_linger_deadline(const struct acct_linger *lg, uint32_t linger_s)
 }
 
 /*
- * The expiry deadline of the retention, independent of answers and rounds: a
- * failed resolver and a line without a round still drop an entry when its
- * window ends, so the status reports the addresses that keep their admission.
+ * Arms the expiry of the retention, independent of answers and rounds. An
+ * entry leaves when its window ends, also after a failed resolve or on a line
+ * without a round. The status then lists only addresses that keep their
+ * admission.
  */
 static void acct_linger_rearm(struct account *a)
 {
@@ -1615,7 +1573,6 @@ static const struct sip_txn_dst *acct_ka_dst_pick(struct account *a,
 	unsigned int i, n, cur, seen = 1;
 
 	if (!idx) {
-		acct_pinhole_bound_sync(a);
 		acct_linger_expire(&a->linger, acct_now(a), a->cfg.linger_s);
 		return acct_target_dst(a);
 	}
@@ -1654,9 +1611,9 @@ static const struct sip_txn_dst *acct_ka_dst_pick(struct account *a,
 }
 
 /*
- * The netdev the line's udp socket is bound to, or NULL for an unscoped
- * bind. The socket is the source, not the tracker: the tracker can name a
- * new device before the socket moved.
+ * Netdev of the line's udp socket, or NULL for an unscoped bind. Read it from
+ * the socket, not the tracker: the tracker can name a new device before the
+ * socket moves.
  */
 static const char *acct_sock_dev(const struct account *a)
 {
@@ -1666,14 +1623,22 @@ static const char *acct_sock_dev(const struct account *a)
 	return dev && dev[0] ? dev : NULL;
 }
 
+/* twice the round interval, because a round can arrive late */
+static unsigned int acct_peer_timeout_s(const struct account *a)
+{
+	bool forced;
+
+	return 2 * acct_ka_interval_effective(&a->cfg, &forced);
+}
+
 /*
  * Every destination of the round of a udp line gets a set element for the
- * line's device and SIP port, with the conntrack bound as its life, so the
- * admission and the conntrack entry of a destination end together. A stream
- * line writes none: its connection is the pinhole.
+ * line's device and SIP port. A stream line writes no element, because its
+ * connection is the pinhole.
  */
 static void acct_peer_admit(struct account *a, const struct sip_txn_dst *dst)
 {
+	unsigned int timeout_s;
 	char host[SIP_SOCK_HOST_MAX];
 	const char *dev;
 
@@ -1689,15 +1654,14 @@ static void acct_peer_admit(struct account *a, const struct sip_txn_dst *dst)
 	if (!sip_dst_host(dst, host, sizeof(host)))
 		return;
 
+	timeout_s = acct_peer_timeout_s(a);
 	vr.host->peer_admit(vr.host->ctx, dev, host,
 			    acct_dst_family(dst) == AF_INET6,
-			    a->cfg.local_port, a->ct_bound_s);
+			    a->cfg.local_port, timeout_s);
 	ACCT_TRACE("line %u admits %s on %s port %u for %u s", a->line, host,
-		   dev, a->cfg.local_port, a->ct_bound_s);
+		   dev, a->cfg.local_port, timeout_s);
 }
 
-/* The round's housekeeping at index 0 runs before the admit, so the element
- * takes the bound of this round. */
 static const struct sip_txn_dst *acct_ka_dst_at(struct sip_ka *ka, void *priv,
 						unsigned int idx)
 {
@@ -3092,7 +3056,6 @@ static bool account_build(struct account *a, const struct acct_cfg *c)
 	sip_dialog_set_init(&a->dialogs, env);
 	a->ua_inited = true;
 
-	a->ct_bound_s = vr.host->net_ct_udp_bound_s(vr.host->ctx);
 	acct_ka_cfg_make(a, &kc);
 	sip_ka_init(&a->ka, &a->mgr, env, acct_owner_make(ACCT_OWNER_KA, a->line + 1),
 		    &kc, acct_ka_dst_at, a);
@@ -3720,6 +3683,8 @@ static void account_reload_dispatch(struct account *a, const struct acct_cfg *nc
 				    enum acct_reload_op op)
 {
 	struct sip_timer_cfg tc;
+	unsigned int was;
+	bool forced;
 
 	switch (op) {
 	case ACCT_ROP_NONE:
@@ -3728,13 +3693,17 @@ static void account_reload_dispatch(struct account *a, const struct acct_cfg *nc
 		account_build(a, nc);
 		return;
 	case ACCT_ROP_TIMERS:
+		was = acct_ka_interval_effective(&a->cfg, &forced);
 		a->cfg = *nc;
 		timers_to_cfg(&a->cfg, &tc);
 		sip_txn_mgr_timers_set(&a->mgr, &tc);
-		/* the bound can have moved since the last round */
-		if (!acct_stream(&a->cfg))
-			a->ct_bound_s = vr.host->net_ct_udp_bound_s(vr.host->ctx);
 		account_ka_update(a);
+		/* Elements of the last round expire after twice the old
+		 * interval. The re-armed timer keeps the time already waited,
+		 * so a longer round must write its elements now. */
+		if (!acct_stream(&a->cfg) &&
+		    acct_ka_interval_effective(&a->cfg, &forced) > was)
+			sip_ka_ping_now(&a->ka);
 		/* a moved dns_linger applies to the standing entries at once */
 		acct_linger_expire(&a->linger, acct_now(a), a->cfg.linger_s);
 		acct_linger_rearm(a);
@@ -4200,14 +4169,12 @@ void accounts_reload(const struct cfg *old_cfg, const struct cfg *new_cfg)
 	acct_tls_take(new_cfg, acct_tls_cfg_changed(old_cfg, new_cfg));
 
 	/*
-	 * rtp_local_port_min/max is RESTART_LINE in the schema, but the range is
-	 * not part of struct acct_cfg, so acct_apply_class() never sees it. A
-	 * live leg holds a port from the old range, so the line is cleared
-	 * first, the same way the account replace path clears it before it
-	 * discards the account objects. The port pool rebases itself once it
-	 * drains (proto/proto.h net_port_alloc: a range is only adopted while
-	 * no port is out), so the next call allocates from the new range. A
-	 * moved voice interface is the tracker's.
+	 * rtp_local_port_min/max is RESTART_LINE in the schema, but acct_cfg
+	 * does not carry the range, so acct_apply_class() never sees it. The
+	 * loop clears each line whose range moved, as the replace path does.
+	 * The pool adopts a new range only when no port is out (net/ports.c
+	 * net_port_alloc()), so the clear lets the next call use the new range.
+	 * The tracker owns a moved voice interface.
 	 */
 	for (i = 0; i < CFG_CHANNEL_MAX; i++) {
 		if (!vr.acct[i].active)
@@ -4553,10 +4520,9 @@ static void account_ka_dump(struct account *a, struct blob_buf *b)
 	blobmsg_add_u64(b, "options_alive", st->options_alive);
 	blobmsg_add_u64(b, "options_failed", st->options_failed);
 	blobmsg_add_u64(b, "options_skipped", st->options_skipped);
-	/* the effective CRLF cadence and the conntrack bound it runs under,
-	 * so a bench read needs no procfs cross-check */
+	/* the interval of the round that runs: SIP_KA_ROUND_DEFAULT_S on a
+	 * udp line with keepalive off */
 	blobmsg_add_u32(b, "interval", a->ka.cfg.crlf_interval_s);
-	blobmsg_add_u32(b, "ct_bound", a->ct_bound_s);
 	blobmsg_close_table(b, tbl);
 }
 

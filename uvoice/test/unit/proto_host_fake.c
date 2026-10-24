@@ -741,13 +741,6 @@ static void phf_net_port_free(void *ctx, uint16_t port)
 #endif
 
 #ifdef PHF_NET_CORE
-static unsigned int phf_net_ct_udp_bound_s(void *ctx)
-{
-	phf.n[PHF_NET_CT_UDP_BOUND_S]++;
-
-	return net_ct_udp_bound_s();
-}
-
 static uint16_t phf_net_ct_punch_interval_ms(void *ctx)
 {
 	phf.n[PHF_NET_CT_PUNCH_INTERVAL_MS]++;
@@ -755,13 +748,6 @@ static uint16_t phf_net_ct_punch_interval_ms(void *ctx)
 	return net_ct_punch_interval_ms();
 }
 #else
-static unsigned int phf_net_ct_udp_bound_s(void *ctx)
-{
-	phf.n[PHF_NET_CT_UDP_BOUND_S]++;
-
-	return phf.ct_udp_bound_s;
-}
-
 static uint16_t phf_net_ct_punch_interval_ms(void *ctx)
 {
 	phf.n[PHF_NET_CT_PUNCH_INTERVAL_MS]++;
@@ -1000,7 +986,6 @@ static const struct proto_host phf_host = {
 	.net_port_range_eq = phf_net_port_range_eq,
 	.net_port_alloc = phf_net_port_alloc,
 	.net_port_free = phf_net_port_free,
-	.net_ct_udp_bound_s = phf_net_ct_udp_bound_s,
 	.net_ct_punch_interval_ms = phf_net_ct_punch_interval_ms,
 	.peer_admit = phf_peer_admit,
 	.peer_hold = phf_peer_hold,
@@ -1031,7 +1016,6 @@ void proto_host_fake_reset(void)
 	phf.digit_q_max = 16;
 	phf.config_generation = 1;
 	phf.cdr_seq = 1;
-	phf.ct_udp_bound_s = 30;
 	phf.punch_interval_ms = 15000;
 }
 

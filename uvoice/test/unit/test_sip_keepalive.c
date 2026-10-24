@@ -1256,10 +1256,8 @@ static void cfg_update_tests(void)
 	CHECK_UINT(ka.stat.options_sent, 1);
 
 	/*
-	 * The account updates the config from inside the round when the
-	 * conntrack bound moved under it. The side that is sending is left to
-	 * its own re-arm, which reads the new interval, and no second round
-	 * runs from the update.
+	 * A config update from inside the round is part of the contract
+	 * (keepalive.h sip_ka_cfg_update).
 	 */
 	CASE("cfg update: safe from inside the destination callback");
 	tc_quiet();
@@ -1279,9 +1277,8 @@ static void cfg_update_tests(void)
 
 	/*
 	 * The round an update fires itself can re-enter the update from the
-	 * callback, the account's bound re-read. The arm after that round reads
-	 * the interval the callback set, not the one the outer update started
-	 * with.
+	 * destination callback. The arm after that round reads the interval the
+	 * callback set, not the one the outer update started with.
 	 */
 	CASE("cfg update: a round it fires re-arms from the interval the "
 	     "callback set");

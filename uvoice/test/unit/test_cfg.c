@@ -513,7 +513,7 @@ static void base_tests(void)
 	CHECK_UINT(fixture.cfg->restrict_source, 1);
 	CHECK_UINT(fixture.cfg->options_interval, 0);
 	CHECK(fixture.cfg->keepalive_enabled);
-	CHECK_UINT(fixture.cfg->keepalive_interval, 30);
+	CHECK_UINT(fixture.cfg->keepalive_interval, 60);
 	CHECK(fixture.cfg->dns_cache_update_mode);
 	CHECK(fixture.cfg->dns_move_unregister);
 	CHECK(fixture.cfg->dns_srv_mode == CFG_DNS_SRV_AUTO);
@@ -536,7 +536,8 @@ static void base_tests(void)
 	CHECK_UINT(fixture.cfg->restrict_source, 1);
 	fixture_free(&fixture);
 
-	/* a D2 config carries 0, 1 or 2, and uvoice reads none of them */
+	/* a config of the other voice stack carries 0, 1 or 2, and uvoice acts
+	 * on none of them */
 	CASE("restrict source 2 loads as stored and warns nothing");
 	warn_capture_begin();
 	FIXTURE_LOAD_OR_RETURN(fixture, fixture_load(
@@ -4741,7 +4742,7 @@ static void base_dump_tests(void)
 	if (dump_fields[DUMP_KEEPALIVE_ENABLED])
 		CHECK(blobmsg_get_bool(dump_fields[DUMP_KEEPALIVE_ENABLED]));
 	if (dump_fields[DUMP_KEEPALIVE_INTERVAL])
-		CHECK_UINT(blobmsg_get_u32(dump_fields[DUMP_KEEPALIVE_INTERVAL]), 30);
+		CHECK_UINT(blobmsg_get_u32(dump_fields[DUMP_KEEPALIVE_INTERVAL]), 60);
 	if (dump_fields[DUMP_OPTIONS_INTERVAL])
 		CHECK_UINT(blobmsg_get_u32(dump_fields[DUMP_OPTIONS_INTERVAL]), 0);
 	if (dump_fields[DUMP_MWI_SUBSCRIBE])

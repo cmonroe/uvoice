@@ -997,13 +997,11 @@ function stats_row_print(r, ind) {
 	]) + "\n");
 }
 
-const KEEPALIVE_FMT = "%8s %8s %8s %8s %8s %8s %8s %8s %8s";
+const KEEPALIVE_FMT = "%8s %8s %8s %8s %8s %8s %8s %8s";
 const KEEPALIVE_HEADER = sprintf(KEEPALIVE_FMT,
 	"CRLFSent", "CRLFSkip", "CRLFFail", "OptSent", "OptAlive", "OptFail",
-	"OptSkip", "Interval", "CTBound");
+	"OptSkip", "Interval");
 
-// interval is the effective CRLF round and ct_bound the conntrack udp bound
-// the round runs under, both in seconds (schema KeepaliveTable).
 function keepalive_row_print(ka, ind) {
 	print(ind + join(" ", [
 		grid_num(ka.crlf_sent, 8, null),
@@ -1013,8 +1011,7 @@ function keepalive_row_print(ka, ind) {
 		grid_num(ka.options_alive, 8, null),
 		grid_num(ka.options_failed, 8, c_yellow),
 		grid_num(ka.options_skipped, 8, c_yellow),
-		cell_right(sprintf("%d s", u32fix(ka.interval)), 8, null),
-		cell_right(sprintf("%d s", u32fix(ka.ct_bound)), 8, null)
+		cell_right(sprintf("%d s", u32fix(ka.interval)), 8, null)
 	]) + "\n");
 }
 

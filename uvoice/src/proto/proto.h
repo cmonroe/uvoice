@@ -7,7 +7,7 @@
  * Licensed under GPL-2.0-only with the linking exception stated in LICENSE.
  *
  * The signaling protocol contract. The core (the line shell, the HAL, the
- * network tracker, the firewall sets, the records and the northbound)
+ * network tracker, the nft set writer, the records and the northbound)
  * offers its services through struct proto_host. A signaling protocol (SIP,
  * MGCP) exports struct proto_ops. One protocol runs per daemon and it owns
  * every line. The build selects which protocols the image carries, and
@@ -638,8 +638,6 @@ struct proto_host {
 			       uint16_t *out);
 	/* Give an RTP port back. net_port_free(). */
 	void (*net_port_free)(void *ctx, uint16_t port);
-	/* The conntrack udp bound in seconds. net_ct_udp_bound_s(). */
-	unsigned int (*net_ct_udp_bound_s)(void *ctx);
 	/* The media punch cadence. net_ct_punch_interval_ms(). */
 	uint16_t (*net_ct_punch_interval_ms)(void *ctx);
 	/* Queue one timed element of the uvoice sets. net_peer_admit(). */
@@ -751,7 +749,8 @@ struct proto_ops {
 	 */
 	void (*dsp_ready)(uint32_t features, uint32_t codecs);
 	/* Apply a new config. The protocol tears down the legs of a line whose
-	 * RTP range moved and takes its set elements again. */
+	 * RTP range moved. A line or socket that the reload rebuilds takes its
+	 * set elements again. */
 	void (*reload)(const struct cfg *old_cfg, const struct cfg *new_cfg);
 	/* Begin the graceful stop. */
 	void (*shutdown_begin)(void);

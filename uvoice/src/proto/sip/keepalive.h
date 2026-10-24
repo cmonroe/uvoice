@@ -20,8 +20,8 @@
  * one until dst_at() answers NULL. No transaction carries a ping and no
  * destination is penalized for one. A round whose index 0 is NULL is skipped
  * and counted; the timer always re-arms. The round runs whenever the CRLF
- * side is enabled, and every destination of the round is a tuple the box has
- * to keep alive.
+ * side is on. Each destination of the round is a tuple that the box must keep
+ * alive.
  *
  * The pong side does not live here: the transport reports an inbound
  * CRLF-only datagram through its ping callback, and the account answers a
@@ -68,6 +68,11 @@
 /* seconds; both intervals clamp into this range when nonzero */
 #define SIP_KA_INTERVAL_MIN	1
 #define SIP_KA_INTERVAL_MAX	86400
+
+/* round of a udp line with keepalive off, because the round must run to write
+ * the set elements; equal to the schema default of keepalive_interval
+ * (cfg/schema.h CFG_KEEPALIVE_INTERVAL_DEF), which account.c asserts */
+#define SIP_KA_ROUND_DEFAULT_S	60
 
 /* the RFC 5626 4.4.1 ping and pong payloads */
 #define SIP_KA_PING		"\r\n\r\n"
@@ -181,10 +186,12 @@ void sip_ka_stop(struct sip_ka *ka);
 
 /*
  * Send the CRLF round now and re-arm the CRLF timer one full interval from
- * now. The account calls it when the destinations moved under a running
- * instance: after a resolver answer or an interface address change the
- * conntrack tuples of the new destinations would otherwise wait for the next
- * tick. A stopped instance, or one whose CRLF side is off, sends nothing.
+ * now. The account calls it when a resolver answer or an interface address
+ * change moves the destinations. Otherwise new destinations wait for the next
+ * tick for their ping and set element. It also calls it when a reload makes
+ * the interval longer, because elements of the last round can expire before
+ * the re-armed tick. A stopped instance, or one with the CRLF side off, sends
+ * nothing.
  */
 void sip_ka_ping_now(struct sip_ka *ka);
 

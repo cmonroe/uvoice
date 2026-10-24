@@ -11,12 +11,11 @@
 #include "net/conntrack.h"
 
 /*
- * The two conntrack timeouts a pinhole lives under, read from procfs at
- * runtime because /etc/config/conntrack can override both, and the values the
- * box ships when a file cannot be read. The smaller one bounds
- * the refresher: the kernel grants the stream timeout only to an entry that
- * saw a reply more than 2 s after its creation, so a REGISTER exchange inside
- * 2 s leaves the entry on the plain timeout.
+ * Conntrack udp timeouts, read from procfs because /etc/config/conntrack can
+ * override both. The defaults are the values that the box ships. The kernel
+ * gives the stream timeout only to an entry that saw a reply more than 2 s
+ * after creation. A fast exchange keeps the plain timeout, so the media punch
+ * and the net/peer.h holds use the smaller value.
  */
 #define NET_CT_PROC_DIR			"/proc/sys/net/netfilter/"
 #define NET_CT_UDP_TIMEOUT_PATH \
@@ -82,8 +81,9 @@ unsigned int net_ct_udp_bound_s(void)
 }
 
 /*
- * Half the bound, so an idle media descriptor is refreshed inside it. Nothing
- * opens the RTP range, so the media needs it.
+ * Half the bound, so the backend refreshes the conntrack entry of an idle
+ * media descriptor before it expires. No firewall rule opens the RTP range,
+ * so inbound media depends on that entry.
  */
 uint16_t net_ct_punch_interval_ms(void)
 {

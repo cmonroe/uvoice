@@ -263,8 +263,8 @@ void proto_stop_wait(void)
 }
 
 /*
- * The protocol frees what it holds once, after the HAL closed, and the port
- * pool goes with it. The set elements stay and time out by themselves.
+ * The protocol frees its state once, after the HAL closes, and the port pool
+ * resets with it. Set elements stay in nft until their timeouts end.
  */
 void proto_done(void)
 {
@@ -647,11 +647,6 @@ static void host_net_port_free(void *ctx, uint16_t port)
 	net_port_free(port);
 }
 
-static unsigned int host_net_ct_udp_bound_s(void *ctx)
-{
-	return net_ct_udp_bound_s();
-}
-
 static uint16_t host_net_ct_punch_interval_ms(void *ctx)
 {
 	return net_ct_punch_interval_ms();
@@ -808,7 +803,6 @@ void proto_host_build(void)
 	host.net_port_range_eq = host_net_port_range_eq;
 	host.net_port_alloc = host_net_port_alloc;
 	host.net_port_free = host_net_port_free;
-	host.net_ct_udp_bound_s = host_net_ct_udp_bound_s;
 	host.net_ct_punch_interval_ms = host_net_ct_punch_interval_ms;
 	host.peer_admit = host_peer_admit;
 	host.peer_hold = host_peer_hold;
