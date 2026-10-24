@@ -11,8 +11,8 @@
  * What it binds. One channel of /etc/config/voip to one registration client:
  * the derived identity (address of record, registrar request URI, the next hop
  * to resolve), a transaction manager on a UDP transport socket and the async
- * resolver. It asks the core firewall reconcile for its signaling rules
- * (net/fw_reconcile.h) and follows the voice interface through the core
+ * resolver. It asks the core for the uvoice set elements that admit its
+ * signaling (net/peer.h) and follows the voice interface through the core
  * netifd tracker (net/iface.h). The SIP protocol builds it on startup and
  * rebuilds it on reload, and it is the graceful stop owner for the
  * registration side (Expires 0 on SIGTERM).
@@ -78,9 +78,8 @@ enum acct_apply {
  *
  * Transport is base only. acct_cfg_derive() reads transport from the base
  * section alone. A channel that names a different value warns once and is
- * ignored, unlike every other alias option. The base only rule follows the
- * firewall reconcile, which writes one proto per rule set, so two lines on two
- * transports would silently break one line's inbound SIP.
+ * ignored, unlike every other alias option. Reason: deployed provisioning
+ * reads the base value alone, so a channel value has no meaning on any unit.
  */
 enum acct_transport {
 	ACCT_TP_UDP = 0,
@@ -151,9 +150,8 @@ struct acct_cfg {
 
 	/*
 	 * The transport the line runs on, and the only place it is stored. The
-	 * firewall reconcile derives its proto from it (fw.c takes a bool and
-	 * changes nothing for this feature), and the four Via and Contact
-	 * writers take the token acct_transport_token() maps it to.
+	 * four Via and Contact writers take the token acct_transport_token()
+	 * maps it to.
 	 */
 	enum acct_transport transport;
 
@@ -185,27 +183,22 @@ struct acct_cfg {
 	 * Keepalive (uci keepalive_enabled, keepalive_interval, and the
 	 * effective options_interval after the channel alias rule). All three
 	 * are the schema LIVE class: a change updates the running instance in
-	 * place through sip_ka_cfg_update().
+	 * place through sip_ka_cfg_update(). A udp line runs the CRLF keepalive
+	 * whatever the pair says, inside half the conntrack udp bound
+	 * (acct_ka_interval_effective), and every destination of the round gets
+	 * a set element.
 	 */
 	bool ka_enabled;
 	uint32_t ka_interval;
 	uint32_t options_interval;
 
 	/*
-	 * uci restrict_source 2, the conntrack pinhole form. A udp line under
-	 * it runs the CRLF keepalive whatever the pair above says, inside half
-	 * the conntrack udp bound (acct_ka_interval_effective); the option is
-	 * LIVE, so a move re-arms the running instance and rebuilds nothing.
-	 */
-	bool pinhole;
-
-	/*
 	 * uci dns_linger (base scope, LIVE): seconds an address a resolver
 	 * answer named keeps its inbound admission after it leaves the answer.
-	 * The keepalive round pings it under restrict_source 2 and mode 1
-	 * keeps its rule, because a pool that rotates one record per query
-	 * sends inbound requests from members the current answer does not
-	 * name. 0 turns the retention off.
+	 * The keepalive round of a udp line pings it and writes its set
+	 * element, because a pool that rotates one record per query sends
+	 * inbound requests from members the current answer does not name. 0
+	 * turns the retention off.
 	 */
 	unsigned int linger_s;
 
@@ -213,8 +206,8 @@ struct acct_cfg {
 };
 
 /*
- * The CRLF interval of a udp line under restrict_source 2, against the
- * conntrack udp bound of net/conntrack.h (net_ct_udp_bound_s):
+ * The CRLF interval of a udp line, against the conntrack udp bound of
+ * net/conntrack.h (net_ct_udp_bound_s):
  * max(1, min(configured, bound_s / 2)), where configured is ka_interval when
  * the pair is on and bound_s / 2 otherwise. forced reports that the answer
  * differs from the configured pair, because it was off or slower. Exported so
@@ -226,17 +219,15 @@ unsigned int acct_ka_interval_effective(const struct acct_cfg *c,
 /*
  * The dns_linger retention: every recently resolved proxy endpoint and when
  * an answer last named it. Every answer notes its endpoints, an endpoint that
- * stops appearing expires after the window, and two readers hold its inbound
- * admission until then: the keepalive round pings it under restrict_source 2,
- * and the mode 1 rule set keeps its Allow_VoIP_PROXY rule. A pool that
- * rotates one record per query sends inbound requests from members the
- * current answer does not name; without the retention exactly one member is
- * admissible at a time.
+ * stops appearing expires after the window, and until then the keepalive
+ * round of a udp line pings it and writes its set element. A
+ * pool that rotates one record per query sends inbound requests from members
+ * the current answer does not name; without the retention exactly one member
+ * is admissible at a time.
  *
  * The cap matches SIP_REG_TARGET_MAX: an answer that fills it makes the
- * retention equal to the target list, and mode 1 cannot admit more than
- * PROTO_FW_PROXY_MAX sources anyway. A full list evicts the entry an answer
- * named longest ago. The entries are ping and firewall inputs alone, never
+ * retention equal to the target list. A full list evicts the entry an answer
+ * named longest ago. The entries are ping and admission inputs alone, never
  * registration failover targets: the target list stays the last answer of
  * record, and an address the answer no longer names is not authorized for
  * new traffic; a failed line asks DNS instead (acct_targets_exhausted()).
@@ -266,20 +257,10 @@ bool acct_linger_covers(const struct acct_linger *lg,
 
 /*
  * The earliest expiry on the env clock, 0 with an empty list or a window of
- * 0. The account arms a timer with it, so a mode 1 rule outlives the window
- * by nothing even when no answer arrives and no round runs.
+ * 0. The account arms a timer with it, so an entry leaves the list when its
+ * window ends even when no answer arrives and no round runs.
  */
 uint64_t acct_linger_deadline(const struct acct_linger *lg, uint32_t linger_s);
-
-/*
- * Add the lingering addresses to a source list acct_proxy_collect() began,
- * never evicting an entry already there: a rotating pool's history must not
- * push out a current proxy, so a full list drops the lingering address with
- * a warning instead. Returns the new count.
- */
-unsigned int acct_linger_collect(const struct acct_linger *lg,
-				 char (*list)[PROTO_FW_SRC_MAX],
-				 unsigned int count);
 
 /*
  * Derive an account from one channel and the base section. It applies the
@@ -495,20 +476,6 @@ bool acct_reconnect_needed(bool up_seen, uint32_t known, uint32_t conn,
 bool acct_reconnect_refresh_ok(int reg_state);
 
 /*
- * The resolved registration targets of one line appended to the firewall proxy
- * source list, in the sorted order fw_reconcile_proxy_add() keeps
- * (net/fw_reconcile.h). Returns the new
- * count, so the next line collects on top of this one. started is the account's
- * reg_inited: a client that never started, or that a teardown stopped, keeps a
- * target list sip_reg_done() does not clear, and those addresses must not reach
- * a rule. Exported on the acct_targets_load() precedent, so the suite collects
- * what a scripted answer would put into a rule.
- */
-unsigned int acct_proxy_collect(const struct sip_reg *reg, bool started,
-				char (*list)[PROTO_FW_SRC_MAX],
-				unsigned int count);
-
-/*
  * The per-line mwi_subscription status key, emitted only when
  * the line subscribes and its client exists; the value is the sip/sub.h
  * status name verbatim. Exported so test_account.c pins the presence rule
@@ -570,8 +537,7 @@ void acct_dns_result_inject(unsigned int line, const struct sip_dns_result *res)
  * of the record cannot see. It answers 0 for a line with no timer armed, and
  * for a timer that is already due. The caller allows for the time between the
  * arm and the read. acct_test_dns_retry_fire() runs a pending attempt the way
- * the uloop dispatch would, and answers false when none is armed. Both follow
- * the fw_test_retry_ms() precedent (fw.h).
+ * the uloop dispatch would, and answers false when none is armed.
  */
 unsigned int acct_test_dns_retry_ms(unsigned int line);
 bool acct_test_dns_retry_fire(unsigned int line);
@@ -614,7 +580,7 @@ void accounts_init(void);
 
 /*
  * The core services of the daemon (proto/proto.h struct proto_host): the netifd
- * tracker, the firewall reconcile, the conntrack bound, the registration
+ * tracker, the uvoice set elements, the conntrack bound, the registration
  * events, the TLS bundle fetch, the message waiting store and the trace. The
  * graceful stop reports its end through host->shutdown_done. Bound before
  * accounts_init().

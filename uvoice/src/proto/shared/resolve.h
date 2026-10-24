@@ -81,9 +81,8 @@
  *
  * The dns_cache_update_mode hook. struct sip_dns_result carries `changed`,
  * which is true when this answer differs from the one the cache held. That is
- * the whole hook: mode 1 re-registers and recomputes the firewall rules on a
- * changed answer, mode 0 does not, and the decision belongs to the account
- * layer, not here.
+ * the whole hook: mode 1 re-registers on a changed answer, mode 0 does not,
+ * and the decision belongs to the account layer, not here.
  *
  * Lifetime. A query is named by a handle ((index << 16) | generation, the
  * shared/handle.h rule) and carries an opaque owner handle that this layer

@@ -2241,9 +2241,15 @@ EOF
 #!/bin/sh
 cat <<'RULES'
 table inet filter {
+	set uvoice_peer4 {
+		type ifname . ipv4_addr . inet_service
+		flags timeout
+		elements = { "eth0" . 192.0.2.10 . 5060 timeout 1m expires 52s,
+			     "eth0" . 192.0.2.11 . 5060 timeout 1m expires 40s }
+	}
 	chain ordinary {
 		tcp dport 22 accept
-		udp dport 5060 accept comment "!fw4: Allow_VoIP_SIP"
+		meta l4proto udp iifname . ip saddr . udp dport @uvoice_peer4 accept comment "uvoice: pinged SIP peer"
 	}
 	chain uvoice-input {
 		udp dport { 5060, 5061 } accept
@@ -2279,9 +2285,16 @@ EOF
 	check_has 'calltrace/finisher nft chain filter' \
 		'chain uvoice-input {' "$ct_nft"
 	check_has 'calltrace/finisher nft fw4 rule filter' \
-		'Allow_VoIP_SIP' "$ct_nft"
+		'comment "uvoice: pinged SIP peer"' "$ct_nft"
 	check_lacks 'calltrace/finisher nft plain rule dropped' \
 		'dport 22' "$ct_nft"
+	check_has 'calltrace/finisher nft set element kept' \
+		'"eth0" . 192.0.2.10 . 5060' "$ct_nft"
+	check_has 'calltrace/finisher nft set element of a continuation line kept' \
+		'"eth0" . 192.0.2.11 . 5060' "$ct_nft"
+	check_eq 'calltrace/finisher nft set header follows its table header' \
+		"$(printf 'table inet filter {\n\tset uvoice_peer4 {')" \
+		"$(printf '%s\n' "$ct_nft" | sed -n '1,2p')"
 
 	mkdir -p "$ct_dir"
 	printf '{"stage":"finishing","times":{"armed_at":1700000000}}\n' \

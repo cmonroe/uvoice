@@ -30,6 +30,8 @@ default_sipp=/tmp/uvoice-host/sipp/sipp-3.7.3/sipp
 sipp_bin=${SIPP_BIN:-$default_sipp}
 host_prefix=${UVOICE_HOST_PREFIX:-/tmp/uvoice-host/prefix}
 artifact_root=${CHURN_ARTIFACTS:-./churn-artifacts}
+# no nft for the daemon under test (test/e2e/README.md, "nft writer")
+export UVOICE_NFT=/nonexistent/uvoice-e2e/nft
 scenario_file=${CHURN_SCENARIO:-$sipp_dir/uas_churn.xml}
 dial_number=${CHURN_NUMBER:-123#}
 talk_ms=${CHURN_TALK_MS:-100}

@@ -58,11 +58,10 @@
 #include "cfg/cfg.h"
 #include "dialplan.h"
 #include "event.h"
-#include "fw.h"
 #include "hal/hal.h"
 #include "line/line.h"
-#include "net/fw_reconcile.h"
 #include "net/iface.h"
+#include "net/peer.h"
 #include "net/ports.h"
 #include "proto/proto.h"
 #include "proto/sip/line.h"
@@ -1512,21 +1511,22 @@ void net_iface_recover_settle(void)
 {
 }
 
-void fw_reconcile_ask(const struct fw_sig_ask *ask)
+bool net_peer_admit(const char *dev, const char *host, bool ipv6,
+		    uint16_t port, unsigned int timeout_s)
+{
+	return false;
+}
+
+int net_peer_hold(const char *dev, const char *host, bool ipv6, uint16_t port)
+{
+	return -1;
+}
+
+void net_peer_release(int handle)
 {
 }
 
-void fw_reconcile_clear(void)
-{
-}
-
-unsigned int fw_reconcile_proxy_add(char (*list)[FW_SRC_MAX],
-				    unsigned int count, const char *addr)
-{
-	return count;
-}
-
-void fw_shutdown(void)
+void net_peer_done(void)
 {
 }
 

@@ -128,17 +128,14 @@ else()
 		"compiled out")
 endif()
 
-# The core network services every protocol reaches through the host table
-# (proto/proto.h): the netifd tracker, the media port pool, the conntrack bounds
-# and the firewall reconcile. A suite that drives them compiles the list into
-# itself.
-set(UVOICE_NET_SOURCES net/iface.c net/ports.c net/conntrack.c
-    net/fw_reconcile.c)
+# Core network services that every protocol reaches through the host table
+# (proto/proto.h). A suite that drives them compiles this list into itself.
+set(UVOICE_NET_SOURCES net/iface.c net/ports.c net/conntrack.c net/peer.c)
 
 # The core sources of uvoiced. The HAL arm below appends the backend, and
 # uvoice_core takes the whole list. dialplan.c is the one core object a
 # protocol links (proto/proto.h, the link rule).
-set(SOURCES main.c event_dispatch.c ubus.c fw.c cfg/uci.c line/line.c cdr.c
+set(SOURCES main.c event_dispatch.c ubus.c cfg/uci.c line/line.c cdr.c
 	    event.c calltrace.c status.c trace.c trace_ring.c pcapng.c
 	    spawn_run.c media_trace.c uvoice_random.c dialplan.c proto/proto.c
 	    ${UVOICE_NET_SOURCES})
@@ -475,14 +472,14 @@ if(UVOICE_TESTS)
 		# account.c and call.c into itself and links the whole SIP
 		# stack, because account.c references the transport and the
 		# resolver even though the pure helpers touch neither. The
-		# cases also read what the core does with the requests of the
-		# account layer, so proto_host_fake.c forwards the host entries
-		# to the real tracker, port pool, firewall and event spawner
-		# (PHF_NET_PORTS, PHF_NET_CORE), which link in with fw.c and
-		# libubus.
+		# cases also read what the core does with requests of the
+		# account layer. proto_host_fake.c therefore forwards the
+		# tracker, port pool, punch cadence and event entries to the
+		# core (PHF_NET_PORTS, PHF_NET_CORE), which links libubus. The
+		# peer entries stay recorders.
 		add_executable(test_account ${UVOICE_TEST_DIR}/unit/test_account.c
 			       ${UVOICE_TEST_DIR}/unit/proto_host_fake.c
-			       proto/sip/account.c proto/sip/call.c fw.c event.c
+			       proto/sip/account.c proto/sip/call.c event.c
 			       spawn_run.c trace.c ${UVOICE_NET_SOURCES})
 		target_include_directories(test_account PRIVATE
 					   ${UVOICE_TEST_DIR}/unit
@@ -510,25 +507,26 @@ if(UVOICE_TESTS)
 	target_link_libraries(test_net_iface ${UBUS_LIBRARY} ${UBOX_LIBRARY})
 	add_test(NAME test_net_iface COMMAND test_net_iface)
 
-	# The firewall reconcile of the core, over fw.c in its test mode, which
-	# spawns nothing. spawn_run.c and the port pool link in for fw.c and for
-	# the RTP ranges the reconcile takes from the config.
-	add_executable(test_net_fw ${UVOICE_TEST_DIR}/unit/test_net_fw.c
-		       net/fw_reconcile.c net/ports.c fw.c spawn_run.c trace.c)
-	target_include_directories(test_net_fw PRIVATE ${UVOICE_TEST_DIR}/unit
+	# Writer of the uvoice nft sets. The suite runs real spawns and
+	# uloop_process reaps against generated scripts in place of nft.
+	# spawn_run.c links in for the spawn, and conntrack.c for the hold
+	# bound.
+	add_executable(test_net_peer ${UVOICE_TEST_DIR}/unit/test_net_peer.c
+		       net/peer.c net/conntrack.c spawn_run.c trace.c)
+	target_include_directories(test_net_peer PRIVATE ${UVOICE_TEST_DIR}/unit
 				   ${CMAKE_CURRENT_SOURCE_DIR}
 				   ${UBOX_INCLUDE_DIR})
-	target_link_libraries(test_net_fw ${UBOX_LIBRARY})
-	add_test(NAME test_net_fw COMMAND test_net_fw)
+	target_link_libraries(test_net_peer ${UBOX_LIBRARY})
+	add_test(NAME test_net_peer COMMAND test_net_peer)
 
 	# The protocol registry, in two builds of one suite: test_proto carries
 	# the SIP flag alone, and test_proto_both the SIP and the MGCP flags.
 	# Each compiles proto/proto.c with its flags and defines a scripted SIP
 	# table itself. test_proto_both links the MGCP unit, so its MGCP table
-	# is the real one, and it exists under UVOICE_PROTO_MGCP alone. The host
-	# adapters of proto/proto.c reach the core services: net/, fw.c and
-	# cdr.c link in, and the suite stubs the line shell, the call trace and
-	# ubus. proto_host_fake.c is the recorder host the tables run on.
+	# is the real one, and it exists under UVOICE_PROTO_MGCP alone. Host
+	# adapters of proto/proto.c reach core services, so net/ and cdr.c
+	# link in. The suite stubs line shell, call trace and ubus. Tables run
+	# on the recorder host of proto_host_fake.c.
 	set(UVOICE_PROTO_SUITES test_proto)
 	if(UVOICE_PROTO_MGCP)
 		list(APPEND UVOICE_PROTO_SUITES test_proto_both)
@@ -536,7 +534,7 @@ if(UVOICE_TESTS)
 	foreach(suite ${UVOICE_PROTO_SUITES})
 		add_executable(${suite} ${UVOICE_TEST_DIR}/unit/test_proto.c
 			       ${UVOICE_TEST_DIR}/unit/proto_host_fake.c
-			       proto/proto.c ${UVOICE_NET_SOURCES} fw.c
+			       proto/proto.c ${UVOICE_NET_SOURCES}
 			       spawn_run.c cdr.c trace.c uvoice_random.c)
 		target_include_directories(${suite} PRIVATE
 					   ${UVOICE_TEST_DIR}/unit

@@ -7,7 +7,7 @@
  * Licensed under GPL-2.0-only with the linking exception stated in LICENSE.
  *
  * The signaling protocol contract. The core (the line shell, the HAL, the
- * network tracker, the firewall reconcile, the records and the northbound)
+ * network tracker, the firewall sets, the records and the northbound)
  * offers its services through struct proto_host. A signaling protocol (SIP,
  * MGCP) exports struct proto_ops. One protocol runs per daemon and it owns
  * every line. The build selects which protocols the image carries, and
@@ -327,31 +327,6 @@ struct net_iface_sub {
 	unsigned int (*down_count)(void *priv);
 };
 
-/*
- * The firewall ask of a protocol (host->fw_ask). The core computes the RTP
- * ranges from the config it took (fw_reconcile_cfg_take); the protocol names
- * what only it knows.
- *
- * active_mask has bit i set for each line i the protocol runs. port[i] is the
- * signaling port of line i. proto_udp is true for a datagram transport.
- * proxy holds nproxy proxy source addresses in the sorted order
- * host->fw_proxy_add keeps; restrict_source 1 admits signaling from these
- * alone.
- *
- * The two bounds equal FW_PROXY_MAX and FW_SRC_MAX of fw.h, which
- * net/fw_reconcile.h asserts.
- */
-#define PROTO_FW_PROXY_MAX	16
-#define PROTO_FW_SRC_MAX	48
-
-struct fw_sig_ask {
-	uint32_t active_mask;
-	uint16_t port[CFG_CHANNEL_MAX];
-	bool proto_udp;
-	char proxy[PROTO_FW_PROXY_MAX][PROTO_FW_SRC_MAX];
-	unsigned int nproxy;
-};
-
 /* Why host->tls_cert_stop runs: a config that no longer asks for the
  * bundle clears it, and a shutdown only reaps the fetch. */
 enum proto_tls_stop {
@@ -629,8 +604,8 @@ struct proto_host {
 	void (*tls_cert_stop)(void *ctx, enum proto_tls_stop mode);
 
 	/*
-	 * Network. net/iface.h, net/ports.h, net/conntrack.h and
-	 * net/fw_reconcile.h hold the contracts.
+	 * Network. net/iface.h, net/ports.h, net/conntrack.h and net/peer.h
+	 * hold the contracts.
 	 */
 
 	/* Install the one tracker subscriber. net_iface_subscribe(). */
@@ -667,14 +642,15 @@ struct proto_host {
 	unsigned int (*net_ct_udp_bound_s)(void *ctx);
 	/* The media punch cadence. net_ct_punch_interval_ms(). */
 	uint16_t (*net_ct_punch_interval_ms)(void *ctx);
-	/* Reconcile the firewall with ask. fw_reconcile_ask(). */
-	void (*fw_ask)(void *ctx, const struct fw_sig_ask *ask);
-	/* Remove every VoIP rule. fw_reconcile_clear(). */
-	void (*fw_clear)(void *ctx);
-	/* Add one proxy source to a sorted list; answers the new count.
-	 * fw_reconcile_proxy_add(). */
-	unsigned int (*fw_proxy_add)(void *ctx, char (*list)[PROTO_FW_SRC_MAX],
-				     unsigned int count, const char *addr);
+	/* Queue one timed element of the uvoice sets. net_peer_admit(). */
+	bool (*peer_admit)(void *ctx, const char *dev, const char *host,
+			   bool ipv6, uint16_t port, unsigned int timeout_s);
+	/* Hold an element until it is released; answers a handle or -1.
+	 * net_peer_hold(). */
+	int (*peer_hold)(void *ctx, const char *dev, const char *host,
+			 bool ipv6, uint16_t port);
+	/* Stop writing a held element. net_peer_release(). */
+	void (*peer_release)(void *ctx, int handle);
 
 	/*
 	 * Records and trace. A record is keyed by the stream of its leg.
@@ -775,7 +751,7 @@ struct proto_ops {
 	 */
 	void (*dsp_ready)(uint32_t features, uint32_t codecs);
 	/* Apply a new config. The protocol tears down the legs of a line whose
-	 * RTP range moved and asks the firewall again. */
+	 * RTP range moved and takes its set elements again. */
 	void (*reload)(const struct cfg *old_cfg, const struct cfg *new_cfg);
 	/* Begin the graceful stop. */
 	void (*shutdown_begin)(void);
@@ -930,7 +906,8 @@ void proto_reload(const struct cfg *old_cfg, const struct cfg *new_cfg);
  */
 void proto_stop_wait(void);
 
-/* Run ops->done once, after hal_close(), and clear the firewall. */
+/* Run ops->done once, after hal_close(), and stop the writer of the set
+ * elements. */
 void proto_done(void);
 
 /* The signaling table of "voice status": the protocol, its state, the error

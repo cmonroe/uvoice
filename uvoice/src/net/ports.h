@@ -6,10 +6,9 @@
  *
  * Licensed under GPL-2.0-only with the linking exception stated in LICENSE.
  *
- * The RTP port pool of the daemon and the effective port range of a channel
- * (src/net/ports.c). The pool hands out even ports, so RTCP takes the odd port
- * above each one. The firewall reconcile opens exactly the range the pool
- * draws from, because both read net_port_range().
+ * RTP port pool of the daemon and effective port range of a channel
+ * (src/net/ports.c). The pool hands out even ports; RTCP takes the odd port
+ * above each one.
  */
 #ifndef UVOICE_NET_PORTS_H
 #define UVOICE_NET_PORTS_H
@@ -42,7 +41,8 @@ void net_port_range(const struct cfg_channel *ch, uint16_t *min, uint16_t *max);
 
 /*
  * Whether two channel configurations name the same effective range. A reload
- * clears the legs of a line whose range moved before the firewall rule moves.
+ * clears the legs of a line whose range moved, because the pool takes a new
+ * range only while no port is out.
  */
 bool net_port_range_eq(const struct cfg_channel *a,
 		       const struct cfg_channel *b);

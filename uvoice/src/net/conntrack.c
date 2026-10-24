@@ -11,9 +11,9 @@
 #include "net/conntrack.h"
 
 /*
- * The two conntrack timeouts a restrict_source 2 pinhole lives under, read
- * from procfs at runtime because /etc/config/conntrack can override both, and
- * the values the box ships when a file cannot be read. The smaller one bounds
+ * The two conntrack timeouts a pinhole lives under, read from procfs at
+ * runtime because /etc/config/conntrack can override both, and the values the
+ * box ships when a file cannot be read. The smaller one bounds
  * the refresher: the kernel grants the stream timeout only to an entry that
  * saw a reply more than 2 s after its creation, so a REGISTER exchange inside
  * 2 s leaves the entry on the plain timeout.
@@ -82,10 +82,8 @@ unsigned int net_ct_udp_bound_s(void)
 }
 
 /*
- * Half the bound, so an idle descriptor is refreshed inside it under
- * restrict_source 2. It is passed in every mode, because the empty datagram
- * costs nothing under a firewall rule and the cadence has to hold the moment
- * the mode moves.
+ * Half the bound, so an idle media descriptor is refreshed inside it. Nothing
+ * opens the RTP range, so the media needs it.
  */
 uint16_t net_ct_punch_interval_ms(void)
 {

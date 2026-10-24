@@ -23,7 +23,7 @@
  *
  * How it publishes. It runs /usr/srg/scripts/event-post.sh with an argv array
  * through the shared spawn (spawn_run.h), and reaps the child through
- * uloop_process, the way fw.c drives firewall_exception. No shell: an argv
+ * uloop_process, the way net/peer.c drives nft. No shell: an argv
  * array needs no shell quoting and cannot be re-parsed.
  *
  * Soft gate. The script belongs to the eventmgr package, which uvoice does not
@@ -116,10 +116,10 @@ void event_tls_cert_stop(enum event_tls_stop_mode mode);
 
 /*
  * Final teardown at process exit. Reaps a post still in flight on every line
- * and forgets a queued state. The waitpid is unbounded, the fw_shutdown() rule:
- * event-post.sh returns as soon as it has backgrounded its worker, and its own
- * 2 s gate lock bounds the wait in practice, but nothing in this daemon caps
- * it. uloop must still be valid.
+ * and forgets a queued state. The waitpid has no bound, as in net_peer_done():
+ * event-post.sh returns as soon as it has backgrounded its worker, and
+ * its own 2 s gate lock bounds the wait in practice, but nothing in this
+ * daemon caps it. uloop must still be valid.
  */
 void event_done(void);
 
@@ -127,7 +127,7 @@ void event_done(void);
 bool event_available(void);
 
 /*
- * Test mode, never used by the daemon, on the fw.c shape. event_test_mode()
+ * Test mode, never used by the daemon. event_test_mode()
  * resets the layer and makes it believe the script exists while suppressing
  * the spawn, so a post records its vector and the fixture completes the child
  * by hand with event_test_reap(). event_test_mode(false) resets it back to the

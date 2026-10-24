@@ -499,7 +499,9 @@ static void base_tests(void)
 	const char no_base[] =
 		"config channel 'channel1'\n"
 		"\toption id '0'\n";
+	const struct cfg_option_desc *d;
 	struct cfg_fixture fixture;
+	unsigned int found = 0;
 
 	CASE("missing base section keeps every base default");
 	FIXTURE_LOAD_OR_RETURN(fixture, fixture_load(no_base));
@@ -508,7 +510,7 @@ static void base_tests(void)
 	CHECK_CSTR(fixture.cfg->local_interface, "wan");
 	CHECK_CSTR(fixture.cfg->transport, "udp");
 	CHECK_CSTR(fixture.cfg->region, "US");
-	CHECK_UINT(fixture.cfg->restrict_source, 2);
+	CHECK_UINT(fixture.cfg->restrict_source, 1);
 	CHECK_UINT(fixture.cfg->options_interval, 0);
 	CHECK(fixture.cfg->keepalive_enabled);
 	CHECK_UINT(fixture.cfg->keepalive_interval, 30);
@@ -531,8 +533,44 @@ static void base_tests(void)
 	CASE("invalid restrict source uses enum default");
 	FIXTURE_LOAD_OR_RETURN(fixture, fixture_load(
 		"config base 'base'\n\toption restrict_source '5'\n"));
+	CHECK_UINT(fixture.cfg->restrict_source, 1);
+	fixture_free(&fixture);
+
+	/* a D2 config carries 0, 1 or 2, and uvoice reads none of them */
+	CASE("restrict source 2 loads as stored and warns nothing");
+	warn_capture_begin();
+	FIXTURE_LOAD_OR_RETURN(fixture, fixture_load(
+		"config base 'base'\n\toption restrict_source '2'\n"));
+	CHECK_UINT(warn_capture_count("restrict_source"), 0);
+	warn_capture_end();
 	CHECK_UINT(fixture.cfg->restrict_source, 2);
 	fixture_free(&fixture);
+
+	CASE("restrict source 0 loads as stored and warns nothing");
+	warn_capture_begin();
+	FIXTURE_LOAD_OR_RETURN(fixture, fixture_load(
+		"config base 'base'\n\toption restrict_source '0'\n"));
+	CHECK_UINT(warn_capture_count("restrict_source"), 0);
+	warn_capture_end();
+	CHECK_UINT(fixture.cfg->restrict_source, 0);
+	fixture_free(&fixture);
+
+	CASE("restrict source 1 loads as stored");
+	FIXTURE_LOAD_OR_RETURN(fixture, fixture_load(
+		"config base 'base'\n\toption restrict_source '1'\n"));
+	CHECK_UINT(fixture.cfg->restrict_source, 1);
+	fixture_free(&fixture);
+
+	CASE("schema: restrict_source is accepted and unsupported, default 1");
+	for (d = cfg_base_options; d->name; d++) {
+		if (strcmp(d->name, "restrict_source"))
+			continue;
+
+		found++;
+		CHECK_UINT(d->support, SUP_ACCEPTED_UNSUPPORTED);
+		CHECK_CSTR(d->def, "1");
+	}
+	CHECK_UINT(found, 1);
 
 	CASE("zero RTCP interval clamps to one");
 	FIXTURE_LOAD_OR_RETURN(fixture, fixture_load(
@@ -5579,7 +5617,7 @@ static void dump_config_word_tests(void)
 
 	CASE("the number-valued enums still dump as integers");
 	FIXTURE_LOAD_OR_RETURN(fixture, fixture_load(
-		"config base 'base'\n\toption restrict_source '2'\n"
+		"config base 'base'\n\toption restrict_source '0'\n"
 		"config channel 'channel1'\n\toption id '0'\n"
 		"\toption digit_esc_enabled '2'\n"
 		"\toption local_conf_enabled '1'\n"
@@ -5595,7 +5633,7 @@ static void dump_config_word_tests(void)
 	blobmsg_parse_attr(int_dump_policy, DUMP_MAX, int_dump_fields, buf.head);
 	CHECK(int_dump_fields[DUMP_RESTRICT_SOURCE] != NULL);
 	if (int_dump_fields[DUMP_RESTRICT_SOURCE])
-		CHECK_UINT(blobmsg_get_u32(int_dump_fields[DUMP_RESTRICT_SOURCE]), 2);
+		CHECK_UINT(blobmsg_get_u32(int_dump_fields[DUMP_RESTRICT_SOURCE]), 0);
 	channel_entry = int_dump_fields[DUMP_CHANNEL] ?
 		(struct blob_attr *)blobmsg_data(int_dump_fields[DUMP_CHANNEL]) :
 		NULL;

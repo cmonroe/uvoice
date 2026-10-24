@@ -20,9 +20,8 @@
  * one until dst_at() answers NULL. No transaction carries a ping and no
  * destination is penalized for one. A round whose index 0 is NULL is skipped
  * and counted; the timer always re-arms. The round runs whenever the CRLF
- * side is enabled, whatever firewall mode the account runs under: under the
- * conntrack pinhole form every destination of the round is a tuple the box
- * has to keep alive, and under a firewall rule the extra pings cost nothing.
+ * side is enabled, and every destination of the round is a tuple the box has
+ * to keep alive.
  *
  * The pong side does not live here: the transport reports an inbound
  * CRLF-only datagram through its ping callback, and the account answers a

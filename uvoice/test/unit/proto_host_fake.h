@@ -17,11 +17,14 @@
  *
  *   PHF_NET_PORTS  the four net_port entries reach the real pool of
  *                  net/ports.c, which the suite compiles in.
- *   PHF_NET_CORE   the tracker, the conntrack bounds, the firewall reconcile
- *                  and the two event entries reach the core functions of
- *                  proto/proto.c's own adapters (net/iface.h, net/conntrack.h,
- *                  net/fw_reconcile.h, event.h, calltrace_event), which the
- *                  suite compiles in or records itself.
+ *   PHF_NET_CORE   the tracker, the conntrack bounds and the two event
+ *                  entries reach the core functions of proto/proto.c's own
+ *                  adapters (net/iface.h, net/conntrack.h, event.h,
+ *                  calltrace_event), which the suite compiles in or records
+ *                  itself.
+ *
+ * The three peer entries stay recorders under both groups, so a suite reads
+ * the set elements a protocol asks for and no nft runs.
  *
  * The suite calls proto_host_fake_reset() and hands proto_host_fake() to the
  * ops table under test as its host. The entries that act on a line or a
@@ -96,9 +99,9 @@ enum phf_entry {
 	PHF_NET_PORT_FREE,
 	PHF_NET_CT_UDP_BOUND_S,
 	PHF_NET_CT_PUNCH_INTERVAL_MS,
-	PHF_FW_ASK,
-	PHF_FW_CLEAR,
-	PHF_FW_PROXY_ADD,
+	PHF_PEER_ADMIT,
+	PHF_PEER_HOLD,
+	PHF_PEER_RELEASE,
 	PHF_CDR_CALL_STARTED,
 	PHF_CDR_CALL_SEQ,
 	PHF_CDR_CALL_CORRELATE,
@@ -139,6 +142,21 @@ struct phf_hop {
 };
 
 /*
+ * One set element a protocol asked for: an admit with its timeout, or a hold,
+ * which has none. live is the state of a hold slot.
+ */
+#define PHF_PEER_MAX	16
+
+struct phf_peer {
+	char dev[16];
+	char host[48];
+	bool ipv6;
+	uint16_t port;
+	unsigned int timeout_s;
+	bool live;
+};
+
+/*
  * What the recorder holds. n[] counts the calls of each entry; the fields
  * below keep the last arguments. The answers are what the entries return,
  * and a case moves them before it calls the code under test.
@@ -160,7 +178,6 @@ struct phf_rec {
 	char verb[32];
 	char log_text[256];
 	int log_level;
-	struct fw_sig_ask fw_ask;
 	struct net_iface_sub sub;
 	bool sub_set;
 
@@ -214,6 +231,14 @@ struct phf_rec {
 	/* the answer of net_iface_source_host_probe without PHF_NET_CORE, no
 	 * address when NULL */
 	const char *probe_addr;
+	/* the answer of net_iface_bind_device without PHF_NET_CORE, no device
+	 * when NULL */
+	const char *bind_dev;
+	/* the admits in call order, a call past PHF_PEER_MAX counted in n[]
+	 * alone, and the hold slots, indexed by the handle peer_hold answers */
+	struct phf_peer admit[PHF_PEER_MAX];
+	unsigned int nadmit;
+	struct phf_peer hold[PHF_PEER_MAX];
 };
 
 extern struct phf_rec phf;

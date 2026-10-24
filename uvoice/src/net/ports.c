@@ -35,9 +35,9 @@ void net_port_reset(void)
 }
 
 /*
- * The one place the unset and incoherent cases are decided. net_port_range()
- * and the allocator both go through it, so the firewall and the pool cannot
- * disagree about which ports a call may use.
+ * port_range_norm() decides the unset and incoherent cases in one place.
+ * net_port_range() and the allocator both call it, so a caller of the range
+ * and the pool cannot disagree about which ports a call can use.
  */
 static void port_range_norm(unsigned int *min, unsigned int *max)
 {

@@ -439,8 +439,9 @@ const CONFIG_LEGEND = {
 		         [2]: "conference with transfer" }
 	},
 	restrict_source: {
-		words: { [0]: "open", [1]: "proxy addresses",
-		         [2]: "keepalive pinhole" }
+		words: { [0]: "accepted, no effect",
+		         [1]: "accepted, no effect",
+		         [2]: "accepted, no effect" }
 	},
 	call_fwd_local_mode: {
 		bits: { [1]: "unconditional", [2]: "busy", [4]: "no answer" }

@@ -1047,15 +1047,15 @@ struct hal_media {
 	 *
 	 * The longest a media descriptor stays silent, in milliseconds, before
 	 * the backend sends an empty datagram on it (RFC 6263 4.1: a receiver
-	 * discards it on the RFC 3550 minimum length). Inbound media under
-	 * restrict_source 2 is admitted by connection tracking alone, and an
-	 * entry exists only after this box sent on the tuple, so the empty
-	 * datagram is what makes the entry exist before the far end's first
-	 * packet, on a stream that receives before it sends, and what keeps it
-	 * from aging out on a stream that stays silent. The call layer passes
-	 * half the conntrack udp bound of the moment, capped at the RFC 6263
-	 * section 7 interval (account.h, acct_call_view). 0 takes the backend
-	 * default. A backend with no such mechanism ignores it: the stub.
+	 * discards it on the RFC 3550 minimum length). Connection tracking
+	 * alone admits inbound media, and a conntrack entry exists only after
+	 * this box sends on the tuple. The empty datagram creates that entry
+	 * before the first packet of the far end on a stream that receives
+	 * first. It also keeps the entry from expiry on a silent stream. The
+	 * call layer passes half the conntrack udp bound of the moment, capped
+	 * at the RFC 6263 section 7 interval (account.h, acct_call_view). 0
+	 * takes the backend default. A backend with no such mechanism ignores
+	 * it: the stub.
 	 */
 	uint16_t punch_interval_ms;
 };

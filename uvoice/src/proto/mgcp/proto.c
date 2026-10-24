@@ -23,6 +23,11 @@
  * opens it. A bind that fails when the endpoints come up settles the
  * recovery, so the tracker arms it with no interface event.
  *
+ * Set elements. The socket holds one uvoice set element (net/peer.h) per call
+ * agent address. The elements follow the socket device and the addresses
+ * that the call agent name resolves to. A socket bound without a device
+ * holds none.
+ *
  * Restart. Every option of the section restarts the unit on a reload: the
  * endpoints leave service on the wire, and the unit starts again with the
  * new section.
@@ -120,6 +125,12 @@ static struct {
 	bool sock_failed;		/* bind failed, the recovery retries */
 	struct sockaddr_storage local;
 	char addr4[NET_IFACE_ADDR_MAX];
+
+	/* the device sock_open() bound, empty for an unscoped bind */
+	char sock_dev[HAL_IFNAME_MAX];
+	/* net_peer hold handles, one per call agent address */
+	int hold[MP_ADDR_MAX];
+	unsigned int holds;
 
 	uint32_t svc_off;		/* lines out of service by the core */
 	uint32_t land;			/* staged config that waits for rest */
@@ -427,7 +438,7 @@ static struct mp_name *name_get(const char *domain)
 	return n;
 }
 
-static void fw_ask_send(void);
+static void peer_holds_sync(void);
 static void unit_up(void);
 
 static void dns_done(struct sip_dns *r, uint32_t query, uint32_t owner,
@@ -459,7 +470,7 @@ static void dns_done(struct sip_dns *r, uint32_t query, uint32_t owner,
 	}
 	n->expires_ms = n->resolved_ms + (uint64_t)res->ttl * 1000u;
 	MP_TRACE("resolve %s: %u addresses", n->domain, n->count);
-	fw_ask_send();
+	peer_holds_sync();
 	if (!n->count) {
 		name_failed(n);
 		return;
@@ -666,6 +677,65 @@ static void sock_read(struct uloop_fd *ufd, unsigned int events)
 	}
 }
 
+/* ---------------------------------------------------- the set elements */
+
+static void peer_holds_release(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < mp.holds; i++)
+		mp.host->peer_release(mp.host->ctx, mp.hold[i]);
+	mp.holds = 0;
+}
+
+static void peer_hold_take(const char *host, bool ipv6)
+{
+	int h;
+
+	if (mp.holds >= MP_ADDR_MAX)
+		return;
+
+	h = mp.host->peer_hold(mp.host->ctx, mp.sock_dev, host, ipv6,
+			       (uint16_t)mp.cfg.local_port);
+	if (h >= 0)
+		mp.hold[mp.holds++] = h;
+}
+
+/*
+ * Set elements of the socket, one per address of the configured call agent:
+ * the literal, or each address that its name resolved to. sock_open() and
+ * dns_done() run it, because the device or the address set can move, and it
+ * releases and takes every hold again. A socket bound without a device holds
+ * nothing, because the set key needs a device.
+ */
+static void peer_holds_sync(void)
+{
+	const char *ca = mp.cfg.call_agent;
+	char host[INET6_ADDRSTRLEN];
+	struct mp_name *n;
+	unsigned int i;
+
+	peer_holds_release();
+	if (!mp.sock_up)
+		return;
+
+	if (!mp.sock_dev[0]) {
+		MP_TRACE("socket unscoped, no set element");
+		return;
+	}
+
+	if (ip_literal(AF_INET, ca) || ip_literal(AF_INET6, ca)) {
+		peer_hold_take(ca, ip_literal(AF_INET6, ca));
+		return;
+	}
+
+	n = ca[0] ? name_find(ca) : NULL;
+	for (i = 0; n && i < n->count; i++) {
+		if (sip_dst_host(&n->addr[i], host, sizeof(host)))
+			peer_hold_take(host, false);
+	}
+}
+
 static void sock_close(void)
 {
 	if (mp.ufd.fd >= 0) {
@@ -674,6 +744,8 @@ static void sock_close(void)
 	}
 	mp.ufd.fd = -1;
 	mp.sock_up = false;
+	mp.sock_dev[0] = '\0';
+	peer_holds_release();
 }
 
 /*
@@ -687,6 +759,7 @@ static bool sock_open(void)
 	struct sockaddr_storage sa;
 	socklen_t slen = sizeof(mp.local);
 	int fd, err, tos = (int)((mp.cfg.signaling_dscp & 0x3f) << 2);
+	const char *dev = bind_dev();
 
 	sock_close();
 	mp.sock_failed = false;
@@ -697,7 +770,7 @@ static bool sock_open(void)
 		    IPPROTO_UDP);
 	if (fd < 0)
 		goto fail;
-	if (!sock_iface_bind(fd, bind_dev()) ||
+	if (!sock_iface_bind(fd, dev) ||
 	    bind(fd, (struct sockaddr *)&sa, sa_len_of(AF_INET)) < 0 ||
 	    getsockname(fd, (struct sockaddr *)&mp.local, &slen) < 0)
 		goto fail_fd;
@@ -713,8 +786,10 @@ static bool sock_open(void)
 	}
 
 	mp.sock_up = true;
+	str_copy(mp.sock_dev, sizeof(mp.sock_dev), dev);
 	MP_TRACE("socket on port %u, device %s", mp.cfg.local_port,
-		 bind_dev()[0] ? bind_dev() : "-");
+		 mp.sock_dev[0] ? mp.sock_dev : "-");
+	peer_holds_sync();
 
 	return true;
 
@@ -728,47 +803,6 @@ fail:
 		     mp.cfg.local_port, strerror(errno));
 
 	return false;
-}
-
-/* ---------------------------------------------------- the firewall ask */
-
-/*
- * The signaling port of every enabled line and the addresses of the
- * configured call agent as the proxy sources (net/fw_reconcile.h).
- */
-static void fw_ask_send(void)
-{
-	char domain[CFG_MGCP_DOMAIN_MAX + 2];
-	char host[PROTO_FW_SRC_MAX];
-	struct fw_sig_ask ask;
-	struct mp_name *n;
-	unsigned int i;
-
-	if (!mp.started || mp.stopping)
-		return;
-
-	memset(&ask, 0, sizeof(ask));
-	ask.proto_udp = true;
-	for (i = 0; i < mp.lines; i++) {
-		if (!(mp.enabled & (1u << i)))
-			continue;
-		ask.active_mask |= 1u << i;
-		ask.port[i] = (uint16_t)mp.cfg.local_port;
-	}
-
-	str_copy(domain, sizeof(domain), mp.cfg.call_agent);
-	n = domain[0] ? name_find(domain) : NULL;
-	if (ip_literal(AF_INET, domain) || ip_literal(AF_INET6, domain))
-		ask.nproxy = mp.host->fw_proxy_add(mp.host->ctx, ask.proxy,
-						   ask.nproxy, domain);
-	for (i = 0; n && i < n->count; i++) {
-		if (sip_dst_host(&n->addr[i], host, sizeof(host)))
-			ask.nproxy = mp.host->fw_proxy_add(mp.host->ctx,
-							   ask.proxy,
-							   ask.nproxy, host);
-	}
-
-	mp.host->fw_ask(mp.host->ctx, &ask);
 }
 
 /* ---------------------------------------------------- the transaction env */
@@ -965,7 +999,6 @@ static void unit_restart(const struct cfg *cfg)
 	mgr_up();
 	ca_name_kick();
 	unit_up();
-	fw_ask_send();
 }
 
 /* A disconnected procedure that waits for the socket tries at once. */
@@ -1082,7 +1115,6 @@ static void mgcp_start(const struct cfg *cfg)
 	iface_take(mp.host->net_iface_state_get(mp.host->ctx));
 	ca_name_kick();
 	unit_up();
-	fw_ask_send();
 }
 
 static void mgcp_dsp_ready(uint32_t features, uint32_t codecs)
@@ -1118,7 +1150,6 @@ static void mgcp_reload(const struct cfg *old_cfg, const struct cfg *new_cfg)
 		mgcp_ep_service(&mp.gw, i, false, MGCP_EP_REASON_OOS);
 		mgcp_ep_service(&mp.gw, i, true, 0);
 	}
-	fw_ask_send();
 }
 
 static void mgcp_shutdown_begin(void)

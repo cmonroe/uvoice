@@ -46,7 +46,7 @@ The runner covers these flows:
 | `stream-subscribe-tcp` | Subscribe to the message-summary event over TCP. Require `SIP/2.0/TCP` in the SUBSCRIBE Via and `;transport=tcp` in its Contact. (note) |
 | `stream-subscribe-tls` | Same subscription over TLS (`stream_subscribe_run tls`), on a client-only line. The DUT is client of both requests, so no bundle is installed. Checks and the two-instance verdict follow the TCP flow. |
 | `cert-fetch` | Fetch a TLS certificate bundle from a local http server through `uvoiced`. Require all three outcomes: install, unchanged ETag, and an unsupported scheme refused with the bundle still standing. (note) |
-| `reload-loop` | Drive thirty live `voice reload`s over an installed TLS bundle. Each reload moves a `tls_*` option, so the certificate helper starts and the daemon rebuilds line 0 in one frame. Require its listener back after each reload, no failed bind and no line-less firewall reconcile. (note) |
+| `reload-loop` | Drive thirty live `voice reload`s over an installed TLS bundle. Each reload moves a `tls_*` option, so the certificate helper starts and the daemon rebuilds line 0 in one frame. Require its listener back after each reload and no failed bind. (note) |
 | `xfer-blind` | Place a call, flash, dial `*072` and a target, and require a blind referral. The DUT sends no BYE: the peer plays a switch's order behind its 202 and ends that leg itself. Its call record carries the transfer key. (note) |
 | `xfer-blind-grace` | Same gesture, against a peer that sends no BYE of its own. The DUT sends one BYE, one grace behind its answer to the verdict NOTIFY, read from SIPp's message log. |
 | `xfer-attended` | Same call with `*073`, completed by a sipfrag 200. The machine ends in OFFHOOK_DIAL, a fresh dial tone. The DUT sends its BYE one grace behind its answer, and its call record carries the transfer key. (note) |
@@ -345,8 +345,7 @@ Notes:
      its reload frame;
   4. requires `lines[0].listener` true.
 
-  At the end, `daemon.log` must carry no "Address already in use" and no
-  "no active line" reconcile.
+  At the end, `daemon.log` must carry no "Address already in use".
 - **`xfer-blind`.** `xfer_transferor_run` with `uas_xfer_blind`, target
   5552000, dialed as `*0725552000#`. The machine ends in OFFHOOK_DIAL. The
   REFER carries exactly one `Refer-To` `<sip:5552000@127.0.0.1>`,
@@ -695,6 +694,11 @@ place, such as `taskset`, is safe.
 
 The host library prefix is `/tmp/uvoice-host/prefix`. Set
 `UVOICE_HOST_PREFIX` to select another prefix.
+
+**nft writer.** The runner exports `UVOICE_NFT` as a path that does not exist.
+Reason: the daemon under test must not change the host nftables. Each attempt
+to write a set element traces "firewall: ... absent, no set element", and the
+daemon starts no `nft` child (`src/net/peer.c`).
 
 Run tls flows with the second SIPp build:
 
@@ -1567,8 +1571,8 @@ it closes its listener and binds a new one on that port.
 descriptor until its `execve`. While a child held that copy, a `close()` in
 the daemon would not destroy its listening socket. Linux refuses a bind
 against a `TCP_LISTEN` holder, whatever `SO_REUSEADDR` says on either side.
-The line would then come up dead with `Address already in use`, and its VoIP
-firewall rules would go with it until the next reload.
+The line would then come up dead with `Address already in use` until the next
+reload.
 
 **Two C libraries.** `posix_spawn(3)` closes that window in a different way on
 each C library:

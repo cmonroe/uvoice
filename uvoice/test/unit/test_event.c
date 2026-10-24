@@ -1600,11 +1600,10 @@ static void spawn_listener_cases(void)
 }
 
 /*
- * The stdout of the helper is /dev/null, and its stderr stays the stderr of
- * the daemon (spawn_run.h). Reason: procd logs the stdio of the daemon under
- * the name of the daemon. The firewall helper prints a line for each delete
- * of a rule that does not exist. The case swaps its own stdio for two
- * pipes around the spawn, and reads what the child wrote to each.
+ * A helper's stdout goes to /dev/null, and its stderr stays the daemon's
+ * (spawn_run.h), because procd logs the daemon's stdio under the daemon's
+ * name. The case swaps its own stdio for two pipes around the spawn and reads
+ * what the child writes to each.
  */
 static void test_spawn_stdio(void)
 {

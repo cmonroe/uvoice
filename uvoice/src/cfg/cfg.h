@@ -481,7 +481,8 @@ struct cfg {
 	 */
 	bool srtp_enabled;
 	char region[CFG_STR_MAX];		/* default US */
-	unsigned int restrict_source;		/* 0 open, 1 proxy IPs, 2 pinhole */
+	/* accepted for D2, no effect in uvoice; cfg_dump() reports it */
+	unsigned int restrict_source;
 	unsigned int options_interval;
 	unsigned int keepalive_interval;
 	bool keepalive_enabled;
@@ -497,12 +498,12 @@ struct cfg {
 	 */
 	enum cfg_dns_srv_mode dns_srv_mode;
 	/*
-	 * Seconds a proxy address a resolver answer named keeps its inbound
-	 * admission after it leaves the answer: the keepalive round holds its
-	 * conntrack pinhole under restrict_source 2, and mode 1 keeps its
-	 * allow rule. 0 turns the retention off. A pool that publishes one
-	 * rotating record per query needs it, because inbound requests can
-	 * arrive from any pool member.
+	 * Seconds that a proxy address keeps its inbound admission after it
+	 * drops out of the resolver answer. During that window the keepalive
+	 * round of a udp line pings the address and writes its set element. 0
+	 * turns the retention off. A pool that publishes one rotating record
+	 * per query needs it, because inbound requests can come from any pool
+	 * member.
 	 */
 	unsigned int dns_linger;
 	bool mwi_subscribe;

@@ -594,7 +594,7 @@
         "options_alive": { "$ref": "#/$defs/U64" },
         "options_failed": { "$ref": "#/$defs/U64" },
         "options_skipped": { "$ref": "#/$defs/U64" },
-        "interval": { "$ref": "#/$defs/U32", "description": "Effective CRLF round seconds, after the restrict_source 2 clamp." },
+        "interval": { "$ref": "#/$defs/U32", "description": "Effective CRLF round seconds. A udp line runs its round inside half the conntrack udp bound." },
         "ct_bound": { "$ref": "#/$defs/U32", "description": "The conntrack udp bound the round runs under, seconds." }
       },
       "required": ["crlf_sent", "crlf_skipped", "crlf_failed", "options_sent", "options_alive", "options_failed", "options_skipped", "interval", "ct_bound"],

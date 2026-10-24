@@ -10,8 +10,8 @@
  *
  * Isolation. The suite compiles proto/proto.c with build flags of the
  * protocols. It defines a scripted SIP table whose entries count their calls.
- * Host adapters of proto/proto.c reach real net/, fw.c and cdr.c objects where
- * they need no daemon. Inert stubs below stand for line shell, call trace and
+ * Host adapters of proto/proto.c reach real net/ and cdr.c objects where they
+ * need no daemon. Inert stubs below stand for line shell, call trace and
  * ubus. Tables under test run on a recorder host (proto_host_fake.c).
  *
  * Two builds. cmake builds the suite twice. test_proto carries
@@ -836,7 +836,7 @@ static void test_host_build(void)
 	CHECK(h->net_port_range && h->net_port_range_eq && h->net_port_alloc &&
 	      h->net_port_free);
 	CHECK(h->net_ct_udp_bound_s && h->net_ct_punch_interval_ms);
-	CHECK(h->fw_ask && h->fw_clear && h->fw_proxy_add);
+	CHECK(h->peer_admit && h->peer_hold && h->peer_release);
 	CHECK(h->cdr_call_started && h->cdr_call_seq && h->cdr_call_correlate &&
 	      h->cdr_call_answered && h->cdr_call_conferenced &&
 	      h->cdr_call_ended);
@@ -1122,15 +1122,8 @@ static void ca_close(void)
 /* No domain option and no local address: the endpoints wait for a name. */
 static void test_mgcp_waiting(const struct proto_ops *ops, struct blob_buf *b)
 {
-	CASE("mgcp table: the firewall ask names each line port and the call "
-	     "agent");
-	CHECK(phf.n[PHF_FW_ASK] >= 1);
-	CHECK_UINT(phf.fw_ask.active_mask, 3);
-	CHECK_UINT(phf.fw_ask.port[0], 2427);
-	CHECK_UINT(phf.fw_ask.port[1], 2427);
-	CHECK(phf.fw_ask.proto_udp);
-	CHECK_UINT(phf.fw_ask.nproxy, 1);
-	CHECK(!strcmp(phf.fw_ask.proxy[0], "192.0.2.1"));
+	CASE("mgcp table: a socket that waits holds no set element");
+	CHECK_UINT(phf.n[PHF_PEER_HOLD], 0);
 
 	CASE("mgcp table: without a name the lines array is empty");
 	blob_buf_init(b, 0);
@@ -1376,13 +1369,12 @@ static void fdns_close(void)
 	close(fdns.ufd.fd);
 }
 
-/* The unit up to its start on the call agent name ca.test, whose resolver
+/* The unit up to its start on the config the caller filled, whose resolver
  * asks the DNS server of the suite. */
-static void mgcp_named_init(const struct proto_ops *ops, const char *domain)
+static void mgcp_named_boot(const struct proto_ops *ops)
 {
 	struct sip_txn_dst srv;
 
-	cfg_mgcp_fill("ca.test", ca.port, 0, domain);
 	proto_host_fake_reset();
 	phf.cfg = &cfg;
 	phf.probe_addr = "127.0.0.1";
@@ -1390,6 +1382,13 @@ static void mgcp_named_init(const struct proto_ops *ops, const char *domain)
 	mgcp_clock_bind();
 	if (sip_dst_set(&srv, "127.0.0.1", fdns.port))
 		sip_dns_servers_set(mgcp_proto_test_dns(), &srv, 1);
+}
+
+/* The unit up to its start on the call agent name ca.test. */
+static void mgcp_named_init(const struct proto_ops *ops, const char *domain)
+{
+	cfg_mgcp_fill("ca.test", ca.port, 0, domain);
+	mgcp_named_boot(ops);
 }
 
 static void mgcp_named_start(const struct proto_ops *ops, const char *domain)
@@ -1585,6 +1584,97 @@ static void test_mgcp_dns(const struct proto_ops *ops, struct blob_buf *b)
 	test_mgcp_dns_edges(ops);
 
 	CHECK_UINT(fake_timer_dropped, 0);
+	fdns_close();
+	ca_close();
+}
+
+/* the live holds of the fake on lo for host and port */
+static unsigned int holds_of(const char *host, uint16_t port)
+{
+	unsigned int i, n = 0;
+
+	for (i = 0; i < PHF_PEER_MAX; i++) {
+		const struct phf_peer *p = &phf.hold[i];
+
+		if (p->live && !strcmp(p->dev, "lo") && !strcmp(p->host, host) &&
+		    !p->ipv6 && p->port == port)
+			n++;
+	}
+
+	return n;
+}
+
+static unsigned int holds_live(void)
+{
+	unsigned int i, n = 0;
+
+	for (i = 0; i < PHF_PEER_MAX; i++)
+		n += phf.hold[i].live;
+
+	return n;
+}
+
+/*
+ * Set elements of the MGCP socket (net/peer.h), read off the fake, which
+ * records them and runs no nft. The fake answers "lo" as bound device, and the
+ * unit takes a free port. The socket therefore opens scoped, and each element
+ * carries both.
+ */
+static void test_mgcp_holds(const struct proto_ops *ops)
+{
+	struct net_iface_state st;
+	unsigned int n0, t;
+	uint16_t port = 0;
+	int fd;
+
+	CASE("mgcp table: a literal call agent holds one element");
+	CHECK(ca_open());
+	fd = port_block(&port);
+	CHECK(fd >= 0);
+	close(fd);
+	memset(&st, 0, sizeof(st));
+	snprintf(st.addr4, sizeof(st.addr4), "127.0.0.1");
+	st.addr4_known = true;
+	cfg_mgcp_fill("127.0.0.1", ca.port, port, "");
+	proto_host_fake_reset();
+	phf.cfg = &cfg;
+	phf.iface = &st;
+	phf.bind_dev = "lo";
+	ops->init(proto_host_fake(), &cfg);
+	mgcp_clock_bind();
+	ops->start(&cfg);
+	CHECK_UINT(holds_live(), 1);
+	CHECK_UINT(holds_of("127.0.0.1", port), 1);
+
+	CASE("mgcp table: the stop releases the element");
+	ops->done();
+	CHECK_UINT(holds_live(), 0);
+
+	CASE("mgcp table: a resolved call agent holds one element for its address");
+	CHECK(fdns_open());
+	cfg_mgcp_fill("ca.test", ca.port, port, "");
+	mgcp_named_boot(ops);
+	phf.bind_dev = "lo";
+	ops->start(&cfg);
+	CHECK(io_until(dns_idle, 2000));
+	CHECK_UINT(holds_live(), 1);
+	CHECK_UINT(holds_of("127.0.0.1", port), 1);
+
+	/* the RSIP gets no answer, and its Max1 asks the name again */
+	CASE("mgcp table: the next resolver answer adds an element per address");
+	fdns.two = true;
+	n0 = fdns.asked;
+	for (t = 0; fdns.asked == n0 && t < 60000; t += 100)
+		clock_walk(100);
+	CHECK(fdns.asked > n0);
+	CHECK_UINT(holds_live(), 2);
+	CHECK_UINT(holds_of("127.0.0.1", port), 1);
+	CHECK_UINT(holds_of("127.0.0.2", port), 1);
+
+	CASE("mgcp table: the stop releases the resolved elements");
+	ops->done();
+	CHECK_UINT(holds_live(), 0);
+
 	fdns_close();
 	ca_close();
 }
@@ -2026,6 +2116,7 @@ static void test_mgcp_table(void)
 	proto_select_from_cfg(&cfg);
 	proto_host_fake_reset();
 	phf.cfg = &cfg;
+	phf.bind_dev = "lo";
 	ops->init(proto_host_fake(), &cfg);
 	sip_reset();
 	proto_start(&cfg);
@@ -2038,6 +2129,7 @@ static void test_mgcp_table(void)
 	test_mgcp_wire(ops, &b);
 	test_mgcp_bind(ops, &b);
 	test_mgcp_dns(ops, &b);
+	test_mgcp_holds(ops);
 	test_mgcp_ops(ops);
 	test_mgcp_reload(ops);
 	test_mgcp_max1(ops);

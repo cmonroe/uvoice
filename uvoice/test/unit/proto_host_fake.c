@@ -27,7 +27,6 @@
 #include "calltrace.h"
 #include "event.h"
 #include "net/conntrack.h"
-#include "net/fw_reconcile.h"
 #include "net/iface.h"
 #endif
 
@@ -637,7 +636,7 @@ static const char *phf_net_iface_bind_device(void *ctx, const char *iface)
 #ifdef PHF_NET_CORE
 	return net_iface_bind_device(iface);
 #else
-	return NULL;
+	return phf.bind_dev;
 #endif
 }
 
@@ -771,39 +770,52 @@ static uint16_t phf_net_ct_punch_interval_ms(void *ctx)
 }
 #endif
 
-static void phf_fw_ask(void *ctx, const struct fw_sig_ask *ask)
+static void phf_peer_set(struct phf_peer *p, const char *dev, const char *host,
+			 bool ipv6, uint16_t port, unsigned int timeout_s)
 {
-	phf.n[PHF_FW_ASK]++;
-	if (ask)
-		phf.fw_ask = *ask;
-#ifdef PHF_NET_CORE
-	fw_reconcile_ask(ask);
-#endif
+	memset(p, 0, sizeof(*p));
+	str_copy(p->dev, sizeof(p->dev), dev);
+	str_copy(p->host, sizeof(p->host), host);
+	p->ipv6 = ipv6;
+	p->port = port;
+	p->timeout_s = timeout_s;
 }
 
-static void phf_fw_clear(void *ctx)
+static bool phf_peer_admit(void *ctx, const char *dev, const char *host,
+			   bool ipv6, uint16_t port, unsigned int timeout_s)
 {
-	phf.n[PHF_FW_CLEAR]++;
-#ifdef PHF_NET_CORE
-	fw_reconcile_clear();
-#endif
+	phf.n[PHF_PEER_ADMIT]++;
+	if (phf.nadmit < PHF_PEER_MAX)
+		phf_peer_set(&phf.admit[phf.nadmit++], dev, host, ipv6, port,
+			     timeout_s);
+
+	return true;
 }
 
-static unsigned int phf_fw_proxy_add(void *ctx,
-				     char (*list)[PROTO_FW_SRC_MAX],
-				     unsigned int count, const char *addr)
+static int phf_peer_hold(void *ctx, const char *dev, const char *host,
+			 bool ipv6, uint16_t port)
 {
-	phf.n[PHF_FW_PROXY_ADD]++;
-#ifdef PHF_NET_CORE
-	return fw_reconcile_proxy_add(list, count, addr);
-#else
-	if (!addr || !*addr || count >= PROTO_FW_PROXY_MAX)
-		return count;
+	int i;
 
-	str_copy(list[count], PROTO_FW_SRC_MAX, addr);
+	phf.n[PHF_PEER_HOLD]++;
+	for (i = 0; i < PHF_PEER_MAX; i++) {
+		if (phf.hold[i].live)
+			continue;
 
-	return count + 1;
-#endif
+		phf_peer_set(&phf.hold[i], dev, host, ipv6, port, 0);
+		phf.hold[i].live = true;
+
+		return i;
+	}
+
+	return -1;
+}
+
+static void phf_peer_release(void *ctx, int handle)
+{
+	phf.n[PHF_PEER_RELEASE]++;
+	if (handle >= 0 && handle < PHF_PEER_MAX)
+		phf.hold[handle].live = false;
 }
 
 /* ------------------------------------------------------ records and trace */
@@ -990,9 +1002,9 @@ static const struct proto_host phf_host = {
 	.net_port_free = phf_net_port_free,
 	.net_ct_udp_bound_s = phf_net_ct_udp_bound_s,
 	.net_ct_punch_interval_ms = phf_net_ct_punch_interval_ms,
-	.fw_ask = phf_fw_ask,
-	.fw_clear = phf_fw_clear,
-	.fw_proxy_add = phf_fw_proxy_add,
+	.peer_admit = phf_peer_admit,
+	.peer_hold = phf_peer_hold,
+	.peer_release = phf_peer_release,
 	.cdr_call_started = phf_cdr_call_started,
 	.cdr_call_seq = phf_cdr_call_seq,
 	.cdr_call_correlate = phf_cdr_call_correlate,

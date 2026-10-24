@@ -84,7 +84,8 @@ conntrack_collect() {
 	command_require conntrack || return
 	command_require jq || return
 	trace_line=$(jq -er '.line' "$dir/manifest.json") || return
-	# call.c port_range_norm() uses 10000-10030 for an unset or invalid pair.
+	# src/net/ports.c port_range_norm() uses 10000-10030 for an unset or
+	# invalid pair.
 	range=$(jq -er --argjson line "$trace_line" '
 		[(.channel // [])[] | select(.id == $line)][0] // {} |
 		(.rtp_local_port_min // 0) as $lo |
@@ -100,11 +101,13 @@ EOF
 nft_collect() {
 	command_require nft || return
 	nft list ruleset > "$scratch/ruleset" || return
-	# fw4 renders the daemon's Allow_VoIP_* uci rules inside its zone chains
-	# with the rule name in a comment, so a chain name alone never finds
-	# them: a matching rule line is kept with its table and chain headers.
+	# fw4 puts the uvoice rules in its own input chain and marks each with a
+	# "uvoice:" comment, so a chain name cannot find them. The filter keeps
+	# each matching rule line with its table and chain headers. It keeps a
+	# matching set whole, because the set elements are the peers that uvoice
+	# admits.
 	awk '
-		/^table[ \t]/ { table = $0; shown_t = 0 }
+		/^table[ \t]/ { table = $0; shown_t = 0; chain = ""; shown_c = 0; next }
 		/^[ \t]*chain[ \t]+[^ \t]+[ \t]*\{/ {
 			chain = $0
 			shown_c = 0
@@ -113,6 +116,10 @@ nft_collect() {
 				if (!shown_t) { print table; shown_t = 1 }
 				shown_c = 1
 			}
+		}
+		/^[ \t]*set[ \t]+[^ \t]+[ \t]*\{/ && tolower($0) ~ /voip|uvoice/ {
+			active = 1
+			if (!shown_t) { print table; shown_t = 1 }
 		}
 		active {
 			print
@@ -123,7 +130,7 @@ nft_collect() {
 		}
 		tolower($0) ~ /voip|uvoice/ {
 			if (!shown_t) { print table; shown_t = 1 }
-			if (!shown_c) { print chain; shown_c = 1 }
+			if (!shown_c && chain != "") { print chain; shown_c = 1 }
 			print
 		}
 	' "$scratch/ruleset" > "$scratch/chains" || return

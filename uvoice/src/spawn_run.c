@@ -38,10 +38,9 @@ extern char **environ;
  * the daemon opens is CLOEXEC, so the exec would close the same set a moment
  * later.
  *
- * The child's stdout goes to /dev/null. procd captures the daemon's stdio and
- * logs a helper's chatter under the daemon's own name at info; the firewall
- * helper prints "<rule> not found" for every delete of a rule that is not
- * there. stderr stays the daemon's, for a helper's real complaint.
+ * The child's stdout goes to /dev/null, because procd logs the daemon's
+ * stdout at info under the daemon's name. stderr stays the daemon's, so a
+ * helper error still reaches the log.
  */
 static int spawn_actions_init(posix_spawn_file_actions_t *fa)
 {

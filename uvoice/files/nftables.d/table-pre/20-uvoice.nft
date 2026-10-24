@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# uvoice - native voice stack for OpenWrt
+# Copyright (C) 2026 Adtran Inc.
+# Author: Chad Monroe <chad.monroe@adtran.com>
+#
+# Licensed under GPL-2.0-only with the linking exception stated in LICENSE.
+#
+# The two timed sets of uvoice in table inet fw4. uvoiced writes their
+# elements with nft (src/net/peer.c), and the input rules of
+# chain-pre/input/20-uvoice.nft accept what they hold.
+set uvoice_peer4 {
+	type ifname . ipv4_addr . inet_service
+	flags timeout
+}
+set uvoice_peer6 {
+	type ifname . ipv6_addr . inet_service
+	flags timeout
+}

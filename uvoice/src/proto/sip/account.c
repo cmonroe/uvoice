@@ -116,7 +116,8 @@ struct account {
 	bool ka_inited;
 
 	/* the conntrack udp bound the keepalive interval was derived under; a
-	 * mode 2 udp line re-reads it on every round (acct_pinhole_bound_sync) */
+	 * udp line re-reads it on every round (acct_pinhole_bound_sync), and
+	 * its set elements live that long */
 	unsigned int ct_bound_s;
 
 	/* the message waiting subscription; the NOTIFY intake needs no client */
@@ -328,9 +329,7 @@ int acct_dns_kind(enum cfg_dns_srv_mode mode, bool port_named)
 
 /*
  * Transport is base only (account.h). The channel value is read only to report
- * that it was ignored: the firewall reconcile writes one proto for the whole
- * rule set, so two lines on two transports would take one line's inbound SIP
- * down without a word.
+ * that it was ignored.
  *
  * An empty base token is udp, and that guard is required, not defensive: the
  * Via writers default on a NULL token alone, so an empty string must never
@@ -378,7 +377,7 @@ unsigned int acct_ka_interval_effective(const struct acct_cfg *c,
 }
 
 /*
- * What restrict_source 2 asks of the signalling refresher, said once per
+ * What the conntrack pinhole asks of the signalling refresher, said once per
  * derive. A udp line runs the CRLF keepalive inside half the conntrack udp
  * bound whatever the configuration says (acct_ka_interval_effective), and the
  * derive reports when that overrode the configured pair, or when the bound is
@@ -392,12 +391,9 @@ static void acct_refresher_report(const struct acct_cfg *c)
 	unsigned int bound, secs;
 	bool forced;
 
-	if (!c->pinhole)
-		return;
-
 	if (c->transport != ACCT_TP_UDP) {
-		ULOG_INFO("line %u restrict_source 2 over %s: the connection holds the "
-			  "SIP pinhole and its keepalive refreshes it every %u s\n",
+		ULOG_INFO("line %u over %s: the connection holds the SIP pinhole "
+			  "and its keepalive refreshes it every %u s\n",
 			  c->line, acct_transport_name(c->transport),
 			  (unsigned int)SIP_STREAM_KA_IDLE_S);
 		return;
@@ -406,10 +402,10 @@ static void acct_refresher_report(const struct acct_cfg *c)
 	bound = vr.host->net_ct_udp_bound_s(vr.host->ctx);
 	secs = acct_ka_interval_effective(c, bound, &forced);
 	if (bound < 2)
-		ULOG_WARN("line %u restrict_source 2 under a %u s conntrack "
-			  "udp timeout: the %u s floor of the SIP keepalive "
-			  "cannot refresh the pinhole in time\n", c->line,
-			  bound, (unsigned int)SIP_KA_INTERVAL_MIN);
+		ULOG_WARN("line %u under a %u s conntrack udp timeout: the %u s "
+			  "floor of the SIP keepalive cannot refresh the pinhole "
+			  "in time\n", c->line, bound,
+			  (unsigned int)SIP_KA_INTERVAL_MIN);
 	if (forced)
 		ULOG_INFO("line %u sip keepalive forced to %u s: the SIP "
 			  "pinhole needs a refresher inside the %u s "
@@ -600,7 +596,6 @@ void acct_cfg_derive(const struct cfg *base, const struct cfg_channel *ch,
 	out->ka_interval = base->keepalive_interval;
 	out->options_interval = ch->options_interval ? ch->options_interval
 						     : base->options_interval;
-	out->pinhole = base->restrict_source == 2;
 	out->linger_s = base->dns_linger;
 
 	out->t1 = ch->timers.t1;
@@ -651,7 +646,7 @@ enum acct_apply acct_apply_class(const struct acct_cfg *a, const struct acct_cfg
 	    a->tg != b->tg || a->th != b->th || a->ti != b->ti || a->tj != b->tj ||
 	    a->tk != b->tk || a->ka_enabled != b->ka_enabled ||
 	    a->ka_interval != b->ka_interval || a->linger_s != b->linger_s ||
-	    a->options_interval != b->options_interval || a->pinhole != b->pinhole)
+	    a->options_interval != b->options_interval)
 		return ACCT_APPLY_LIVE;
 
 	return ACCT_APPLY_NONE;
@@ -1064,7 +1059,6 @@ enum acct_family_result {
 static enum acct_family_result
 account_family_sync(struct account *a, const struct sip_txn_dst *dst,
 		    enum acct_family_send send);
-static void fw_reconcile(void);
 static void account_sub_init(struct account *a);
 static void account_sub_start(struct account *a);
 static void acct_reg_conn_seed(struct account *a);
@@ -1423,13 +1417,6 @@ acct_service_route_of(const struct account *a, const struct sip_txn_dst *dst)
 	return sip_reg_service_route(&a->reg);
 }
 
-/* a udp line under the conntrack pinhole form: the one that enforces the
- * refresher, because nothing else holds its SIP tuple open */
-static bool acct_pinhole_udp(const struct account *a)
-{
-	return a->cfg.pinhole && !acct_stream(&a->cfg);
-}
-
 static void acct_ka_cfg_make(const struct account *a, struct sip_ka_cfg *kc)
 {
 	bool forced;
@@ -1446,7 +1433,8 @@ static void acct_ka_cfg_make(const struct account *a, struct sip_ka_cfg *kc)
 	kc->crlf_interval_s = a->cfg.ka_interval;
 	kc->options_interval_s = a->cfg.options_interval;
 
-	if (!acct_pinhole_udp(a))
+	/* nothing but the round holds the SIP tuple of a udp line open */
+	if (acct_stream(&a->cfg))
 		return;
 
 	kc->crlf_enabled = true;
@@ -1466,8 +1454,8 @@ static void account_ka_update(struct account *a)
 }
 
 /*
- * The conntrack udp bound of the moment, read again on every round of a mode 2
- * udp line: /etc/config/conntrack can move it under a running daemon, and a
+ * The conntrack udp bound of the moment, read again on every round of a udp
+ * line: /etc/config/conntrack can move it under a running daemon, and a
  * keepalive derived under the old value could then run outside the new one.
  * A move re-derives the interval and re-arms the timer inside it; the update
  * is safe from inside the round (sip/keepalive.h, sip_ka_cfg_update).
@@ -1477,7 +1465,7 @@ static void acct_pinhole_bound_sync(struct account *a)
 	unsigned int bound, secs;
 	bool forced;
 
-	if (!acct_pinhole_udp(a))
+	if (acct_stream(&a->cfg))
 		return;
 
 	bound = vr.host->net_ct_udp_bound_s(vr.host->ctx);
@@ -1580,49 +1568,10 @@ uint64_t acct_linger_deadline(const struct acct_linger *lg, uint32_t linger_s)
 	return at;
 }
 
-static bool proxy_list_has(char (*list)[PROTO_FW_SRC_MAX], unsigned int count,
-			   const char *addr)
-{
-	unsigned int i;
-
-	for (i = 0; i < count; i++) {
-		if (!strcmp(list[i], addr))
-			return true;
-	}
-
-	return false;
-}
-
-unsigned int acct_linger_collect(const struct acct_linger *lg,
-				 char (*list)[PROTO_FW_SRC_MAX], unsigned int count)
-{
-	char host[PROTO_FW_SRC_MAX];
-	unsigned int i;
-
-	for (i = 0; i < lg->count; i++) {
-		if (!sip_dst_host(&lg->entry[i].dst, host, sizeof(host)))
-			continue;
-		if (proxy_list_has(list, count, host))
-			continue;
-		if (count >= PROTO_FW_PROXY_MAX) {
-			ULOG_WARN("firewall: lingering proxy source %s dropped, "
-				  "only %u rules exist\n", host,
-				  (unsigned int)PROTO_FW_PROXY_MAX);
-			continue;
-		}
-
-		count = vr.host->fw_proxy_add(vr.host->ctx, list, count, host);
-	}
-
-	return count;
-}
-
 /*
  * The expiry deadline of the retention, independent of answers and rounds: a
- * failed resolver and a disabled keepalive still remove a mode 1 rule when
- * its window ends, because neither of the two ordinary reconcile triggers
- * runs then. Expiring from the round alone would also never run in mode 1,
- * which has no round.
+ * failed resolver and a line without a round still drop an entry when its
+ * window ends, so the status reports the addresses that keep their admission.
  */
 static void acct_linger_rearm(struct account *a)
 {
@@ -1643,7 +1592,6 @@ static void linger_timer_cb(struct uloop_timeout *t)
 
 	acct_linger_expire(&a->linger, acct_now(a), a->cfg.linger_s);
 	acct_linger_rearm(a);
-	fw_reconcile();
 }
 
 /*
@@ -1660,10 +1608,9 @@ static void linger_timer_cb(struct uloop_timeout *t)
  * other family gets no ping. Index 0 also compacts the retention, so the
  * indexes stay stable for the rest of the walk.
  */
-static const struct sip_txn_dst *acct_ka_dst_at(struct sip_ka *ka, void *priv,
-						unsigned int idx)
+static const struct sip_txn_dst *acct_ka_dst_pick(struct account *a,
+						  unsigned int idx)
 {
-	struct account *a = priv;
 	const struct sip_txn_dst *dst;
 	unsigned int i, n, cur, seen = 1;
 
@@ -1707,21 +1654,60 @@ static const struct sip_txn_dst *acct_ka_dst_at(struct sip_ka *ka, void *priv,
 }
 
 /*
- * The live apply of the keepalive options. A line that sat outside mode 2
- * never re-read the conntrack bound, so the bound is taken fresh before the
- * interval is derived. A udp line this reload moved into mode 2 sends the
- * round now: its tuples may have aged out under a keepalive the old mode
- * left off, and the reconcile of the same reload removes the rules.
+ * The netdev the line's udp socket is bound to, or NULL for an unscoped
+ * bind. The socket is the source, not the tracker: the tracker can name a
+ * new device before the socket moved.
  */
-static void account_ka_reload(struct account *a, bool entered)
+static const char *acct_sock_dev(const struct account *a)
 {
-	if (acct_pinhole_udp(a))
-		a->ct_bound_s = vr.host->net_ct_udp_bound_s(vr.host->ctx);
+	const struct sip_sock *sk = sip_sock_get(&vr.tp, a->sock);
+	const char *dev = sk ? sip_sock_iface(sk) : NULL;
 
-	account_ka_update(a);
+	return dev && dev[0] ? dev : NULL;
+}
 
-	if (entered)
-		sip_ka_ping_now(&a->ka);
+/*
+ * Every destination of the round of a udp line gets a set element for the
+ * line's device and SIP port, with the conntrack bound as its life, so the
+ * admission and the conntrack entry of a destination end together. A stream
+ * line writes none: its connection is the pinhole.
+ */
+static void acct_peer_admit(struct account *a, const struct sip_txn_dst *dst)
+{
+	char host[SIP_SOCK_HOST_MAX];
+	const char *dev;
+
+	if (acct_stream(&a->cfg))
+		return;
+
+	dev = acct_sock_dev(a);
+	if (!dev) {
+		ACCT_TRACE("line %u binds unscoped, no set element", a->line);
+		return;
+	}
+
+	if (!sip_dst_host(dst, host, sizeof(host)))
+		return;
+
+	vr.host->peer_admit(vr.host->ctx, dev, host,
+			    acct_dst_family(dst) == AF_INET6,
+			    a->cfg.local_port, a->ct_bound_s);
+	ACCT_TRACE("line %u admits %s on %s port %u for %u s", a->line, host,
+		   dev, a->cfg.local_port, a->ct_bound_s);
+}
+
+/* The round's housekeeping at index 0 runs before the admit, so the element
+ * takes the bound of this round. */
+static const struct sip_txn_dst *acct_ka_dst_at(struct sip_ka *ka, void *priv,
+						unsigned int idx)
+{
+	struct account *a = priv;
+	const struct sip_txn_dst *dst = acct_ka_dst_pick(a, idx);
+
+	if (dst)
+		acct_peer_admit(a, dst);
+
+	return dst;
 }
 
 /*
@@ -2048,14 +2034,6 @@ static void account_dns_result(struct account *a, const struct sip_dns_result *r
 	 */
 	if ((first || changed) && !a->pending)
 		sip_ka_ping_now(&a->ka);
-
-	/*
-	 * The proxy addresses of a restricted rule set come from these targets,
-	 * so a resolution that moved them has to reach the firewall. Nothing
-	 * else runs on this path: the build reconciled before any answer
-	 * existed. A no-op reconcile is absorbed by the chain comparison.
-	 */
-	fw_reconcile();
 }
 
 /*
@@ -3123,14 +3101,6 @@ static bool account_build(struct account *a, const struct acct_cfg *c)
 
 	a->active = true;
 
-	/*
-	 * Reconcile on the activation edge, after the line is active and before
-	 * its first resolution. Every caller reconciles again after the build,
-	 * and the chain coalescing absorbs the redundant call. A build that
-	 * cannot open its socket or listener returns before this point, and the
-	 * line stays inactive until a reload.
-	 */
-	fw_reconcile();
 	account_resolve(a);
 
 	return true;
@@ -3702,8 +3672,6 @@ static void account_grace_cb(struct uloop_timeout *t)
 	account_teardown(a);
 	if (!remove)
 		account_build(a, &nc);
-
-	fw_reconcile();
 }
 
 /*
@@ -3721,7 +3689,6 @@ static void account_graceful_replace(struct account *a, const struct acct_cfg *n
 		account_teardown(a);
 		if (nc)
 			account_build(a, nc);
-		fw_reconcile();
 		return;
 	}
 
@@ -3753,7 +3720,6 @@ static void account_reload_dispatch(struct account *a, const struct acct_cfg *nc
 				    enum acct_reload_op op)
 {
 	struct sip_timer_cfg tc;
-	bool entered;
 
 	switch (op) {
 	case ACCT_ROP_NONE:
@@ -3762,13 +3728,14 @@ static void account_reload_dispatch(struct account *a, const struct acct_cfg *nc
 		account_build(a, nc);
 		return;
 	case ACCT_ROP_TIMERS:
-		entered = !a->cfg.pinhole && nc->pinhole && !acct_stream(nc);
 		a->cfg = *nc;
 		timers_to_cfg(&a->cfg, &tc);
 		sip_txn_mgr_timers_set(&a->mgr, &tc);
-		account_ka_reload(a, entered);
-		/* a moved dns_linger applies to the standing entries at once;
-		 * the reload's own reconcile picks the rule set up */
+		/* the bound can have moved since the last round */
+		if (!acct_stream(&a->cfg))
+			a->ct_bound_s = vr.host->net_ct_udp_bound_s(vr.host->ctx);
+		account_ka_update(a);
+		/* a moved dns_linger applies to the standing entries at once */
 		acct_linger_expire(&a->linger, acct_now(a), a->cfg.linger_s);
 		acct_linger_rearm(a);
 		ULOG_INFO("line %u timers and keepalive updated live\n", a->line);
@@ -3894,92 +3861,6 @@ static void acct_lines_retry_kick(void)
 
 		sip_reg_retry_now(&a->reg);
 	}
-}
-
-/* --------------------------------------------------------------- firewall */
-
-/*
- * The resolved registration targets of one line (sip/reg.h). They are the
- * addresses the proxy answers and registers from, so they are what the
- * restricted rule admits. A line that never resolved has none, which is why the
- * reconcile has to run again when a resolution completes. The targets are read
- * in target order and land in the sorted order fw_reconcile_proxy_add() keeps,
- * so the
- * answer order never reaches a rule number.
- *
- * started is the account's reg_inited, and it is not a formality:
- * sip_reg_done() stops the client and leaves the target list in place, so an
- * ungated collect hands a torn down line's proxy addresses to the next rule
- * set. account.h exports the function on the acct_targets_load() precedent, so
- * the suite collects what a scripted answer would put into a rule.
- */
-unsigned int acct_proxy_collect(const struct sip_reg *reg, bool started,
-				char (*list)[PROTO_FW_SRC_MAX], unsigned int count)
-{
-	char host[PROTO_FW_SRC_MAX];
-	unsigned int i, targets;
-
-	if (!started)
-		return count;
-
-	targets = sip_reg_target_count(reg);
-	for (i = 0; i < targets; i++) {
-		const struct sip_reg_target *tg = sip_reg_target_get(reg, i);
-
-		if (!tg || !sip_dst_host(&tg->dst, host, sizeof(host)))
-			continue;
-
-		count = vr.host->fw_proxy_add(vr.host->ctx, list, count, host);
-	}
-
-	return count;
-}
-
-/*
- * What the running accounts ask of the firewall, handed to the core reconcile
- * (net/fw_reconcile.h), which owns the policy and the RTP rules. It runs on
- * every event that can move the set: a build, the start, a teardown, a
- * reload, a completed resolution and the expiry of a lingering address. An
- * interface change reaches it through the resolution that follows.
- *
- * The lingering addresses fill the slots the current targets left, never the
- * other way round: every line's current proxies land first, so a rotating
- * pool's history cannot push out another line's live rule
- * (acct_linger_collect refuses to evict).
- */
-static void fw_reconcile(void)
-{
-	struct fw_sig_ask ask;
-	unsigned int i;
-
-	memset(&ask, 0, sizeof(ask));
-	ask.proto_udp = true;
-
-	for (i = 0; i < CFG_CHANNEL_MAX; i++) {
-		struct account *a = &vr.acct[i];
-
-		if (!a->active)
-			continue;
-
-		ask.active_mask |= 1u << i;
-		ask.port[i] = a->cfg.local_port;
-		/* fw.c takes one bool for the proto: the transport is base
-		 * only, so every active line names the same proto and the
-		 * last write is the only write. */
-		ask.proto_udp = a->cfg.transport == ACCT_TP_UDP;
-		ask.nproxy = acct_proxy_collect(&a->reg, a->reg_inited, ask.proxy,
-						ask.nproxy);
-	}
-
-	for (i = 0; i < CFG_CHANNEL_MAX; i++) {
-		struct account *a = &vr.acct[i];
-
-		if (a->active && a->reg_inited && a->cfg.linger_s)
-			ask.nproxy = acct_linger_collect(&a->linger, ask.proxy,
-							 ask.nproxy);
-	}
-
-	vr.host->fw_ask(vr.host->ctx, &ask);
 }
 
 /* --------------------------------------------------------------- lifecycle */
@@ -4264,7 +4145,6 @@ void accounts_start(const struct cfg *cfg)
 		}
 	}
 
-	fw_reconcile();
 	vr.started = true;
 }
 
@@ -4322,14 +4202,12 @@ void accounts_reload(const struct cfg *old_cfg, const struct cfg *new_cfg)
 	/*
 	 * rtp_local_port_min/max is RESTART_LINE in the schema, but the range is
 	 * not part of struct acct_cfg, so acct_apply_class() never sees it. A
-	 * live leg holds a port from the old range and the new rule would not
-	 * cover it, so the line is cleared first, the same way the account
-	 * replace path clears it before it discards the account objects. The
-	 * port pool rebases itself once it drains (proto/proto.h
-	 * net_port_alloc: a range is only adopted while no port is out), so the
-	 * next call allocates from the new range the new rule opens. The core
-	 * took the new ranges for the firewall before this reload, and a moved
-	 * voice interface is the tracker's.
+	 * live leg holds a port from the old range, so the line is cleared
+	 * first, the same way the account replace path clears it before it
+	 * discards the account objects. The port pool rebases itself once it
+	 * drains (proto/proto.h net_port_alloc: a range is only adopted while
+	 * no port is out), so the next call allocates from the new range. A
+	 * moved voice interface is the tracker's.
 	 */
 	for (i = 0; i < CFG_CHANNEL_MAX; i++) {
 		if (!vr.acct[i].active)
@@ -4388,8 +4266,6 @@ void accounts_reload(const struct cfg *old_cfg, const struct cfg *new_cfg)
 
 		account_reload_dispatch(a, &nc, op);
 	}
-
-	fw_reconcile();
 
 	/* the lines the loop rebuilt took their sockets and listeners again,
 	 * so what is down now is what the recovery owns */

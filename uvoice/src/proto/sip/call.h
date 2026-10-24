@@ -416,11 +416,10 @@ struct call_cb {
 void calls_init(const struct call_media_ops *ops, const struct call_cb *cb);
 
 /*
- * The core services of the daemon (proto/proto.h struct proto_host). A leg
- * draws its RTP port from the pool of the core through it, inside the effective
- * range of its channel, which is the range the firewall reconcile opens. It
- * must be bound after calls_init(), which clears it, and before the first
- * leg.
+ * Core services of the daemon (proto/proto.h struct proto_host). A leg draws
+ * its RTP port from the core pool through it, inside the effective range of
+ * its channel. The caller must bind it after calls_init(), which clears it,
+ * and before the first leg.
  */
 struct proto_host;
 void calls_host_bind(const struct proto_host *host);

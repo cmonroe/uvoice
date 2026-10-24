@@ -23,7 +23,6 @@
 #include "event.h"
 #include "event_dispatch.h"
 #include "line/line.h"
-#include "net/fw_reconcile.h"
 #include "net/iface.h"
 #include "proto/proto.h"
 
@@ -161,7 +160,6 @@ int uvoice_reload(void)
 	 * operator asked for it at runtime. */
 	trace_uci_apply(cfg->debug.trace);
 	net_iface_iface_set(cfg->local_interface);
-	fw_reconcile_cfg_take(cfg);
 	/* One ops->reload, before the lines: the protocol takes the new config
 	 * and tears down the legs whose RTP range moved. */
 	proto_reload(old, cfg);
@@ -339,8 +337,8 @@ static int event_transport_open(void)
 {
 	int fds[2];
 
-	/* CLOEXEC: the firewall helper and the event publisher spawn children
-	 * that must not inherit the HAL event channel. */
+	/* CLOEXEC: a child that the daemon spawns (nft, event and TLS helpers,
+	 * call trace tools) must not inherit the HAL event channel. */
 	if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, fds) < 0) {
 		ULOG_ERR("event socketpair failed: %s\n", strerror(errno));
 		return -1;
@@ -563,7 +561,6 @@ int main(int argc, char **argv)
 	 * registers so the line is reachable and the fault shows over ubus. */
 	event_init();
 	net_iface_init(uv.cfg);
-	fw_reconcile_cfg_take(uv.cfg);
 	proto_start(uv.cfg);
 
 	/*

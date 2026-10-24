@@ -31,12 +31,13 @@ system/ holds the system context at the finish:
   ip6-route.json     IPv6 routes from ip -6 -j route.
   conntrack-rtp      Up to 5000 UDP connection tracking records whose ports
                      match the traced line's effective RTP port range.
-  nft-voip           nftables chains whose names contain voip or uvoice,
-                     and every rule line that carries one of those words
-                     (the fw4 rendering of the daemon's Allow_VoIP_* rules)
-                     with its table and chain headers. If nothing matches,
-                     up to 2000 lines of the ruleset. The manifest notes
-                     this fallback.
+  nft-voip           Each nftables chain or set whose name contains voip
+                     or uvoice, whole (a set with its elements), and every
+                     rule line that carries one of those words (the fw4
+                     rendering of the uvoice accept rules) with its table
+                     and chain headers. If nothing matches, up to 2000
+                     lines of the ruleset. The manifest notes this
+                     fallback.
   logread            System log for the trace, with a 30 second margin.
                      The upper time limit is exclusive. If the time options
                      fail, this file holds the last 20000 records instead.

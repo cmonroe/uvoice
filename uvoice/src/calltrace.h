@@ -100,7 +100,7 @@ bool calltrace_capturing(void);		/* armed or running */
 bool calltrace_lec_capturing(void);
 
 /*
- * Test control, on the fw_test_mode() precedent. Test mode resets the
+ * Test control, on the event_test_mode() precedent. Test mode resets the
  * controller, starts no child and skips the capture tool checks: every spawn
  * becomes a recorded argument list the suite reads back, and the suite
  * completes each child by hand. Nothing here is compiled out, so the daemon

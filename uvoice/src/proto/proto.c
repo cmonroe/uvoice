@@ -21,11 +21,10 @@
 #include "calltrace.h"
 #include "cdr.h"
 #include "event.h"
-#include "fw.h"
 #include "line/line.h"
 #include "net/conntrack.h"
-#include "net/fw_reconcile.h"
 #include "net/iface.h"
+#include "net/peer.h"
 #include "net/ports.h"
 #include "proto/proto.h"
 #include "str.h"
@@ -265,9 +264,7 @@ void proto_stop_wait(void)
 
 /*
  * The protocol frees what it holds once, after the HAL closed, and the port
- * pool and the rules go with it. The loop runs no chain after the stop, so
- * the removal is the synchronous one of fw_shutdown() and not the chain of
- * fw_reconcile_clear().
+ * pool goes with it. The set elements stay and time out by themselves.
  */
 void proto_done(void)
 {
@@ -277,7 +274,7 @@ void proto_done(void)
 	}
 
 	net_port_reset();
-	fw_shutdown();
+	net_peer_done();
 }
 
 /*
@@ -660,21 +657,21 @@ static uint16_t host_net_ct_punch_interval_ms(void *ctx)
 	return net_ct_punch_interval_ms();
 }
 
-static void host_fw_ask(void *ctx, const struct fw_sig_ask *ask)
+static bool host_peer_admit(void *ctx, const char *dev, const char *host,
+			    bool ipv6, uint16_t port, unsigned int timeout_s)
 {
-	fw_reconcile_ask(ask);
+	return net_peer_admit(dev, host, ipv6, port, timeout_s);
 }
 
-static void host_fw_clear(void *ctx)
+static int host_peer_hold(void *ctx, const char *dev, const char *host,
+			  bool ipv6, uint16_t port)
 {
-	fw_reconcile_clear();
+	return net_peer_hold(dev, host, ipv6, port);
 }
 
-static unsigned int host_fw_proxy_add(void *ctx,
-				      char (*list)[PROTO_FW_SRC_MAX],
-				      unsigned int count, const char *addr)
+static void host_peer_release(void *ctx, int handle)
 {
-	return fw_reconcile_proxy_add(list, count, addr);
+	net_peer_release(handle);
 }
 
 static uint32_t host_cdr_call_started(void *ctx, unsigned int line,
@@ -813,9 +810,9 @@ void proto_host_build(void)
 	host.net_port_free = host_net_port_free;
 	host.net_ct_udp_bound_s = host_net_ct_udp_bound_s;
 	host.net_ct_punch_interval_ms = host_net_ct_punch_interval_ms;
-	host.fw_ask = host_fw_ask;
-	host.fw_clear = host_fw_clear;
-	host.fw_proxy_add = host_fw_proxy_add;
+	host.peer_admit = host_peer_admit;
+	host.peer_hold = host_peer_hold;
+	host.peer_release = host_peer_release;
 	host.cdr_call_started = host_cdr_call_started;
 	host.cdr_call_seq = host_cdr_call_seq;
 	host.cdr_call_correlate = host_cdr_call_correlate;

@@ -128,7 +128,7 @@ static const struct cfg_option_desc cfg_base_options[] = {
 	 * it, so the dialled digits reach the dial plan. A code the config
 	 * names is local in either mode, and the literal "none" clears one. */
 	CFG_DESC("star_codes_local", CFG_BOOL, "0", 0, 1, cfg_bool_vals, APPLY_LIVE, SUP_SUPPORTED, NULL),
-	CFG_DESC("restrict_source", CFG_ENUM, "2", 0, 2, cfg_restrict_source_vals, APPLY_LIVE, SUP_SUPPORTED, NULL),
+	CFG_DESC("restrict_source", CFG_ENUM, "1", 0, 2, cfg_restrict_source_vals, APPLY_LIVE, SUP_ACCEPTED_UNSUPPORTED, NULL),
 	CFG_DESC("options_interval", CFG_INT, "0", 0, INT_MAX, NULL, APPLY_LIVE, SUP_SUPPORTED, NULL),
 	CFG_DESC("active_source_filter_enabled", CFG_BOOL, "0", 0, 1, cfg_bool_vals, APPLY_LIVE, SUP_ACCEPTED_UNSUPPORTED, NULL),
 	CFG_DESC("transport", CFG_ENUM, "udp", 0, 0, cfg_transport_vals, APPLY_RESTART_ALL, SUP_SUPPORTED, NULL),

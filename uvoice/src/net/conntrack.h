@@ -7,9 +7,10 @@
  * Licensed under GPL-2.0-only with the linking exception stated in LICENSE.
  *
  * The conntrack udp bound and the media punch cadence it sets
- * (src/net/conntrack.c). Under restrict_source 2 the kernel admits inbound
- * traffic only on a conntrack entry this box opened, so the signaling
- * refresher and the media punch both run inside that bound.
+ * (src/net/conntrack.c). The kernel admits inbound media only on a conntrack
+ * entry this box opened, so the media punch runs inside that bound. A udp line
+ * also refreshes its SIP tuples inside it, and its set elements take the bound
+ * as their timeout (net/peer.h).
  */
 #ifndef UVOICE_NET_CONNTRACK_H
 #define UVOICE_NET_CONNTRACK_H

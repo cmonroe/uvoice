@@ -56,6 +56,7 @@ define Package/uvoice
   DEPENDS:=+libubox +libubus +libuci +libblobmsg-json \
 	+UVOICE_PROTO_SIP:libopenssl \
 	+curl \
+	+firewall4 \
 	+jq \
 	+tcpdump \
 	+ucode-mod-struct \
@@ -144,6 +145,14 @@ define Package/uvoice/install
 
 	$(INSTALL_DIR) $(1)/usr/srg/scripts/techlog
 	$(INSTALL_BIN) ./files/techlog-uvoice.sh $(1)/usr/srg/scripts/techlog/techlog-uvoice.sh
+
+	$(INSTALL_DIR) $(1)/usr/share/nftables.d/table-pre
+	$(INSTALL_DATA) ./files/nftables.d/table-pre/20-uvoice.nft $(1)/usr/share/nftables.d/table-pre/20-uvoice.nft
+	$(INSTALL_DIR) $(1)/usr/share/nftables.d/chain-pre/input
+	$(INSTALL_DATA) ./files/nftables.d/chain-pre/input/20-uvoice.nft $(1)/usr/share/nftables.d/chain-pre/input/20-uvoice.nft
+
+	$(INSTALL_DIR) $(1)/etc/uci-defaults
+	$(INSTALL_BIN) ./files/uvoice-voip-rules.default $(1)/etc/uci-defaults/95-uvoice-voip-rules
 endef
 
 $(eval $(call BuildPackage,uvoice))

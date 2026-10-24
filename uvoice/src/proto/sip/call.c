@@ -5308,7 +5308,6 @@ static bool leg_media_take(struct call *c)
 		return false;
 	}
 
-	/* the same effective range the firewall reconcile opens */
 	cv.host->net_port_range(cv.host->ctx, &c->ch, &min, &max);
 	if (!cv.host->net_port_alloc(cv.host->ctx, min, max, &port))
 		return false;

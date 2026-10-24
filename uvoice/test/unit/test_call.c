@@ -2020,9 +2020,8 @@ static void test_ports(void)
 }
 
 /*
- * The effective range, which the firewall reconcile opens. It must be the
- * range that the allocator hands out. A rule that does not cover the pool
- * gives a call whose far end audio never arrives.
+ * Effective range of a channel. The allocator must hand out ports from it, and
+ * the offer must name one of them.
  */
 static void test_port_range(void)
 {
@@ -2097,7 +2096,7 @@ static void test_port_range(void)
 	CHECK_UINT(p, 10000);
 	net_port_reset();
 
-	CASE("port range: a leg allocates inside the range the firewall opens");
+	CASE("port range: a leg allocates inside the effective range");
 	fx_reset();
 	cfg.channel[0].rtp_port_min = 30000;
 	cfg.channel[0].rtp_port_max = 30010;
@@ -2111,8 +2110,8 @@ static void test_port_range(void)
 
 	/*
 	 * rtp_local_port_min/max is RESTART_LINE, so a reload that moves the
-	 * effective range clears the line before the rule moves: a live leg
-	 * holds a port from the old range and the new rule would not cover it.
+	 * effective range clears the line. The pool takes a new range only when
+	 * no port is out.
 	 */
 	CASE("port range: a moved range is a change, an unmoved one is not");
 	{

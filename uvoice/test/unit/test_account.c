@@ -39,10 +39,8 @@
 #include "calltrace.h"
 #include "cfg/cfg.h"
 #include "event.h"
-#include "fw.h"
 #include "hal/hal.h"
 #include "net/conntrack.h"
-#include "net/fw_reconcile.h"
 #include "net/iface.h"
 #include "net/ports.h"
 #include "proto/proto.h"
@@ -114,20 +112,18 @@ static void base_default(void)
 
 /*
  * The start and the reload of the account layer in the order main.c runs them
- * around the core services: the tracker and the firewall take the config
- * first, then the protocol does.
+ * around the core services: the tracker takes the config first, then the
+ * protocol does.
  */
 static void core_start(const struct cfg *cfg)
 {
 	net_iface_init(cfg);
-	fw_reconcile_cfg_take(cfg);
 	accounts_start(cfg);
 }
 
 static void core_reload(const struct cfg *old_cfg, const struct cfg *new_cfg)
 {
 	net_iface_iface_set(new_cfg->local_interface);
-	fw_reconcile_cfg_take(new_cfg);
 	accounts_reload(old_cfg, new_cfg);
 }
 
@@ -684,7 +680,7 @@ static void test_apply_class(void)
 	base_default();
 }
 
-/* ---------------------------------- the restrict_source 2 refresher bound */
+/* ------------------------------------- the refresher bound of a udp line */
 
 static unsigned int ct_file_read(const char *path, unsigned int def)
 {
@@ -714,9 +710,10 @@ static unsigned int ct_host_bound(void)
 }
 
 /*
- * restrict_source 2 installs no firewall rule, so the inbound service depends
- * on conntrack alone. A udp line therefore refreshes its SIP tuple inside half
- * the conntrack udp bound, whatever the keepalive options say
+ * The inbound service of a udp line depends on the conntrack entry and set
+ * element of each pinged destination. Both last for the conntrack udp bound.
+ * A udp line therefore refreshes its SIP tuple inside half the conntrack udp
+ * bound, whatever the keepalive options say
  * (acct_ka_interval_effective). The test hook fixes the bound, so the
  * conntrack values of the host play no part. The derive log line is the
  * second observable, because derive returns a config and not a diagnosis.
@@ -733,15 +730,13 @@ static void test_refresher_bound(void)
 	snprintf(ch.sip_username, sizeof(ch.sip_username), "5551000");
 	snprintf(ch.sip_proxy, sizeof(ch.sip_proxy), "sip.example.com");
 
-	CASE("bound: mode 2 with a disabled keepalive is forced on at half "
+	CASE("bound: a udp line with a disabled keepalive is forced on at half "
 	     "the bound");
-	base.restrict_source = 2;
 	base.keepalive_enabled = false;
 	base.keepalive_interval = 0;
 	base.options_interval = 0;
 	warn_capture_begin();
 	acct_cfg_derive(&base, &ch, &c);
-	CHECK(c.pinhole);
 	CHECK_UINT(warn_capture_count("sip keepalive forced to 30 s"), 1);
 	CHECK_UINT(warn_capture_count("60 s conntrack udp timeout"), 1);
 	CHECK_UINT(acct_ka_interval_effective(&c, 60, &forced), 30);
@@ -788,39 +783,19 @@ static void test_refresher_bound(void)
 	CHECK_UINT(warn_capture_count("sip keepalive forced to 30 s"), 1);
 	CHECK_UINT(c.options_interval, 20);
 	base.options_interval = 0;
-
-	CASE("bound: modes 0 and 1 keep the configured pair and log nothing");
-	base.restrict_source = 1;
-	warn_capture_begin();
-	acct_cfg_derive(&base, &ch, &c);
-	CHECK(!c.pinhole);
-	CHECK(!c.ka_enabled);
-	CHECK_UINT(warn_capture_count("keepalive"), 0);
-	CHECK_UINT(warn_capture_count("restrict_source 2"), 0);
-	base.restrict_source = 0;
-	base.keepalive_enabled = true;
-	base.keepalive_interval = 300;
-	warn_capture_begin();
-	acct_cfg_derive(&base, &ch, &c);
-	CHECK(!c.pinhole);
-	CHECK(c.ka_enabled);
-	CHECK_UINT(c.ka_interval, 300);
-	CHECK_UINT(warn_capture_count("keepalive"), 0);
 	warn_capture_end();
 
 	/*
 	 * A stream line holds the pinhole with the connection itself and
 	 * refreshes it with SO_KEEPALIVE, so the udp bound does not apply and
-	 * the configured pair stands under every mode.
+	 * the configured pair stands.
 	 */
-	CASE("bound: a tcp line under mode 2 keeps the pair off and says why");
-	base.restrict_source = 2;
+	CASE("bound: a tcp line keeps the pair off and says why");
 	base.keepalive_enabled = false;
 	base.keepalive_interval = 0;
 	snprintf(base.transport, sizeof(base.transport), "tcp");
 	warn_capture_begin();
 	acct_cfg_derive(&base, &ch, &c);
-	CHECK(c.pinhole);
 	CHECK(!c.ka_enabled);
 	CHECK_UINT(warn_capture_count("sip keepalive forced"), 0);
 	CHECK_UINT(warn_capture_count("keepalive refreshes it"), 1);
@@ -834,33 +809,26 @@ static void test_refresher_bound(void)
 	CHECK_UINT(c.ka_interval, 300);
 	CHECK_UINT(warn_capture_count("sip keepalive forced"), 0);
 	CHECK_UINT(warn_capture_count("over tls"), 1);
-
-	CASE("bound: a stream line under mode 1 says nothing at all");
-	base.restrict_source = 1;
-	warn_capture_begin();
-	acct_cfg_derive(&base, &ch, &c);
-	CHECK_UINT(warn_capture_count("restrict_source 2"), 0);
-	CHECK_UINT(warn_capture_count("keepalive"), 0);
 	warn_capture_end();
 	snprintf(base.transport, sizeof(base.transport), "udp");
 
-	/* the mode reaches the account as one field, and a move of it is the
-	 * live apply class: the running keepalive is re-armed and nothing is
-	 * rebuilt */
-	CASE("bound: a mode move alone is the live apply class");
-	base.restrict_source = 2;
+	/* uvoice accepts the D2 option and derives nothing from it */
+	CASE("bound: restrict_source moves no account field");
 	base.keepalive_enabled = false;
 	base.keepalive_interval = 0;
-	acct_cfg_derive(&base, &ch, &c);
 	base.restrict_source = 1;
+	acct_cfg_derive(&base, &ch, &c);
+	base.restrict_source = 0;
 	acct_cfg_derive(&base, &ch, &d);
-	CHECK(c.pinhole && !d.pinhole);
-	CHECK(acct_apply_class(&c, &d) == ACCT_APPLY_LIVE);
-	CHECK(acct_apply_class(&d, &c) == ACCT_APPLY_LIVE);
+	CHECK(acct_apply_class(&c, &d) == ACCT_APPLY_NONE);
+	CHECK_UINT(acct_ka_interval_effective(&d, 60, &forced), 30);
+	base.restrict_source = 2;
+	acct_cfg_derive(&base, &ch, &d);
+	CHECK(acct_apply_class(&c, &d) == ACCT_APPLY_NONE);
+	base.restrict_source = 1;
 
 	CASE("bound: 1 s floors the keepalive at 1 s and warns");
 	net_ct_udp_bound_test_set(1, 180);
-	base.restrict_source = 2;
 	warn_capture_begin();
 	acct_cfg_derive(&base, &ch, &c);
 	CHECK_UINT(warn_capture_count("under a 1 s conntrack udp timeout"), 1);
@@ -924,14 +892,14 @@ static void test_srtp_transport_warn(void)
 	CHECK_UINT(warn_capture_count("srtp_enabled"), 1);
 	CHECK_UINT(warn_capture_count("RFC 4568 7.2"), 1);
 	/* the message names the transport it warns about, not a constant */
-	CHECK_UINT(warn_capture_count("over udp"), 1);
+	CHECK_UINT(warn_capture_count("srtp_enabled over udp"), 1);
 
 	CASE("srtp warn: srtp over tcp warns once and names tcp");
 	snprintf(base.transport, sizeof(base.transport), "tcp");
 	warn_capture_begin();
 	acct_cfg_derive(&base, &ch, &c);
 	CHECK_UINT(warn_capture_count("srtp_enabled"), 1);
-	CHECK_UINT(warn_capture_count("over tcp"), 1);
+	CHECK_UINT(warn_capture_count("srtp_enabled over tcp"), 1);
 
 	CASE("srtp warn: srtp over tls says nothing");
 	snprintf(base.transport, sizeof(base.transport), "tls");
@@ -1071,11 +1039,9 @@ static void test_derive_endpoint(void)
 /* --------------------------------------------------- the transport of a line */
 
 /*
- * Transport is base only (account.h). The firewall reconcile writes one proto
- * for the whole rule set. Two lines on two transports would therefore take
- * the inbound SIP of one line down with no report. The base value is the only
- * one that reaches an account, and a channel that names another is reported
- * and ignored. It is the one option of the schema whose channel row is not an
+ * Transport is base only (account.h). The base value is the only one that
+ * reaches an account, and a channel that names another is reported and
+ * ignored. It is the one option of the schema whose channel row is not an
  * alias, so the derive reports it.
  */
 static void test_derive_transport(void)
@@ -2149,16 +2115,14 @@ static void test_dns_reload(void)
 }
 
 /*
- * The dns_linger retention, pure: virtual clocks in the arguments, no uloop
- * and no line. The live halves, the round membership and the rule set, run in
- * the round and dns move classes.
+ * The dns_linger retention, pure: virtual clocks in its arguments, no uloop
+ * and no line. Its live half, round membership and set elements, runs in the
+ * round and set classes.
  */
 static void test_linger(void)
 {
 	struct acct_linger lg;
 	struct sip_txn_dst dst, dst2;
-	char list[FW_PROXY_MAX][FW_SRC_MAX];
-	unsigned int n;
 	unsigned int i;
 
 	CASE("linger: a noted address refreshes its last seen on re-appearance");
@@ -2210,38 +2174,6 @@ static void test_linger(void)
 	CASE("linger: the deadline is the oldest entry's expiry");
 	CHECK(acct_linger_deadline(&lg, 10) == 1001 + 10 * 1000);
 	CHECK(acct_linger_deadline(&lg, 0) == 0);
-
-	CASE("linger: collect lands in the sorted proxy order and inside the bound");
-	memset(&lg, 0, sizeof(lg));
-	CHECK(sip_dst_set(&dst, "198.51.100.30", 5060));
-	acct_linger_note(&lg, &dst, 1000);
-	CHECK(sip_dst_set(&dst, "198.51.100.20", 5060));
-	acct_linger_note(&lg, &dst, 1000);
-	memset(list, 0, sizeof(list));
-	n = fw_reconcile_proxy_add(list, 0, "198.51.100.25");
-	n = acct_linger_collect(&lg, list, n);
-	CHECK_UINT(n, 3);
-	CHECK(!strcmp(list[0], "198.51.100.20"));
-	CHECK(!strcmp(list[1], "198.51.100.25"));
-	CHECK(!strcmp(list[2], "198.51.100.30"));
-
-	CASE("linger: collect never evicts a current proxy");
-	memset(list, 0, sizeof(list));
-	for (n = 0, i = 0; i < FW_PROXY_MAX; i++) {
-		char host[32];
-
-		snprintf(host, sizeof(host), "203.0.113.%u", 100 + i);
-		n = fw_reconcile_proxy_add(list, n, host);
-	}
-	CHECK_UINT(n, FW_PROXY_MAX);
-	/* both lingering addresses sort before every current one and still
-	 * get no slot */
-	warn_capture_begin();
-	n = acct_linger_collect(&lg, list, n);
-	CHECK_UINT(warn_capture_count("lingering proxy source"), 2);
-	warn_capture_end();
-	CHECK_UINT(n, FW_PROXY_MAX);
-	CHECK(!strcmp(list[0], "203.0.113.100"));
 }
 
 /*
@@ -2311,95 +2243,6 @@ static void test_local_host_move(void)
 	sip_reg_refresh_now(&rk_reg);
 	CHECK_UINT(rk_reg.fail_run, 0);
 
-	sip_reg_done(&rk_reg);
-	sip_txn_mgr_done(&rk_mgr);
-}
-
-/* ------------------------------------------------- the proxy source collector */
-
-static struct sip_txn_mgr rk2_mgr;
-static struct sip_reg rk2_reg;
-
-/*
- * A second line on the same scripted environment. The reconcile walks every
- * active line with one list and one running count, so the collector needs two
- * registrations to be exercised the way production calls it.
- */
-static void rk2_reset(void)
-{
-	struct sip_reg_cfg rc;
-	struct sip_timer_cfg tc;
-
-	sip_reg_done(&rk2_reg);
-	sip_txn_mgr_done(&rk2_mgr);
-
-	memset(&rc, 0, sizeof(rc));
-	rc.aor = "sip:5551001@sip.example.com";
-	rc.registrar = "sip:sip.example.com";
-	rc.contact_user = "5551001";
-	rc.local_host = "10.0.0.5";
-	rc.local_port = 5062;
-
-	sip_timer_cfg_default(&tc);
-	sip_txn_mgr_init(&rk2_mgr, &rk.env, &tc);
-	sip_reg_init(&rk2_reg, &rk2_mgr, &rk.env, 0x00020001, &rc, NULL, NULL);
-}
-
-static void test_proxy_collect(void)
-{
-	char proxy[FW_PROXY_MAX][FW_SRC_MAX];
-	struct sip_dns_result res;
-	struct sip_reg fresh;
-	unsigned int n;
-
-	memset(proxy, 0, sizeof(proxy));
-
-	CASE("collect: one line fills the list in sorted order");
-	rk_reset();
-	sip_reg_start(&rk_reg);
-	answer_make(&res, DNS_A, DNS_B);
-	acct_targets_load(&rk_reg, &res);
-	n = acct_proxy_collect(&rk_reg, true, proxy, 0);
-	CHECK_UINT(n, 2);
-	CHECK(!strcmp(proxy[0], DNS_A));
-	CHECK(!strcmp(proxy[1], DNS_B));
-
-	/*
-	 * The second line collects on top of the first: that running count is
-	 * how one bounded list covers both lines, a proxy they share holds one
-	 * rule, and a proxy only the second line uses gets its own.
-	 */
-	CASE("collect: a second line appends to the running count and shares a slot");
-	rk2_reset();
-	sip_reg_start(&rk2_reg);
-	answer_make(&res, DNS_B, DNS_C);
-	acct_targets_load(&rk2_reg, &res);
-	n = acct_proxy_collect(&rk2_reg, true, proxy, n);
-	CHECK_UINT(n, 3);
-	CHECK(!strcmp(proxy[0], DNS_A));
-	CHECK(!strcmp(proxy[1], DNS_B));
-	CHECK(!strcmp(proxy[2], DNS_C));
-
-	CASE("collect: a client that never started contributes nothing");
-	memset(&fresh, 0, sizeof(fresh));
-	CHECK_UINT(acct_proxy_collect(&fresh, true, proxy, n), 3);
-	CHECK_UINT(acct_proxy_collect(&fresh, false, proxy, n), 3);
-
-	/*
-	 * sip_reg_done() stops the client and leaves the target list, so the
-	 * started gate is the only thing between a torn down line and a rule
-	 * that still names its proxy.
-	 */
-	CASE("collect: a stopped client keeps its targets, and the gate holds them back");
-	sip_reg_done(&rk_reg);
-	memset(proxy, 0, sizeof(proxy));
-	CHECK_UINT(acct_proxy_collect(&rk_reg, true, proxy, 0), 2);
-	memset(proxy, 0, sizeof(proxy));
-	CHECK_UINT(acct_proxy_collect(&rk_reg, false, proxy, 0), 0);
-	CHECK(!proxy[0][0]);
-
-	sip_reg_done(&rk2_reg);
-	sip_txn_mgr_done(&rk2_mgr);
 	sip_reg_done(&rk_reg);
 	sip_txn_mgr_done(&rk_mgr);
 }
@@ -3185,1284 +3028,9 @@ static void test_sni(void)
 	CHECK(acct_sni_of(&c) == NULL);
 }
 
-/* ------------------------------------------------ the source address probe */
-
-/*
- * A stream line has no datagram socket to ask for its own address. The Via
- * and the Contact therefore come from the route: a transient connected
- * datagram socket that sends nothing. Loopback is the one destination that a
- * host always has.
- */
-/*
- * Every chain deletes the whole rule namespace first, so an add step sits at
- * DELS + its index in the desired set.
- */
-#define DELS		(1 + CFG_CHANNEL_MAX + FW_PROXY_MAX)
-#define ADD(n)		(DELS + (n))
-
-#define SCRIPT		"/usr/srg/scripts/firewall_exception"
-
 static bool has_str(const char *hay, const char *needle)
 {
 	return hay && strstr(hay, needle) != NULL;
-}
-
-/* NULL tolerant: a step past the end must fail the case, not the process */
-static bool step_is(unsigned int idx, const char *want)
-{
-	char cmd[256];
-	const char *got = fw_plan_step(idx, cmd, sizeof(cmd));
-
-	return got && !strcmp(got, want);
-}
-
-static bool step_has(unsigned int idx, const char *needle)
-{
-	char cmd[256];
-
-	return has_str(fw_plan_step(idx, cmd, sizeof(cmd)), needle);
-}
-
-/* Whether any step of the plan carries the text, for what must not be there. */
-static bool plan_has(const char *needle)
-{
-	unsigned int i;
-
-	for (i = 0; i < fw_plan_count(); i++) {
-		if (step_has(i, needle))
-			return true;
-	}
-
-	return false;
-}
-
-/*
- * The argv entries a step needs, counted from the rendered command: one per
- * space separated token plus the NULL execv() takes. It is only exact while no
- * single argument holds a space, which a one port rule satisfies.
- */
-static unsigned int step_argc(unsigned int idx)
-{
-	char cmd[256];
-	const char *p = fw_plan_step(idx, cmd, sizeof(cmd));
-	unsigned int n = 1;
-
-	if (!p || !*p)
-		return 0;
-
-	while (*p) {
-		if (*p == ' ')
-			n++;
-		p++;
-	}
-
-	return n + 1;
-}
-
-/* The open form, which is what every rule set looked like before mode 1. */
-static void fw_open_set(const char *iface, const char *sip_ports, bool proto_udp,
-			const struct fw_rtp_range *rtp, unsigned int rtp_count)
-{
-	fw_voip_set(iface, sip_ports, proto_udp, rtp, rtp_count, NULL, 0, true);
-}
-
-/*
- * The firewall rule set. The firewall helper is absent off target, so the
- * observable is the argument vector that the reconcile would run. The plan is
- * built before the script is looked up, and fw_plan_step() formats exactly
- * what fw_spawn() receives.
- *
- * The RTP rules matter: with the SIP rule alone, the wan firewall drops the
- * inbound media stream, so the far end hears the handset and the handset
- * hears silence.
- */
-static void test_firewall(void)
-{
-	struct fw_rtp_range rtp[2];
-	char cmd[256];
-
-	memset(rtp, 0, sizeof(rtp));
-	rtp[0].channel = 1;
-	rtp[0].min = 10000;
-	rtp[0].max = 10030;
-	rtp[1].channel = 2;
-	rtp[1].min = 10000;
-	rtp[1].max = 10030;
-
-	CASE("firewall: one line opens SIP and its own RTP range");
-	fw_open_set("wan", "5060", true, rtp, 1);
-	CHECK_UINT(fw_plan_count(), ADD(2));
-
-	CASE("firewall: every known rule name is deleted first");
-	CHECK(step_is(0, SCRIPT " -d Allow_VoIP_SIP -r"));
-	CHECK(step_is(1, SCRIPT " -d Allow_VoIP_RTP_CH1 -r"));
-	CHECK(step_is(2, SCRIPT " -d Allow_VoIP_RTP_CH2 -r"));
-
-	/*
-	 * The proxy names are deleted whatever the mode: a box that ran
-	 * restrict_source 1 and then went open keeps its Allow_VoIP_PROXY<n>
-	 * rules, and nothing else on the system removes them.
-	 */
-	CASE("firewall: the proxy rule names are deleted too, in every mode");
-	CHECK(step_is(3, SCRIPT " -d Allow_VoIP_PROXY1 -r"));
-	CHECK(step_is(DELS - 1, SCRIPT " -d Allow_VoIP_PROXY16 -r"));
-	CHECK_UINT(DELS, 19);
-
-	CASE("firewall: the SIP rule keeps its shape");
-	CHECK(step_is(ADD(0), SCRIPT " -a Allow_VoIP_SIP -p 5060 -P udp -i wan -r"));
-
-	CASE("firewall: the RTP rule opens the range as a udp dest_port range");
-	CHECK(step_is(ADD(1), SCRIPT " -a Allow_VoIP_RTP_CH1 -p 10000-10031 -P udp -i wan"));
-
-	/*
-	 * The allocator hands out even RTP ports across the whole range, so the
-	 * top pair of a range ending on an even port has its RTCP one past max.
-	 * The rule has to admit the pair, not the bare range.
-	 */
-	CASE("firewall: the rule admits the top RTP pair, not the bare range");
-	{
-		struct cfg_channel ch;
-		uint16_t lo = 0, hi = 0, p = 0, last = 0;
-
-		memset(&ch, 0, sizeof(ch));
-		net_port_range(&ch, &lo, &hi);
-		CHECK_UINT(lo, 10000);
-		CHECK_UINT(hi, 10030);
-
-		net_port_reset();
-		while (net_port_alloc(lo, hi, &p))
-			last = p;
-		net_port_reset();
-
-		/* the top even port is allocatable, and its RTCP is above max */
-		CHECK_UINT(last, 10030);
-		CHECK_UINT(last + 1, 10031);
-
-		rtp[0].min = lo;
-		rtp[0].max = hi;
-		fw_open_set("wan", "5060", true, rtp, 1);
-		CHECK(step_has(ADD(1), "-p 10000-10031"));
-	}
-
-	CASE("firewall: a range ending on an odd port covers its pair too");
-	rtp[0].min = 30000;
-	rtp[0].max = 30011;
-	fw_open_set("wan", "5060", true, rtp, 1);
-	CHECK(step_has(ADD(1), "-p 30000-30012"));
-	rtp[0].min = 10000;
-	rtp[0].max = 10030;
-
-	CASE("firewall: a range at the top of the port space does not wrap");
-	rtp[0].min = 65500;
-	rtp[0].max = 65535;
-	fw_open_set("wan", "5060", true, rtp, 1);
-	CHECK(step_has(ADD(1), "-p 65500-65535"));
-	rtp[0].min = 10000;
-	rtp[0].max = 10030;
-	fw_open_set("wan", "5060", true, rtp, 1);
-
-	CASE("firewall: only the last step reloads fw4 (-r batching)");
-	CHECK(step_has(ADD(0), " -r"));
-	CHECK(!step_has(ADD(1), " -r"));
-
-	CASE("firewall: a second line adds its own rule");
-	fw_open_set("wan", "5060 5062", true, rtp, 2);
-	CHECK_UINT(fw_plan_count(), ADD(3));
-	CHECK(step_is(ADD(0), SCRIPT " -a Allow_VoIP_SIP -p 5060 5062 -P udp -i wan -r"));
-	CHECK(step_is(ADD(1), SCRIPT " -a Allow_VoIP_RTP_CH1 -p 10000-10031 -P udp -i wan -r"));
-	CHECK(step_is(ADD(2), SCRIPT " -a Allow_VoIP_RTP_CH2 -p 10000-10031 -P udp -i wan"));
-
-	CASE("firewall: a per channel range reaches its own rule");
-	rtp[1].min = 20000;
-	rtp[1].max = 20040;
-	fw_open_set("wan", "5060 5062", true, rtp, 2);
-	CHECK(step_is(ADD(2), SCRIPT " -a Allow_VoIP_RTP_CH2 -p 20000-20041 -P udp -i wan"));
-
-	CASE("firewall: the voice interface follows the config");
-	fw_open_set("wan2", "5060", true, rtp, 1);
-	CHECK(step_has(ADD(1), "-i wan2"));
-
-	CASE("firewall: an empty interface takes wan");
-	fw_open_set(NULL, "5060", true, rtp, 1);
-	CHECK(step_has(ADD(1), "-i wan"));
-
-	CASE("firewall: tcp signalling still opens RTP over udp");
-	fw_open_set("wan", "5060", false, rtp, 1);
-	CHECK(step_has(ADD(0), "-P tcp"));
-	CHECK(step_has(ADD(1), "-P udp"));
-
-	CASE("firewall: an incoherent range is dropped, never opened wrong");
-	rtp[0].min = 0;
-	fw_open_set("wan", "5060", true, rtp, 1);
-	CHECK_UINT(fw_plan_count(), ADD(1));
-	CHECK(step_has(ADD(0), "Allow_VoIP_SIP"));
-	rtp[0].min = 10000;
-
-	CASE("firewall: no line at all deletes every rule and adds none");
-	fw_voip_clear();
-	CHECK_UINT(fw_plan_count(), DELS);
-	CHECK(step_is(DELS - 1, SCRIPT " -d Allow_VoIP_PROXY16"));
-
-	CASE("firewall: empty SIP ports are a clear, not an empty rule");
-	fw_open_set("wan", "", true, rtp, 1);
-	CHECK_UINT(fw_plan_count(), DELS);
-
-	CASE("firewall: a step past the end reports nothing");
-	CHECK(fw_plan_step(99, cmd, sizeof(cmd)) == NULL);
-	CHECK(fw_plan_step(0, NULL, 0) == NULL);
-}
-
-/*
- * restrict_source 1. One Allow_VoIP_PROXY<n> per
- * distinct resolved proxy address replaces the open Allow_VoIP_SIP rule, and
- * each carries that address as its source. The RTP rules do not change,
- * because the media of an asymmetric peer arrives from an address that the
- * signaling never named. Before the first address resolves, the open rule
- * stays.
- */
-static void test_firewall_restrict(void)
-{
-	char proxy[FW_PROXY_MAX][FW_SRC_MAX];
-	struct fw_rtp_range rtp[2];
-	struct sip_dns_result res;
-	unsigned int i, n;
-
-	memset(proxy, 0, sizeof(proxy));
-	memset(rtp, 0, sizeof(rtp));
-	rtp[0].channel = 1;
-	rtp[0].min = 10000;
-	rtp[0].max = 10030;
-	rtp[1].channel = 2;
-	rtp[1].min = 10000;
-	rtp[1].max = 10030;
-
-	CASE("restrict: two proxies replace the SIP rule with one rule each");
-	n = 0;
-	n = fw_reconcile_proxy_add(proxy, n, "198.51.100.7");
-	n = fw_reconcile_proxy_add(proxy, n, "203.0.113.9");
-	CHECK_UINT(n, 2);
-	fw_voip_set("wan", "5060 5062", true, rtp, 2, proxy, n, fw_reconcile_sip_open_needed(1, n));
-	CHECK_UINT(fw_plan_count(), ADD(4));
-	CHECK(step_is(ADD(0), SCRIPT " -a Allow_VoIP_PROXY1 -p 5060 5062 -P udp "
-		      "-s 198.51.100.7 -i wan -r"));
-	CHECK(step_is(ADD(1), SCRIPT " -a Allow_VoIP_PROXY2 -p 5060 5062 -P udp "
-		      "-s 203.0.113.9 -i wan -r"));
-	CHECK(!plan_has("-a Allow_VoIP_SIP"));
-
-	CASE("restrict: the RTP rules follow the proxy rules, unrestricted");
-	CHECK(step_is(ADD(2), SCRIPT " -a Allow_VoIP_RTP_CH1 -p 10000-10031 -P udp -i wan -r"));
-	CHECK(step_is(ADD(3), SCRIPT " -a Allow_VoIP_RTP_CH2 -p 10000-10031 -P udp -i wan"));
-
-	CASE("restrict: the source add step fits the argv the runner builds");
-	fw_voip_set("wan", "5060", true, rtp, 1, proxy, 1, false);
-	CHECK(step_is(ADD(0), SCRIPT " -a Allow_VoIP_PROXY1 -p 5060 -P udp "
-		      "-s 198.51.100.7 -i wan -r"));
-	CHECK_UINT(step_argc(ADD(0)), 13);
-
-	CASE("restrict: nothing resolved yet keeps the open rule");
-	n = 0;
-	CHECK(fw_reconcile_sip_open_needed(1, n));
-	CHECK(fw_reconcile_sip_open_needed(2, n));
-	fw_voip_set("wan", "5060", true, rtp, 1, proxy, n, fw_reconcile_sip_open_needed(1, n));
-	CHECK_UINT(fw_plan_count(), ADD(2));
-	CHECK(step_is(ADD(0), SCRIPT " -a Allow_VoIP_SIP -p 5060 -P udp -i wan -r"));
-	CHECK(!plan_has("-a Allow_VoIP_PROXY"));
-
-	CASE("restrict: mode 0 opens the SIP rule whatever was resolved");
-	n = fw_reconcile_proxy_add(proxy, 0, "198.51.100.7");
-	CHECK(fw_reconcile_sip_open_needed(0, n));
-	fw_voip_set("wan", "5060", true, rtp, 1, proxy, n, fw_reconcile_sip_open_needed(0, n));
-	CHECK_UINT(fw_plan_count(), ADD(2));
-	CHECK(step_is(ADD(0), SCRIPT " -a Allow_VoIP_SIP -p 5060 -P udp -i wan -r"));
-	CHECK(!plan_has("-s "));
-
-	CASE("restrict: two lines behind one proxy hold one rule");
-	n = 0;
-	n = fw_reconcile_proxy_add(proxy, n, "198.51.100.7");	/* line 1 target */
-	n = fw_reconcile_proxy_add(proxy, n, "198.51.100.7");	/* line 2, same target */
-	CHECK_UINT(n, 1);
-	fw_voip_set("wan", "5060 5062", true, rtp, 2, proxy, n, fw_reconcile_sip_open_needed(1, n));
-	CHECK_UINT(fw_plan_count(), ADD(3));
-	CHECK(step_is(ADD(0), SCRIPT " -a Allow_VoIP_PROXY1 -p 5060 5062 -P udp "
-		      "-s 198.51.100.7 -i wan -r"));
-
-	/* A target whose address does not print must not eat a rule slot, or the
-	 * rule after it would carry the wrong number. */
-	CASE("restrict: an empty address is not an address");
-	{
-		char empty[FW_PROXY_MAX][FW_SRC_MAX];
-
-		memset(empty, 0, sizeof(empty));
-		CHECK_UINT(fw_reconcile_proxy_add(empty, 0, ""), 0);
-		CHECK_UINT(fw_reconcile_proxy_add(empty, 0, NULL), 0);
-		CHECK(!empty[0][0]);
-	}
-
-	/*
-	 * The rule namespace is fixed, so the ninth address gets no rule. It is
-	 * dropped and reported rather than renumbered over an existing rule.
-	 */
-	CASE("restrict: an address past the bound is dropped, not renumbered");
-	n = 0;
-	for (i = 0; i < FW_PROXY_MAX + 1; i++) {
-		char addr[FW_SRC_MAX];
-
-		snprintf(addr, sizeof(addr), "198.51.100.%u", i + 1);
-		n = fw_reconcile_proxy_add(proxy, n, addr);
-	}
-	CHECK_UINT(n, FW_PROXY_MAX);
-	CHECK(!strcmp(proxy[FW_PROXY_MAX - 1], "198.51.100.8"));
-
-	CASE("restrict: the bounded set is the whole rule set the chain adds");
-	fw_voip_set("wan", "5060", true, rtp, 2, proxy, n, fw_reconcile_sip_open_needed(1, n));
-	CHECK_UINT(fw_plan_count(), ADD(FW_PROXY_MAX + 2));
-	CHECK(step_has(ADD(0),
-		       "-a Allow_VoIP_PROXY1 -p 5060 -P udp -s 198.51.100.1"));
-	CHECK(step_has(ADD(FW_PROXY_MAX - 1),
-		       "-a Allow_VoIP_PROXY16 -p 5060 -P udp -s 198.51.100.8"));
-	CHECK(!plan_has("198.51.100.9"));
-	CHECK(step_is(ADD(FW_PROXY_MAX + 1), SCRIPT " -a Allow_VoIP_RTP_CH2 -p 10000-10031 "
-		      "-P udp -i wan"));
-
-	/*
-	 * Mode 1 keeps its whole machinery when mode 2 becomes the pinhole
-	 * form: the open-rule fallback answers for both modes, and only the
-	 * ingress-rule question separates them (test_firewall_pinhole).
-	 */
-	CASE("restrict: mode 2 leaves the mode 1 fallback rule untouched");
-	n = fw_reconcile_proxy_add(proxy, 0, "198.51.100.7");
-	CHECK(!fw_reconcile_sip_open_needed(1, n));
-	CHECK(!fw_reconcile_sip_open_needed(2, n));
-	fw_voip_set("wan", "5060", true, rtp, 1, proxy, n, fw_reconcile_sip_open_needed(1, n));
-	CHECK_UINT(fw_plan_count(), ADD(2));
-	CHECK(step_is(ADD(0), SCRIPT " -a Allow_VoIP_PROXY1 -p 5060 -P udp "
-		      "-s 198.51.100.7 -i wan -r"));
-	CHECK(step_has(ADD(1), "-a Allow_VoIP_RTP_CH1"));
-
-	/* Every SRV target belongs in the restricted source set. */
-	CASE("restrict: SRV failover reaches a target covered by the rule set");
-	rk_reset();
-	sip_reg_start(&rk_reg);
-	answer_make(&res, DNS_A, DNS_B);
-	acct_targets_load(&rk_reg, &res);
-	CHECK(current_host_is(DNS_A));
-	sip_reg_txn_done(&rk_reg, rk_reg.txn, SIP_TXN_DONE_TIMEOUT);
-	CHECK(current_host_is(DNS_B));
-	rk.now = rk_reg.timer.due_ms;
-	sip_timer_expire(&rk_reg.timer);
-	CHECK(!strcmp(rk.host, DNS_B));
-	memset(proxy, 0, sizeof(proxy));
-	n = acct_proxy_collect(&rk_reg, true, proxy, 0);
-	CHECK_UINT(n, 2);
-	fw_voip_set("wan", "5060", true, rtp, 1, proxy, n, fw_reconcile_sip_open_needed(1, n));
-	CHECK(plan_has("-s " DNS_A));
-	CHECK(plan_has("-s " DNS_B));
-	CHECK(!plan_has("-a Allow_VoIP_SIP"));
-
-	/*
-	 * A zone with records of both families fills the answer, and the
-	 * registration accepts every endpoint of it, so the rule set has to
-	 * admit every one: a target with no rule is a proxy whose traffic the
-	 * firewall drops.
-	 */
-	CASE("restrict: a sixteen endpoint answer loads whole and rules whole");
-	rk_reset();
-	sip_reg_start(&rk_reg);
-	memset(&res, 0, sizeof(res));
-	res.status = SIP_DNS_OK;
-	res.ttl = 300;
-	res.count = FW_PROXY_MAX;
-	for (i = 0; i < FW_PROXY_MAX; i++) {
-		char host[FW_SRC_MAX];
-
-		if (i < FW_PROXY_MAX / 2)
-			snprintf(host, sizeof(host), "198.51.100.%u", i + 10);
-		else
-			snprintf(host, sizeof(host), "2001:db8:1::%u", i + 10);
-
-		snprintf(res.target[i].host, sizeof(res.target[i].host), "%s",
-			 host);
-		res.target[i].port = 5060;
-		CHECK(sip_dst_set(&res.target[i].dst, host, 5060));
-	}
-
-	acct_targets_load(&rk_reg, &res);
-	CHECK_UINT(sip_reg_target_count(&rk_reg), FW_PROXY_MAX);
-	memset(proxy, 0, sizeof(proxy));
-	n = acct_proxy_collect(&rk_reg, true, proxy, 0);
-	CHECK_UINT(n, FW_PROXY_MAX);
-	fw_voip_set("wan", "5060", true, rtp, 1, proxy, n,
-		    fw_reconcile_sip_open_needed(1, n));
-	CHECK_UINT(fw_plan_count(), ADD(FW_PROXY_MAX + 1));
-
-	CASE("restrict: and every one of the sixteen holds a rule of its own");
-	for (i = 0; i < FW_PROXY_MAX; i++) {
-		char want[FW_SRC_MAX + 8];
-
-		snprintf(want, sizeof(want), "-s %s", res.target[i].host);
-		CHECK(plan_has(want));
-	}
-	CHECK(!plan_has("-a Allow_VoIP_SIP"));
-
-	sip_reg_done(&rk_reg);
-	sip_txn_mgr_done(&rk_mgr);
-}
-
-/*
- * restrict_source 2, the keepalive pinhole. The reconcile installs no rule
- * for it: it deletes the whole namespace, as the disable
- * path does, and adds nothing. Inbound service uses conntrack: the SIP socket
- * pings the proxy, and the media sockets are bound to the advertised ports
- * and connected. Every tuple that the far end answers on therefore has an
- * established entry.
- *
- * The cases drive fw_reconcile_apply(), the production policy. The static
- * fw_reconcile() collects the inputs from the account table and passes them
- * on, and nothing here implements a decision again.
- */
-static void test_firewall_pinhole(void)
-{
-	char cleared[DELS][160];
-	char proxy[FW_PROXY_MAX][FW_SRC_MAX];
-	struct fw_rtp_range rtp[1];
-	struct sip_dns_result res;
-	unsigned int i, n;
-
-	memset(proxy, 0, sizeof(proxy));
-	memset(rtp, 0, sizeof(rtp));
-	rtp[0].channel = 1;
-	rtp[0].min = 10000;
-	rtp[0].max = 10030;
-
-	CASE("pinhole: mode 2 asks for no rule although two addresses resolved");
-	rk_reset();
-	sip_reg_start(&rk_reg);
-	answer_make(&res, DNS_A, DNS_B);
-	acct_targets_load(&rk_reg, &res);
-	n = acct_proxy_collect(&rk_reg, true, proxy, 0);
-	CHECK_UINT(n, 2);
-	CHECK(!fw_reconcile_ingress_rules_needed(2));
-	CHECK(fw_reconcile_ingress_rules_needed(0));
-	CHECK(fw_reconcile_ingress_rules_needed(1));
-
-	CASE("pinhole: the reconcile after a resolution deletes and adds nothing");
-	fw_test_mode(true);
-	fw_reconcile_apply("wan", 2, 1, "5060", true, rtp, 1, proxy, n);
-	CHECK_UINT(fw_plan_count(), DELS);
-	CHECK(!plan_has(" -a "));
-	for (i = 0; i < DELS; i++) {
-		CHECK(step_has(i, " -d "));
-		fw_test_step_done(0);
-	}
-	CHECK_UINT(fw_test_spawned(), DELS);
-
-	CASE("pinhole: no add chain follows the deletes");
-	fw_test_step_done(0);
-	CHECK_UINT(fw_test_spawned(), DELS);
-	CHECK_UINT(fw_plan_count(), 0);
-
-	/*
-	 * The mode is live (schema APPLY_LIVE), so a reload can move it either
-	 * way with the registration untouched. Both directions have to reach the
-	 * firewall on the next reconcile.
-	 */
-	CASE("pinhole: a flip to mode 1 installs the proxy rules");
-	n = acct_proxy_collect(&rk_reg, true, proxy, 0);
-	CHECK_UINT(n, 2);
-	fw_reconcile_apply("wan", 1, 1, "5060", true, rtp, 1, proxy, n);
-	CHECK_UINT(fw_plan_count(), ADD(3));
-	CHECK(step_has(ADD(0), "-a Allow_VoIP_PROXY1 -p 5060 -P udp -s " DNS_A));
-	CHECK(step_has(ADD(1), "-a Allow_VoIP_PROXY2 -p 5060 -P udp -s " DNS_B));
-	CHECK(step_has(ADD(2), "-a Allow_VoIP_RTP_CH1"));
-	for (i = 0; i < ADD(3); i++)
-		fw_test_step_done(0);
-	CHECK_UINT(fw_test_spawned(), DELS + ADD(3));
-
-	CASE("pinhole: a flip back to mode 2 deletes them again");
-	fw_reconcile_apply("wan", 2, 1, "5060", true, rtp, 1, proxy, n);
-	CHECK_UINT(fw_plan_count(), DELS);
-	CHECK(!plan_has(" -a "));
-	for (i = 0; i < DELS; i++)
-		fw_test_step_done(0);
-	CHECK_UINT(fw_test_spawned(), DELS + ADD(3) + DELS);
-
-	/*
-	 * Nothing resolved is where mode 1 falls back to the open rule. Mode 2
-	 * has no such fallback: the pinhole form is the whole answer, so a line
-	 * that never resolved still installs nothing.
-	 */
-	CASE("pinhole: mode 2 with nothing resolved installs nothing either");
-	rk_reset();
-	fw_test_mode(true);
-	memset(proxy, 0, sizeof(proxy));
-	n = acct_proxy_collect(&rk_reg, true, proxy, 0);
-	CHECK_UINT(n, 0);
-	CHECK(fw_reconcile_sip_open_needed(2, n));
-	CHECK(!fw_reconcile_ingress_rules_needed(2));
-	fw_reconcile_apply("wan", 2, 1, "5060", true, rtp, 1, proxy, n);
-	CHECK_UINT(fw_plan_count(), DELS);
-	CHECK(!plan_has("-a Allow_VoIP_SIP"));
-	CHECK(!plan_has(" -a "));
-	for (i = 0; i < DELS; i++)
-		fw_test_step_done(0);
-	CHECK_UINT(fw_test_spawned(), DELS);
-
-	/*
-	 * The mode 2 chain and the disable chain are one chain. A step that
-	 * differed, the fw4 reload on the last one above all, would make the
-	 * pinhole mode a second teardown path with its own failure modes.
-	 */
-	CASE("pinhole: the mode 2 chain is the disable chain, step for step");
-	fw_test_mode(false);
-	fw_reconcile_apply("wan", 2, 1, "5060", true, rtp, 1, proxy, n);
-	CHECK_UINT(fw_plan_count(), DELS);
-	for (i = 0; i < DELS; i++) {
-		fw_plan_step(i, cleared[i], sizeof(cleared[i]));
-		CHECK(has_str(cleared[i], " -d "));
-	}
-	fw_open_set("wan", "", true, rtp, 1);		/* the disable path */
-	CHECK_UINT(fw_plan_count(), DELS);
-	for (i = 0; i < DELS; i++)
-		CHECK(step_is(i, cleared[i]));
-	CHECK(step_is(DELS - 1, SCRIPT " -d Allow_VoIP_PROXY16"));
-
-	sip_reg_done(&rk_reg);
-	sip_txn_mgr_done(&rk_mgr);
-}
-
-/*
- * A DNS address change updates the restricted firewall rules. The DNS
- * completion is the sixth reconcile call site
- * (account.c account_dns_result), and these cases run its production stages.
- * acct_targets_load() puts the answer on the target list, acct_proxy_collect()
- * takes the rule sources off that list, and fw_reconcile_apply() composes the
- * desired set. A moved address must move the rules. An answer that moved
- * nothing must not run a chain again, because the reconcile runs on every
- * completion. A chain per TTL cycle would reload fw4 for nothing.
- */
-static void test_firewall_dns_move(void)
-{
-	char proxy[FW_PROXY_MAX][FW_SRC_MAX];
-	struct fw_rtp_range rtp[1];
-	struct sip_dns_result res;
-	unsigned int i, n;
-
-	memset(rtp, 0, sizeof(rtp));
-	rtp[0].channel = 1;
-	rtp[0].min = 10000;
-	rtp[0].max = 10030;
-
-	CASE("dns move: the first completion opens one rule per resolved address");
-	rk_reset();
-	sip_reg_start(&rk_reg);
-	answer_make(&res, DNS_A, DNS_B);
-	acct_targets_load(&rk_reg, &res);
-	fw_test_mode(true);
-	memset(proxy, 0, sizeof(proxy));
-	n = acct_proxy_collect(&rk_reg, true, proxy, 0);
-	CHECK_UINT(n, 2);
-	fw_reconcile_apply("wan", 1, 1, "5060", true, rtp, 1, proxy, n);
-	CHECK_UINT(fw_plan_count(), ADD(3));
-	CHECK(step_has(ADD(0), "-a Allow_VoIP_PROXY1 -p 5060 -P udp -s " DNS_A));
-	CHECK(step_has(ADD(1), "-a Allow_VoIP_PROXY2 -p 5060 -P udp -s " DNS_B));
-	for (i = 0; i < ADD(3); i++)
-		fw_test_step_done(0);
-	CHECK_UINT(fw_test_spawned(), ADD(3));
-
-	CASE("dns move: a completion carrying the same answer runs no chain");
-	answer_make(&res, DNS_A, DNS_B);
-	acct_targets_load(&rk_reg, &res);
-	memset(proxy, 0, sizeof(proxy));
-	n = acct_proxy_collect(&rk_reg, true, proxy, 0);
-	CHECK_UINT(n, 2);
-	fw_reconcile_apply("wan", 1, 1, "5060", true, rtp, 1, proxy, n);
-	CHECK_UINT(fw_test_spawned(), ADD(3));
-	CHECK_UINT(fw_plan_count(), 0);
-
-	/*
-	 * A changed set must not leave the stale source its rule and the new
-	 * one none, or the firewall blocks the proxy that answers.
-	 * The rule namespace is deleted whole before the adds, so the stale rule
-	 * goes even though its name is reused.
-	 */
-	CASE("dns move: a changed address set moves the rules to the new addresses");
-	answer_make(&res, DNS_B, DNS_C);
-	res.changed = true;
-	acct_targets_load(&rk_reg, &res);
-	memset(proxy, 0, sizeof(proxy));
-	n = acct_proxy_collect(&rk_reg, true, proxy, 0);
-	CHECK_UINT(n, 2);
-	CHECK(!strcmp(proxy[0], DNS_B));
-	CHECK(!strcmp(proxy[1], DNS_C));
-	fw_reconcile_apply("wan", 1, 1, "5060", true, rtp, 1, proxy, n);
-	CHECK_UINT(fw_plan_count(), ADD(3));
-	CHECK(step_is(1 + CFG_CHANNEL_MAX, SCRIPT " -d Allow_VoIP_PROXY1 -r"));
-	CHECK(step_is(2 + CFG_CHANNEL_MAX, SCRIPT " -d Allow_VoIP_PROXY2 -r"));
-	CHECK(step_has(ADD(0), "-a Allow_VoIP_PROXY1 -p 5060 -P udp -s " DNS_B));
-	CHECK(step_has(ADD(1), "-a Allow_VoIP_PROXY2 -p 5060 -P udp -s " DNS_C));
-	CHECK(!plan_has("-s " DNS_A));
-
-	CASE("dns move: the moved rules are what the chain runs");
-	for (i = 0; i < ADD(3); i++)
-		fw_test_step_done(0);
-	CHECK_UINT(fw_test_spawned(), ADD(3) * 2);
-
-	/*
-	 * The resolver redraws equal priority SRV records on every delivery
-	 * (shared/resolve.h L17), so the same two servers come back in the
-	 * other order once per TTL cycle. The sorted source list turns that
-	 * answer into the same desired set, the comparison absorbs it and no
-	 * chain runs. A list in answer order would swap the sources between
-	 * PROXY1 and PROXY2 and reload fw4 every cycle for no change in what is
-	 * admitted.
-	 */
-	CASE("dns move: a redraw of the same servers runs no chain");
-	answer_make(&res, DNS_C, DNS_B);
-	acct_targets_load(&rk_reg, &res);
-	memset(proxy, 0, sizeof(proxy));
-	n = acct_proxy_collect(&rk_reg, true, proxy, 0);
-	CHECK_UINT(n, 2);
-	CHECK(!strcmp(proxy[0], DNS_B));
-	CHECK(!strcmp(proxy[1], DNS_C));
-	fw_reconcile_apply("wan", 1, 1, "5060", true, rtp, 1, proxy, n);
-	CHECK_UINT(fw_test_spawned(), ADD(3) * 2);
-	CHECK_UINT(fw_plan_count(), 0);
-
-	/*
-	 * The retention in the rule set: the member the rotation left keeps
-	 * its rule for the window, through the same two-pass collect the
-	 * reconcile runs, and the expiry then removes it.
-	 */
-	CASE("dns move: a rotated address keeps its rule for the linger window");
-	{
-		struct acct_linger lg;
-		struct sip_txn_dst d;
-
-		memset(&lg, 0, sizeof(lg));
-		CHECK(sip_dst_set(&d, DNS_C, 5060));	/* the member that left */
-		acct_linger_note(&lg, &d, 1000);
-		CHECK(sip_dst_set(&d, DNS_A, 5060));	/* the current member */
-		acct_linger_note(&lg, &d, 2000);
-		answer_make(&res, DNS_A, NULL);
-		acct_targets_load(&rk_reg, &res);
-		memset(proxy, 0, sizeof(proxy));
-		n = acct_proxy_collect(&rk_reg, true, proxy, 0);
-		CHECK_UINT(n, 1);
-		n = acct_linger_collect(&lg, proxy, n);
-		CHECK_UINT(n, 2);
-		fw_reconcile_apply("wan", 1, 1, "5060", true, rtp, 1, proxy, n);
-		CHECK_UINT(fw_plan_count(), ADD(3));
-		CHECK(step_has(ADD(0), "-s " DNS_A));
-		CHECK(step_has(ADD(1), "-s " DNS_C));
-		CHECK(!plan_has("-s " DNS_B));
-		for (i = 0; i < ADD(3); i++)
-			fw_test_step_done(0);
-
-		CASE("dns move: the expiry then removes the rotated address");
-		acct_linger_expire(&lg, 1000 + 10 * 1000, 10);
-		memset(proxy, 0, sizeof(proxy));
-		n = acct_proxy_collect(&rk_reg, true, proxy, 0);
-		n = acct_linger_collect(&lg, proxy, n);
-		CHECK_UINT(n, 1);
-		fw_reconcile_apply("wan", 1, 1, "5060", true, rtp, 1, proxy, n);
-		CHECK_UINT(fw_plan_count(), ADD(2));
-		CHECK(step_has(ADD(0), "-s " DNS_A));
-		CHECK(!plan_has("-s " DNS_C));
-		for (i = 0; i < ADD(2); i++)
-			fw_test_step_done(0);
-	}
-
-	fw_test_mode(false);
-	sip_reg_done(&rk_reg);
-	sip_txn_mgr_done(&rk_mgr);
-}
-
-/*
- * One overflow build under the warning capture, which the helper ends. A
- * needle therefore costs its own build, and the build is pure, so repeating
- * it for each needle costs nothing but the calls.
- */
-static unsigned int proxy_overflow_warns(const char *const *addrs, unsigned int count,
-					 bool reverse, const char *needle)
-{
-	char list[FW_PROXY_MAX][FW_SRC_MAX];
-	unsigned int i, n = 0, hits;
-
-	memset(list, 0, sizeof(list));
-	warn_capture_begin();
-
-	for (i = 0; i < count; i++)
-		n = fw_reconcile_proxy_add(list, n, addrs[reverse ? count - 1 - i : i]);
-
-	hits = warn_capture_count(needle);
-	warn_capture_end();
-
-	return hits;
-}
-
-/*
- * RFC 2782 weight selection reorders equal priority SRV answers by design, and
- * the resolver draws again on every delivery (shared/resolve.h L17). A TTL
- * re-resolution therefore gives the account the same servers in another
- * order. The proxy source list is sorted for that reason: the same set must
- * give the same list. Otherwise the rule numbering follows the draw, and every
- * cycle costs a whole delete and add chain plus an fw4 reload.
- *
- * The cases drive the production stages, never a copy. acct_targets_load()
- * takes the scripted answer, acct_proxy_collect() reads the targets off it,
- * and fw_reconcile_apply() composes the desired set.
- */
-static void test_firewall_redraw(void)
-{
-	/* two addresses more than the rule namespace holds, all of one
-	 * width, so the sorted order and the numeric order are one list */
-	static const char *const many[] = {
-		"198.51.100.27", "198.51.100.13", "198.51.100.20",
-		"198.51.100.11", "198.51.100.26", "198.51.100.14",
-		"198.51.100.22", "198.51.100.12", "198.51.100.19",
-		"198.51.100.10", "198.51.100.24", "198.51.100.16",
-		"198.51.100.21", "198.51.100.15", "198.51.100.25",
-		"198.51.100.17", "198.51.100.23", "198.51.100.18",
-	};
-	const unsigned int manys = sizeof(many) / sizeof(many[0]);
-	char first[ADD(FW_PROXY_MAX + 1)][160];
-	char proxy[FW_PROXY_MAX][FW_SRC_MAX];
-	char other[FW_PROXY_MAX][FW_SRC_MAX];
-	struct fw_rtp_range rtp[1];
-	struct sip_dns_result res;
-	unsigned int i, n, m;
-
-	memset(rtp, 0, sizeof(rtp));
-	rtp[0].channel = 1;
-	rtp[0].min = 10000;
-	rtp[0].max = 10030;
-
-	/*
-	 * Two independent registrations take the two draws, so nothing but the
-	 * answer order differs between the lists they produce.
-	 */
-	CASE("redraw: the same address set in either order collects one list");
-	rk_reset();
-	sip_reg_start(&rk_reg);
-	answer_make(&res, DNS_B, DNS_A);
-	acct_targets_load(&rk_reg, &res);
-	memset(proxy, 0, sizeof(proxy));
-	n = acct_proxy_collect(&rk_reg, true, proxy, 0);
-
-	rk_reset();
-	sip_reg_start(&rk_reg);
-	answer_make(&res, DNS_A, DNS_B);
-	acct_targets_load(&rk_reg, &res);
-	memset(other, 0, sizeof(other));
-	m = acct_proxy_collect(&rk_reg, true, other, 0);
-
-	CHECK_UINT(n, 2);
-	CHECK_UINT(m, 2);
-	CHECK(!strcmp(proxy[0], DNS_A));
-	CHECK(!strcmp(proxy[1], DNS_B));
-	CHECK(!strcmp(other[0], DNS_A));
-	CHECK(!strcmp(other[1], DNS_B));
-
-	CASE("redraw: and one rule list, step for step, numbering included");
-	fw_test_mode(true);
-	fw_reconcile_apply("wan", 1, 1, "5060", true, rtp, 1, proxy, n);
-	CHECK_UINT(fw_plan_count(), ADD(3));
-	for (i = 0; i < ADD(3); i++)
-		fw_plan_step(i, first[i], sizeof(first[i]));
-
-	fw_test_mode(true);
-	fw_reconcile_apply("wan", 1, 1, "5060", true, rtp, 1, other, m);
-	CHECK_UINT(fw_plan_count(), ADD(3));
-	for (i = 0; i < ADD(3); i++)
-		CHECK(step_is(i, first[i]));
-
-	/*
-	 * The control. A set that really moved must still rewrite, or the sort
-	 * would have bought the no-op by making every answer look unchanged.
-	 */
-	CASE("redraw: a set that really changed still rewrites the rules");
-	fw_test_mode(true);
-	rk_reset();
-	sip_reg_start(&rk_reg);
-	answer_make(&res, DNS_A, DNS_B);
-	acct_targets_load(&rk_reg, &res);
-	memset(proxy, 0, sizeof(proxy));
-	n = acct_proxy_collect(&rk_reg, true, proxy, 0);
-	fw_reconcile_apply("wan", 1, 1, "5060", true, rtp, 1, proxy, n);
-	CHECK_UINT(fw_plan_count(), ADD(3));
-	for (i = 0; i < ADD(3); i++)
-		fw_test_step_done(0);
-	CHECK_UINT(fw_test_spawned(), ADD(3));
-
-	answer_make(&res, DNS_C, DNS_B);
-	res.changed = true;
-	acct_targets_load(&rk_reg, &res);
-	memset(proxy, 0, sizeof(proxy));
-	n = acct_proxy_collect(&rk_reg, true, proxy, 0);
-	CHECK_UINT(n, 2);
-	CHECK(!strcmp(proxy[0], DNS_B));
-	CHECK(!strcmp(proxy[1], DNS_C));
-	fw_reconcile_apply("wan", 1, 1, "5060", true, rtp, 1, proxy, n);
-	CHECK_UINT(fw_plan_count(), ADD(3));
-	CHECK(step_has(ADD(0), "-s " DNS_B));
-	CHECK(step_has(ADD(1), "-s " DNS_C));
-	CHECK(!plan_has("-s " DNS_A));
-	CHECK_UINT(fw_test_spawned(), ADD(3) + 1);
-	for (i = 1; i < ADD(3); i++)
-		fw_test_step_done(0);
-
-	/*
-	 * The rule namespace is smaller than the answer can be, so somebody
-	 * loses a rule. Which one must not depend on the draw either: the list
-	 * keeps the FW_PROXY_MAX lexicographically smallest addresses, so the
-	 * same answer always blacks out the same proxy.
-	 */
-	CASE("redraw: an overflowing set drops the same addresses in either order");
-	memset(proxy, 0, sizeof(proxy));
-	memset(other, 0, sizeof(other));
-	n = 0;
-	for (i = 0; i < manys; i++)
-		n = fw_reconcile_proxy_add(proxy, n, many[i]);
-	m = 0;
-	for (i = manys; i > 0; i--)
-		m = fw_reconcile_proxy_add(other, m, many[i - 1]);
-
-	CHECK_UINT(n, FW_PROXY_MAX);
-	CHECK_UINT(m, FW_PROXY_MAX);
-	for (i = 0; i < FW_PROXY_MAX; i++)
-		CHECK(!strcmp(proxy[i], other[i]));
-	CHECK(!strcmp(proxy[0], "198.51.100.10"));
-	CHECK(!strcmp(proxy[FW_PROXY_MAX - 1], "198.51.100.25"));
-
-	CASE("redraw: the overflowing set is one rule list too");
-	fw_test_mode(true);
-	fw_reconcile_apply("wan", 1, 1, "5060", true, rtp, 1, proxy, n);
-	CHECK_UINT(fw_plan_count(), ADD(FW_PROXY_MAX + 1));
-	for (i = 0; i < ADD(FW_PROXY_MAX + 1); i++)
-		fw_plan_step(i, first[i], sizeof(first[i]));
-
-	fw_test_mode(true);
-	fw_reconcile_apply("wan", 1, 1, "5060", true, rtp, 1, other, m);
-	CHECK_UINT(fw_plan_count(), ADD(FW_PROXY_MAX + 1));
-	for (i = 0; i < ADD(FW_PROXY_MAX + 1); i++)
-		CHECK(step_is(i, first[i]));
-	CHECK(step_has(ADD(0),
-		       "-a Allow_VoIP_PROXY1 -p 5060 -P udp -s 198.51.100.10"));
-	CHECK(step_has(ADD(FW_PROXY_MAX - 1),
-		       "-a Allow_VoIP_PROXY16 -p 5060 -P udp "
-		       "-s 198.51.100.25"));
-	CHECK(!plan_has("-s 198.51.100.26"));
-	CHECK(!plan_has("-s 198.51.100.27"));
-
-	/*
-	 * The warn is the only sign an operator gets that a proxy holds no rule
-	 * and has its traffic dropped. Naming a surviving address instead would
-	 * read as a working rule set with a spurious complaint, and would send
-	 * the diagnosis at the proxy that still works. The addresses it names
-	 * must be the ones that lost their rule, in either draw.
-	 */
-	CASE("redraw: the overflow warn names the addresses that lost their rule");
-	CHECK_UINT(proxy_overflow_warns(many, manys, false, "198.51.100.27"),
-		   1);
-	CHECK_UINT(proxy_overflow_warns(many, manys, false, "198.51.100.26"),
-		   1);
-	CHECK_UINT(proxy_overflow_warns(many, manys, true, "198.51.100.27"), 1);
-	CHECK_UINT(proxy_overflow_warns(many, manys, true, "198.51.100.26"), 1);
-	CHECK_UINT(proxy_overflow_warns(many, manys, false, "198.51.100.25"),
-		   0);
-	CHECK_UINT(proxy_overflow_warns(many, manys, true, "198.51.100.10"), 0);
-
-	fw_test_mode(false);
-	sip_reg_done(&rk_reg);
-	sip_txn_mgr_done(&rk_mgr);
-}
-
-/*
- * The chain in flight executes an immutable snapshot. The steps already
- * spawned cannot carry a desired set that changes while a child runs. The
- * completion must therefore notice the change and start a second chain. The
- * completion records that snapshot as the applied set. A copy of the desired
- * set instead would record rules that were never installed, and the
- * coalescing pass would then skip them for good.
- */
-static void test_firewall_inflight(void)
-{
-	char proxy[FW_PROXY_MAX][FW_SRC_MAX];
-	struct fw_rtp_range rtp[2];
-	unsigned int i;
-
-	memset(proxy, 0, sizeof(proxy));
-	memset(rtp, 0, sizeof(rtp));
-	rtp[0].channel = 1;
-	rtp[0].min = 10000;
-	rtp[0].max = 10030;
-	rtp[1].channel = 2;
-	rtp[1].min = 20000;
-	rtp[1].max = 20040;
-
-	CASE("in flight: a chain starts for the first desired set");
-	fw_test_mode(true);
-	fw_open_set("wan", "5060", true, rtp, 1);
-	CHECK_UINT(fw_plan_count(), ADD(2));
-	CHECK_UINT(fw_test_spawned(), 1);
-
-	CASE("in flight: a set that arrives mid chain does not rewrite it");
-	fw_test_step_done(0);				/* the SIP delete completed */
-	fw_open_set("wan", "5060 5062", true, rtp, 2);	/* the line 2 rule appears */
-	CHECK_UINT(fw_plan_count(), ADD(2));		/* still the old chain */
-	CHECK(step_is(ADD(0), SCRIPT " -a Allow_VoIP_SIP -p 5060 -P udp -i wan -r"));
-	CHECK(step_is(ADD(1), SCRIPT " -a Allow_VoIP_RTP_CH1 -p 10000-10031 -P udp -i wan"));
-
-	CASE("in flight: the completion starts a chain for what is wanted now");
-	for (i = 1; i < ADD(2); i++)
-		fw_test_step_done(0);
-	CHECK_UINT(fw_plan_count(), ADD(3));
-	CHECK_UINT(fw_test_spawned(), ADD(2) + 1);
-	CHECK_UINT(fw_test_retry_ms(), 0);	/* success coalesces, no timer */
-
-	CASE("in flight: the second chain carries the rule the first could not");
-	CHECK(step_is(ADD(0), SCRIPT " -a Allow_VoIP_SIP -p 5060 5062 -P udp -i wan -r"));
-	CHECK(step_is(ADD(2), SCRIPT " -a Allow_VoIP_RTP_CH2 -p 20000-20041 -P udp -i wan"));
-
-	CASE("in flight: it settles and nothing more runs");
-	for (i = 1; i < ADD(3); i++)
-		fw_test_step_done(0);
-	CHECK_UINT(fw_test_spawned(), ADD(2) + ADD(3));		/* 13 steps, then 14 */
-	fw_test_step_done(0);
-	fw_open_set("wan", "5060 5062", true, rtp, 2);
-	CHECK_UINT(fw_test_spawned(), ADD(2) + ADD(3));
-
-	CASE("in flight: a set identical to the one running starts no second chain");
-	fw_test_mode(true);
-	fw_open_set("wan", "5060", true, rtp, 1);
-	fw_test_step_done(0);
-	fw_open_set("wan", "5060", true, rtp, 1);
-	for (i = 1; i < ADD(2); i++)
-		fw_test_step_done(0);
-	CHECK_UINT(fw_test_spawned(), ADD(2));
-
-	CASE("in flight: a clear mid chain is picked up at the completion");
-	fw_test_mode(true);
-	fw_open_set("wan", "5060", true, rtp, 1);
-	fw_test_step_done(0);
-	fw_voip_clear();
-	for (i = 1; i < ADD(2); i++)
-		fw_test_step_done(0);
-	CHECK_UINT(fw_plan_count(), DELS);
-	CHECK_UINT(fw_test_spawned(), ADD(2) + 1);
-
-	/*
-	 * The live order of a daemon start: the first reconcile runs before any
-	 * account is active, so it clears, and the populated set follows once
-	 * the line comes up. Both arrival points have to end with the adds on
-	 * the wire, because a clear chain alone leaves no voice rule at all.
-	 */
-	CASE("live order: a populated set after the clear chain runs its adds");
-	fw_test_mode(true);
-	fw_voip_clear();
-	CHECK_UINT(fw_plan_count(), DELS);
-	for (i = 0; i < DELS; i++)
-		fw_test_step_done(0);
-	CHECK_UINT(fw_test_spawned(), DELS);
-	fw_open_set("wan", "5060", true, rtp, 1);
-	CHECK_UINT(fw_plan_count(), ADD(2));
-	CHECK(step_has(ADD(0), "-a Allow_VoIP_SIP -p 5060"));
-	CHECK(step_has(ADD(1), "-a Allow_VoIP_RTP_CH1 -p 10000-10031"));
-	CHECK_UINT(fw_test_spawned(), DELS + 1);
-
-	CASE("live order: a populated set DURING the clear chain runs its adds");
-	fw_test_mode(true);
-	fw_voip_clear();
-	fw_test_step_done(0);				/* the clear chain is running */
-	fw_open_set("wan", "5060", true, rtp, 1);	/* the account came up */
-	CHECK_UINT(fw_plan_count(), DELS);		/* the chain is untouched */
-	for (i = 1; i < DELS; i++)
-		fw_test_step_done(0);
-
-	CASE("live order: the completion notices the clear installed nothing");
-	CHECK_UINT(fw_plan_count(), ADD(2));
-	CHECK(step_has(ADD(0), "-a Allow_VoIP_SIP -p 5060"));
-	CHECK(step_has(ADD(1), "-a Allow_VoIP_RTP_CH1 -p 10000-10031"));
-	CHECK_UINT(fw_test_spawned(), DELS + 1);
-
-	CASE("live order: the add chain then settles and stays settled");
-	for (i = 1; i < ADD(2); i++)
-		fw_test_step_done(0);
-	CHECK_UINT(fw_test_spawned(), DELS + ADD(2));
-	fw_open_set("wan", "5060", true, rtp, 1);
-	CHECK_UINT(fw_test_spawned(), DELS + ADD(2));
-
-	/*
-	 * A proxy that moved is the same rule name with a different source. The
-	 * chain comparison has to see the source, or the moved address would
-	 * never reach the firewall and the box would keep admitting the old one.
-	 */
-	CASE("in flight: a proxy address that moves alone re-chains");
-	fw_test_mode(true);
-	snprintf(proxy[0], sizeof(proxy[0]), "198.51.100.7");
-	fw_voip_set("wan", "5060", true, rtp, 1, proxy, 1, false);
-	for (i = 0; i < ADD(2); i++)
-		fw_test_step_done(0);
-	CHECK_UINT(fw_test_spawned(), ADD(2));
-	snprintf(proxy[0], sizeof(proxy[0]), "198.51.100.8");
-	fw_voip_set("wan", "5060", true, rtp, 1, proxy, 1, false);
-	CHECK_UINT(fw_test_spawned(), ADD(2) + 1);
-	CHECK(step_has(ADD(0), "-a Allow_VoIP_PROXY1 -p 5060 -P udp -s 198.51.100.8"));
-
-	CASE("in flight: a source change mid chain is carried by the completion");
-	fw_test_mode(true);
-	snprintf(proxy[0], sizeof(proxy[0]), "198.51.100.7");
-	fw_voip_set("wan", "5060", true, rtp, 1, proxy, 1, false);
-	fw_test_step_done(0);
-	snprintf(proxy[0], sizeof(proxy[0]), "198.51.100.8");
-	fw_voip_set("wan", "5060", true, rtp, 1, proxy, 1, false);
-	CHECK(step_has(ADD(0), "-s 198.51.100.7"));	/* the chain is untouched */
-	for (i = 1; i < ADD(2); i++)
-		fw_test_step_done(0);
-	CHECK_UINT(fw_test_spawned(), ADD(2) + 1);
-	CHECK(step_has(ADD(0), "-s 198.51.100.8"));
-
-	CASE("in flight: the re-chained source settles");
-	for (i = 1; i < ADD(2); i++)
-		fw_test_step_done(0);
-	CHECK_UINT(fw_test_spawned(), ADD(2) * 2);
-	fw_test_step_done(0);
-	fw_voip_set("wan", "5060", true, rtp, 1, proxy, 1, false);
-	CHECK_UINT(fw_test_spawned(), ADD(2) * 2);
-
-	fw_test_mode(false);
-}
-
-/*
- * The answer that fw_voip_set() and fw_voip_clear() give the reconcile log.
- * It is true while the ask differs from what the firewall holds or has under
- * way, so a chain runs for it. It is false for an ask that the firewall holds
- * or already carries. The comparison covers the whole rule set, so a proxy
- * address that the log line does not show still counts. A failed chain arms a
- * retry of the same ask, which its failure line reports. That ask answers
- * false until the retry runs; a changed ask answers true and runs at once.
- */
-static void test_firewall_change_report(void)
-{
-	char proxy[FW_PROXY_MAX][FW_SRC_MAX];
-	struct fw_rtp_range rtp[1];
-	unsigned int i;
-
-	memset(proxy, 0, sizeof(proxy));
-	memset(rtp, 0, sizeof(rtp));
-	rtp[0].channel = 1;
-	rtp[0].min = 10000;
-	rtp[0].max = 10030;
-
-	CASE("report: the first ask differs from an empty install");
-	fw_test_mode(true);
-	CHECK(fw_voip_set("wan", "5060", true, rtp, 1, proxy, 0, true));
-	for (i = 0; i < ADD(2); i++)
-		fw_test_step_done(0);
-	CHECK_UINT(fw_plan_count(), 0);
-
-	CASE("report: the same ask again runs no chain");
-	CHECK(!fw_voip_set("wan", "5060", true, rtp, 1, proxy, 0, true));
-	CHECK_UINT(fw_plan_count(), 0);
-
-	CASE("report: a proxy address the log line does not show still counts");
-	snprintf(proxy[0], sizeof(proxy[0]), "192.0.2.10");
-	CHECK(fw_voip_set("wan", "5060", true, rtp, 1, proxy, 1, false));
-	for (i = 0; i < ADD(2); i++)
-		fw_test_step_done(0);
-	CHECK(!fw_voip_set("wan", "5060", true, rtp, 1, proxy, 1, false));
-	snprintf(proxy[0], sizeof(proxy[0]), "192.0.2.11");
-	CHECK(fw_voip_set("wan", "5060", true, rtp, 1, proxy, 1, false));
-	for (i = 0; i < ADD(2); i++)
-		fw_test_step_done(0);
-	CHECK(!fw_voip_set("wan", "5060", true, rtp, 1, proxy, 1, false));
-
-	CASE("report: the retry carries a failed ask, a changed ask runs at once");
-	snprintf(proxy[0], sizeof(proxy[0]), "192.0.2.12");
-	CHECK(fw_voip_set("wan", "5060", true, rtp, 1, proxy, 1, false));
-	for (i = 0; i < DELS; i++)
-		fw_test_step_done(0);
-	fw_test_step_done(1);
-	CHECK_UINT(fw_test_retry_ms(), FW_RETRY_MS);
-	CHECK(!fw_voip_set("wan", "5060", true, rtp, 1, proxy, 1, false));
-	CHECK_UINT(fw_test_retry_ms(), FW_RETRY_MS);
-	snprintf(proxy[0], sizeof(proxy[0]), "192.0.2.13");
-	CHECK(fw_voip_set("wan", "5060", true, rtp, 1, proxy, 1, false));
-	CHECK_UINT(fw_test_retry_ms(), 0);
-	for (i = 0; i < ADD(2); i++)
-		fw_test_step_done(0);
-	CHECK(!fw_voip_set("wan", "5060", true, rtp, 1, proxy, 1, false));
-
-	CASE("report: clearing an installed set is a chain, clearing again is not");
-	CHECK(fw_voip_clear());
-	for (i = 0; i < DELS; i++)
-		fw_test_step_done(0);
-	CHECK(!fw_voip_clear());
-
-	/*
-	 * While a chain runs, the reference is what that chain installs, not
-	 * the set it replaces: an ask that differs from the running snapshot
-	 * gets its own chain from fw_chain_done() and must be logged for it,
-	 * and the ask the chain already carries must not.
-	 */
-	CASE("report: an ask that repeats the running chain is no new chain");
-	CHECK(fw_voip_set("wan", "5060", true, rtp, 1, proxy, 0, true));
-	CHECK(!fw_voip_set("wan", "5060", true, rtp, 1, proxy, 0, true));
-
-	CASE("report: a clear under a running add chain is a chain of its own");
-	CHECK(fw_voip_clear());
-	CHECK(!fw_voip_clear());
-	for (i = 0; i < ADD(2); i++)
-		fw_test_step_done(0);
-	CHECK_UINT(fw_plan_count(), DELS);
-	CHECK(!fw_voip_clear());
-	for (i = 0; i < DELS; i++)
-		fw_test_step_done(0);
-	CHECK_UINT(fw_plan_count(), 0);
-	CHECK(!fw_voip_clear());
-	fw_test_mode(false);
-}
-
-/*
- * The failure backoff. A chain whose step exits nonzero must never start
- * again synchronously. A synchronous restart runs the whole chain and a fw4
- * reload again, with no backoff, for as long as the step fails. The fixture
- * fails steps by hand and fires the retry as the uloop dispatch would, so no
- * clock is involved.
- */
-static void test_firewall_retry(void)
-{
-	static const unsigned int walk[] = {
-		2 * FW_RETRY_MS, 4 * FW_RETRY_MS, 8 * FW_RETRY_MS,
-		FW_RETRY_MAX_MS, FW_RETRY_MAX_MS
-	};
-	struct fw_rtp_range rtp[1];
-	unsigned int i, w;
-
-	memset(rtp, 0, sizeof(rtp));
-	rtp[0].channel = 1;
-	rtp[0].min = 10000;
-	rtp[0].max = 10030;
-
-	CASE("retry: a failed add arms the backoff instead of a re-kick");
-	fw_test_mode(true);
-	fw_open_set("wan", "5060", true, rtp, 1);
-	for (i = 0; i < DELS; i++)
-		fw_test_step_done(0);
-	CHECK_UINT(fw_test_spawned(), DELS + 1);	/* the SIP add is running */
-	fw_test_step_done(1);
-	CHECK_UINT(fw_test_spawned(), DELS + 1);	/* nothing re-ran */
-	CHECK_UINT(fw_plan_count(), 0);
-	CHECK_UINT(fw_test_retry_ms(), FW_RETRY_MS);
-
-	CASE("retry: the fired timer re-runs the whole chain");
-	CHECK(fw_test_retry_fire());
-	CHECK_UINT(fw_plan_count(), ADD(2));
-	CHECK_UINT(fw_test_spawned(), DELS + 2);
-	CHECK_UINT(fw_test_retry_ms(), 0);
-
-	CASE("retry: consecutive failures escalate to the cap");
-	for (w = 0; w < 5; w++) {
-		for (i = 0; i < DELS; i++)
-			fw_test_step_done(0);
-		fw_test_step_done(1);
-		CHECK_UINT(fw_test_retry_ms(), walk[w]);
-		CHECK(fw_test_retry_fire());
-	}
-
-	CASE("retry: a completed chain resets the ladder");
-	for (i = 0; i < ADD(2); i++)
-		fw_test_step_done(0);
-	CHECK_UINT(fw_test_retry_ms(), 0);
-	fw_open_set("wan", "5061", true, rtp, 1);
-	for (i = 0; i < DELS; i++)
-		fw_test_step_done(0);
-	fw_test_step_done(1);
-	CHECK_UINT(fw_test_retry_ms(), FW_RETRY_MS);	/* the first rung again */
-
-	CASE("retry: a failed delete retries once inside the chain, no timer");
-	fw_test_mode(true);
-	fw_open_set("wan", "5060", true, rtp, 1);
-	CHECK_UINT(fw_test_spawned(), 1);
-	fw_test_step_done(3);
-	CHECK_UINT(fw_test_spawned(), 2);		/* the same step, at once */
-	CHECK_UINT(fw_test_retry_ms(), 0);
-	CHECK_UINT(fw_plan_count(), ADD(2));
-	fw_test_step_done(0);
-	CHECK_UINT(fw_test_spawned(), 3);		/* the chain advanced */
-
-	CASE("retry: a delete that fails twice aborts the chain to the timer");
-	fw_test_step_done(3);
-	fw_test_step_done(3);
-	CHECK_UINT(fw_test_spawned(), 4);		/* only the one retry ran */
-	CHECK_UINT(fw_test_retry_ms(), FW_RETRY_MS);
-
-	CASE("retry: the same set re-asserted during the backoff waits");
-	fw_open_set("wan", "5060", true, rtp, 1);
-	CHECK_UINT(fw_test_spawned(), 4);
-	CHECK_UINT(fw_test_retry_ms(), FW_RETRY_MS);
-
-	CASE("retry: a new set during the backoff runs at once");
-	fw_open_set("wan", "5062", true, rtp, 1);
-	CHECK_UINT(fw_test_spawned(), 5);
-	CHECK_UINT(fw_test_retry_ms(), 0);		/* the timer went with it */
-
-	CASE("retry: the ladder survives the new set");
-	for (i = 0; i < DELS; i++)
-		fw_test_step_done(0);
-	fw_test_step_done(1);
-	CHECK_UINT(fw_test_retry_ms(), 2 * FW_RETRY_MS);
-
-	CASE("retry: a failure forgets the applied set");
-	fw_test_mode(true);
-	fw_open_set("wan", "5060", true, rtp, 1);
-	for (i = 0; i < ADD(2); i++)
-		fw_test_step_done(0);
-	CHECK_UINT(fw_test_spawned(), ADD(2));		/* the set is applied */
-	fw_open_set("wan", "5062", true, rtp, 1);
-	for (i = 0; i < DELS; i++)
-		fw_test_step_done(0);
-	fw_test_step_done(1);
-	CHECK_UINT(fw_test_retry_ms(), FW_RETRY_MS);
-	/* the failed chain deleted the old rules, so the old set must not
-	 * look applied: re-asserting it has to start a chain right away */
-	fw_open_set("wan", "5060", true, rtp, 1);
-	CHECK_UINT(fw_test_spawned(), ADD(2) + DELS + 2);
-	CHECK_UINT(fw_test_retry_ms(), 0);
-
-	CASE("retry: a set changed mid chain rides the fired retry");
-	fw_test_mode(true);
-	fw_open_set("wan", "5060", true, rtp, 1);
-	fw_test_step_done(0);
-	fw_open_set("wan", "5062", true, rtp, 1);	/* mid chain move */
-	for (i = 1; i < DELS; i++)
-		fw_test_step_done(0);
-	fw_test_step_done(1);
-	CHECK_UINT(fw_test_spawned(), DELS + 1);	/* no immediate kick */
-	CHECK_UINT(fw_test_retry_ms(), FW_RETRY_MS);
-	CHECK(fw_test_retry_fire());
-	CHECK(step_has(ADD(0), "-p 5062"));		/* the retry carries it */
-
-	CASE("retry: a reload failure (2) on the last add takes the backoff");
-	fw_test_mode(true);
-	fw_open_set("wan", "5060", true, rtp, 1);
-	for (i = 0; i < ADD(2) - 1; i++)
-		fw_test_step_done(0);
-	fw_test_step_done(2);				/* the reload-carrying add */
-	CHECK_UINT(fw_test_spawned(), ADD(2));
-	CHECK_UINT(fw_test_retry_ms(), FW_RETRY_MS);
-
-	CASE("retry: a reload failure (2) on a clear chain burns no delete retry");
-	fw_test_mode(true);
-	fw_voip_clear();
-	CHECK_UINT(fw_plan_count(), DELS);
-	for (i = 0; i < DELS - 1; i++)
-		fw_test_step_done(0);
-	fw_test_step_done(2);				/* the last delete reloads */
-	CHECK_UINT(fw_test_spawned(), DELS);		/* no same-step retry ran */
-	CHECK_UINT(fw_test_retry_ms(), FW_RETRY_MS);
-
-	fw_test_mode(false);
 }
 
 /* ------------------------------------------------------- the NOTIFY routing */
@@ -5013,6 +3581,17 @@ static void test_reg_events(void)
 
 /* ----------------------------------------------------- the pre-start window */
 
+/* every call the protocol made into the host table so far */
+static unsigned int phf_calls(void)
+{
+	unsigned int i, n = 0;
+
+	for (i = 0; i < PHF_COUNT; i++)
+		n += phf.n[i];
+
+	return n;
+}
+
 /*
  * The daemon connects to ubus first and starts the accounts after, because
  * accounts_start() needs the netifd answer to scope the first bind. A command
@@ -5020,18 +3599,15 @@ static void test_reg_events(void)
  * that main.c holds. A build here would repeat over the same struct and drop
  * the first socket.
  *
- * The observable is the firewall plan: a reload that reaches the accounts
- * ends in a reconcile, which rewrites the plan from the active state. The
- * first loaded set names a port and an interface that no config here
- * produces, so any reconcile is visible, whether it builds or clears. The
- * case is the last class of the pre-start window. The next class,
- * test_tls_cert_trigger(), calls accounts_start(), and no call clears the
- * vr.started flag that it sets.
+ * Observable: the host table. A reload that reaches a line calls the core at
+ * least once, for its recovery settle, and the fake counts each call.
+ * The case is the last class of the pre-start window. The next
+ * class, test_tls_cert_trigger(), calls accounts_start(), and no call clears
+ * the vr.started flag that it sets.
  */
 static void test_early_reload(void)
 {
 	static struct cfg new_cfg;
-	struct fw_rtp_range rtp[1];
 	unsigned int before;
 
 	base_default();
@@ -5042,18 +3618,10 @@ static void test_early_reload(void)
 	snprintf(new_cfg.channel[0].sip_proxy, sizeof(new_cfg.channel[0].sip_proxy),
 		 "p.example.com");
 
-	memset(rtp, 0, sizeof(rtp));
-	rtp[0].channel = 1;
-	rtp[0].min = 30000;
-	rtp[0].max = 30030;
-
-	CASE("pre-start: a reload before the start reconciles nothing");
-	fw_open_set("wan2", "5555", true, rtp, 1);
-	before = fw_plan_count();
-	CHECK(step_has(ADD(0), "-a Allow_VoIP_SIP -p 5555 -P udp -i wan2"));
+	CASE("pre-start: a reload before the start reaches no line");
+	before = phf_calls();
 	core_reload(&base, &new_cfg);
-	CHECK_UINT(fw_plan_count(), before);
-	CHECK(step_has(ADD(0), "-a Allow_VoIP_SIP -p 5555 -P udp -i wan2"));
+	CHECK_UINT(phf_calls(), before);
 
 	/* The ubus contract of the window is a refusal, never a crash. */
 	CASE("pre-start: the register commands are refused");
@@ -5079,7 +3647,6 @@ static void test_tls_cert_trigger(void)
 	snprintf(tls_cfg.tls_cert_password, sizeof(tls_cfg.tls_cert_password), "secret");
 
 	event_test_mode(true);
-	fw_test_mode(true);
 
 	CASE("tls cert trigger: a TLS path starts the helper with the base credentials");
 	core_start(&tls_cfg);
@@ -5417,7 +3984,6 @@ static void test_netifd_addr6(void)
 	live.channels = 0;
 
 	event_test_mode(true);
-	fw_test_mode(true);
 	core_start(&live);
 
 	CASE("addr6: a global address of the voice interface is taken");
@@ -5639,7 +4205,6 @@ static void test_ipv6_gate(void)
 	on.ipv6_enabled = true;
 
 	event_test_mode(true);
-	fw_test_mode(true);
 
 	/* The third half of the preference: the media of a call runs in the
 	 * family of its signalling, so the backend has to carry IPv6 media
@@ -5712,8 +4277,9 @@ static void test_ipv6_gate(void)
  * It needs no ubus and no HAL. netifd_query() returns at once without a ubus
  * context, accounts_init() builds only the transport, the TLS holder, the
  * stream pool and the resolver, and account.c names no hal_ symbol anywhere.
- * The event publisher and the firewall run in their own no-spawn test modes,
- * and the proxy is a literal, so the resolver delivers it without a lookup.
+ * The event publisher runs in its no-spawn test mode, the host fake records
+ * the set elements and runs no nft, and the proxy is a literal, so the
+ * resolver delivers it without a lookup.
  *
  * uloop is driven one pass at a time. uloop_run_timeout() with a non-negative
  * argument runs one timeout phase and one event phase and then returns (its
@@ -5733,18 +4299,20 @@ static int registrar_fd = -1;
 static struct uloop_fd registrar_ufd;
 static unsigned int registrar_answers;
 
-static uint16_t udp_loopback_open(int *fd_out)
+static uint16_t udp_open_at(int *fd_out, const char *host)
 {
 	struct sockaddr_in sa;
 	socklen_t len = sizeof(sa);
-	int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-
-	if (fd < 0)
-		return 0;
+	int fd;
 
 	memset(&sa, 0, sizeof(sa));
 	sa.sin_family = AF_INET;
-	sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	if (inet_pton(AF_INET, host, &sa.sin_addr) != 1)
+		return 0;
+
+	fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	if (fd < 0)
+		return 0;
 
 	if (bind(fd, (const struct sockaddr *)&sa, sizeof(sa)) < 0 ||
 	    getsockname(fd, (struct sockaddr *)&sa, &len) < 0) {
@@ -5755,6 +4323,11 @@ static uint16_t udp_loopback_open(int *fd_out)
 	*fd_out = fd;
 
 	return ntohs(sa.sin_port);
+}
+
+static uint16_t udp_loopback_open(int *fd_out)
+{
+	return udp_open_at(fd_out, "127.0.0.1");
 }
 
 /* one header line of the request, its name included, without the CRLF */
@@ -5855,6 +4428,23 @@ static bool registrar_reply(int fd, const char *req, unsigned int rport,
  */
 static const char *registrar_extra;
 
+/*
+ * Every udp line runs the CRLF round, so its pings reach the fake registrars
+ * beside its requests. A ping is no request: the registrars read it away
+ * before they read or count a request, and a case that asks about the
+ * round reads the pings itself (ping_waiting(), fam_peek_raw()).
+ */
+static void fam_pings_drop(int fd)
+{
+	char buf[SIP_KA_PING_LEN + 1];
+	ssize_t n;
+
+	while ((n = recv(fd, buf, sizeof(buf), MSG_PEEK | MSG_DONTWAIT)) ==
+		       SIP_KA_PING_LEN &&
+	       !memcmp(buf, SIP_KA_PING, SIP_KA_PING_LEN))
+		recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
+}
+
 /* the request one fake registrar has waiting, read and answered */
 static bool registrar_answer(int fd, unsigned int rport)
 {
@@ -5862,6 +4452,7 @@ static bool registrar_answer(int fd, unsigned int rport)
 	socklen_t plen = sizeof(peer);
 	ssize_t n;
 
+	fam_pings_drop(fd);
 	n = recvfrom(fd, registrar_last, sizeof(registrar_last) - 1, 0,
 		     (struct sockaddr *)&peer, &plen);
 	if (n <= 0)
@@ -5947,13 +4538,15 @@ static unsigned int status_line0(char *state, size_t slen)
 }
 
 /*
- * Whether a datagram is waiting at the registrar, read without a uloop pass.
+ * Whether a request is waiting at the registrar, read without a uloop pass.
  * The window's timer is armed at 0, so a pass would fire it and close the
- * window; a peek answers "did anything leave the daemon" on the spot.
+ * window; a peek answers "did a request leave the daemon" on the spot.
  */
 static bool registrar_pending(void)
 {
 	char peek[64];
+
+	fam_pings_drop(registrar_fd);
 
 	return recv(registrar_fd, peek, sizeof(peek), MSG_PEEK | MSG_DONTWAIT) > 0;
 }
@@ -6265,7 +4858,7 @@ static uint16_t fam_free_port(void)
  * uloop pass: a pass would answer it, and several cases have to read what left
  * the daemon before anything answers.
  */
-static bool fam_peek(int fd, char *out, size_t olen)
+static bool fam_peek_raw(int fd, char *out, size_t olen)
 {
 	ssize_t n = recv(fd, out, olen - 1, MSG_PEEK | MSG_DONTWAIT);
 
@@ -6275,6 +4868,14 @@ static bool fam_peek(int fd, char *out, size_t olen)
 	out[n] = 0;
 
 	return true;
+}
+
+/* the request waiting, with the pings ahead of it read away */
+static bool fam_peek(int fd, char *out, size_t olen)
+{
+	fam_pings_drop(fd);
+
+	return fam_peek_raw(fd, out, olen);
 }
 
 /*
@@ -6296,10 +4897,10 @@ static void fam_registrar_answers(struct uloop_fd *u, bool on)
 }
 
 /*
- * Every datagram waiting at a socket, read and discarded, and how many of them
- * carried the text the caller asks about. A NULL needle counts them all. Both
- * lines of a fixture send to one registrar, so the Contact user is what says
- * which line a request came from.
+ * Every datagram waiting at a socket, read and discarded, and how many of the
+ * requests among them carried the text the caller asks about. A NULL needle
+ * counts every request. Both lines of a fixture send to one registrar, so the
+ * Contact user is what says which line a request came from.
  */
 static unsigned int fam_drain_user(int fd, const char *user)
 {
@@ -6309,6 +4910,8 @@ static unsigned int fam_drain_user(int fd, const char *user)
 
 	while ((n = recv(fd, buf, sizeof(buf) - 1, MSG_DONTWAIT)) > 0) {
 		buf[n] = 0;
+		if (n == SIP_KA_PING_LEN && !memcmp(buf, SIP_KA_PING, n))
+			continue;
 		if (!user || strstr(buf, user))
 			hits++;
 	}
@@ -6316,7 +4919,8 @@ static unsigned int fam_drain_user(int fd, const char *user)
 	return hits;
 }
 
-/* every datagram waiting at a socket, read and discarded, and how many */
+/* every datagram waiting at a socket, read and discarded, and how many of
+ * them were requests */
 static unsigned int fam_drain(int fd)
 {
 	return fam_drain_user(fd, NULL);
@@ -6333,11 +4937,14 @@ static bool fam_inflight_wait(int fd)
 	unsigned int i;
 
 	for (i = 0; i < 400; i++) {
+		fam_pings_drop(fd);
 		if (recv(fd, peek, sizeof(peek), MSG_PEEK | MSG_DONTWAIT) > 0)
 			return true;
 
 		uloop_run_timeout(20);
 	}
+
+	fam_pings_drop(fd);
 
 	return recv(fd, peek, sizeof(peek), MSG_PEEK | MSG_DONTWAIT) > 0;
 }
@@ -6850,7 +5457,6 @@ static void test_family_gate(void)
 	CHECK(local_port != 0 && dead_port != 0);
 
 	event_test_mode(true);
-	fw_test_mode(true);
 	accounts_hal_features_set(HAL_FEAT_IPV6_MEDIA);
 
 	base_default();
@@ -7033,7 +5639,6 @@ static void test_family_move(void)
 	failover[1].port = reg6;
 
 	event_test_mode(true);
-	fw_test_mode(true);
 	accounts_hal_features_set(HAL_FEAT_IPV6_MEDIA);
 
 	base_default();
@@ -7477,7 +6082,6 @@ static void test_family_flip(void)
 	both[1].port = reg6;
 
 	event_test_mode(true);
-	fw_test_mode(true);
 	accounts_hal_features_set(HAL_FEAT_IPV6_MEDIA);
 
 	base_default();
@@ -7746,7 +6350,6 @@ static void test_family_stream(void)
 	v6only[0].port = tcp6;
 
 	event_test_mode(true);
-	fw_test_mode(true);
 	accounts_hal_features_set(HAL_FEAT_IPV6_MEDIA);
 
 	base_default();
@@ -8030,7 +6633,6 @@ static void test_conn_binding(void)
 		goto out;
 
 	event_test_mode(true);
-	fw_test_mode(true);
 
 	base_default();
 	live = base;
@@ -8041,7 +6643,6 @@ static void test_conn_binding(void)
 	live.dns_cache_update_mode = false;
 	live.keepalive_enabled = true;
 	live.keepalive_interval = 30;
-	live.restrict_source = 0;
 	fam_channel(&live, 0, "127.0.0.1", port_a, local_port);
 	none = live;
 	none.channels = 0;
@@ -8090,7 +6691,7 @@ out:
 	uloop_done();
 }
 
-/* ------------------------------------ the CRLF round of a mode 2 udp line */
+/* ------------------------------------------ the CRLF round of a udp line */
 
 static struct blob_attr *table_find(struct blob_attr *tbl, const char *name)
 {
@@ -8324,7 +6925,7 @@ static bool loopback_invite_send(int fd, uint16_t from_port, uint16_t local_port
 }
 
 static const char *const round_titles[] = {
-	"round: a mode 2 line comes up and its first answer primes the round",
+	"round: a udp line comes up and its first answer primes the round",
 	"round: a mixed answer pings the targets of the line's family only",
 	"round: and keeps the sticky selection where it was",
 	"round: a moved answer pings at once and a redraw does not",
@@ -8332,12 +6933,11 @@ static const char *const round_titles[] = {
 	"round: and leaves it when the call ends",
 	"round: a bound that moves under the line re-arms inside the new one",
 	"round: an address change primes the udp line",
-	"round: a live move to mode 1 stops the round and the move back "
-	"re-arms it",
+	"round: a live keepalive reload reads the bound of the moment",
 };
 
 /*
- * The round of a restrict_source 2 udp line on the wire. The fixture has real
+ * The round of a udp line on the wire. The fixture has real
  * sockets, a loopback registrar of each family, a second IPv4 target and a
  * proxy that the answer never named. The test hook fixes the bound, so the
  * conntrack values of the host play no part. The changed answers that prepare the round
@@ -8348,7 +6948,7 @@ static const char *const round_titles[] = {
 static void test_refresher_round(void)
 {
 	static struct cfg live;
-	static struct cfg mode1;
+	static struct cfg moved;
 	static struct cfg none;
 	static struct cfg parked;
 	struct sip_dns_result res;
@@ -8361,7 +6961,6 @@ static void test_refresher_round(void)
 	uint16_t reg4, reg6, second_port, proxy_port, local_port;
 	int second_fd = -1;
 	int proxy_fd = -1;
-	unsigned int answers;
 	unsigned int i;
 	unsigned int t = 0;
 	bool v6 = tu_v6_loopback(why, sizeof(why));
@@ -8403,7 +7002,6 @@ static void test_refresher_round(void)
 	v4pair[1] = mixed[1];
 
 	event_test_mode(true);
-	fw_test_mode(true);
 	accounts_hal_features_set(HAL_FEAT_IPV6_MEDIA);
 	net_ct_udp_bound_test_set(60, 180);
 
@@ -8411,7 +7009,6 @@ static void test_refresher_round(void)
 	live = base;
 	live.channels = 1;
 	live.ipv6_enabled = true;
-	live.restrict_source = 2;
 	live.dns_cache_update_mode = false;
 	fam_channel(&live, 0, "127.0.0.1", reg4, local_port);
 	/* the ordinary T1, so no REGISTER retransmission of the line's own
@@ -8443,7 +7040,7 @@ static void test_refresher_round(void)
 	 * target would count a failure and not a datagram */
 	CHECK_UINT(ka_stat(0, "crlf_failed"), 0);
 	CHECK(ping_waiting(second_fd));
-	CHECK(!fam_peek(fam_fd6, wire, sizeof(wire)));
+	CHECK(!fam_peek_raw(fam_fd6, wire, sizeof(wire)));
 	CHECK(fam_is(0, "targets", "3"));
 
 	CASE(round_titles[t++]);
@@ -8545,47 +7142,32 @@ static void test_refresher_round(void)
 	CASE(round_titles[t++]);
 	uloop_run_timeout(20);
 	uloop_run_timeout(20);
-	CHECK(!fam_peek(fam_fd4, wire, sizeof(wire)));
+	CHECK(!fam_peek_raw(fam_fd4, wire, sizeof(wire)));
 	sent = ka_stat(0, "crlf_sent");
 	status46_inject(V6_DEV, "192.0.2.66", NULL, 0);
 	CHECK_UINT(ka_stat(0, "crlf_sent"), sent + 1);
-	CHECK(fam_peek(fam_fd4, wire, sizeof(wire)));
+	CHECK(fam_peek_raw(fam_fd4, wire, sizeof(wire)));
 	CHECK(!strcmp(wire, SIP_KA_PING));
 	CHECK(fam_is(0, "state", "refreshing"));
 	CHECK(fam_wait(0, "state", "registered"));
 
 	/*
-	 * The mode moves live. Its apply class is LIVE, so the running
-	 * keepalive is re-armed and nothing rebuilds: under mode 1 the
-	 * configured pair stands, which is off here, and a changed answer
-	 * then primes nothing. The bound moves while the line sits in mode 1,
-	 * where nothing reads it; the move back takes it fresh, so the round
-	 * it sends in the same frame finds nothing left to re-read, and the
-	 * timer behind that round sits inside the bound of the moment.
+	 * A live reload of the keepalive options derives the interval from
+	 * the bound of the moment, not from the one the last round read, so
+	 * the timer it re-arms sits inside a bound that moved between rounds.
 	 */
 	CASE(round_titles[t++]);
-	mode1 = live;
-	mode1.restrict_source = 1;
-	answers = fam_regs4;
-	core_reload(&live, &mode1);
-	CHECK(fam_is(0, "state", "registered"));
-	CHECK_UINT(fam_regs4, answers);
-	sent = ka_stat(0, "crlf_sent");
-	fam_answer(&res, v4only, 1, true);
-	acct_dns_result_inject(0, &res);
-	CHECK_UINT(ka_stat(0, "crlf_sent"), sent);
+	moved = live;
+	moved.keepalive_interval = 20;
 	net_ct_udp_bound_test_set(2, 180);
-	warn_capture_begin();
-	core_reload(&mode1, &live);
-	CHECK_UINT(warn_capture_count("conntrack udp timeout 60 s -> 2 s"), 0);
-	warn_capture_end();
-	CHECK(fam_is(0, "state", "registered"));
-	CHECK_UINT(fam_regs4, answers);
-	CHECK_UINT(ka_stat(0, "crlf_sent"), sent + 1);
-	CHECK(ka_stat_wait(0, "crlf_sent", sent + 2));
+	core_reload(&live, &moved);
+	CHECK_UINT(ka_u32(0, "ct_bound"), 2);
+	CHECK_UINT(ka_u32(0, "interval"), 1);
 	net_ct_udp_bound_test_set(60, 180);
-	sent = ka_stat(0, "crlf_sent");
-	CHECK(ka_stat_wait(0, "crlf_sent", sent + 1));
+	core_reload(&moved, &live);
+	CHECK_UINT(ka_u32(0, "ct_bound"), 60);
+	CHECK_UINT(ka_u32(0, "interval"), 30);
+	CHECK(fam_is(0, "state", "registered"));
 
 	parked = none;
 	snprintf(parked.local_interface, sizeof(parked.local_interface),
@@ -8654,14 +7236,10 @@ static void test_rotation_events(void)
 	CHECK(uloop_fd_add(&fam_ufd4b, ULOOP_READ) == 0);
 
 	event_test_mode(true);
-	fw_test_mode(true);
 
 	base_default();
 	live = base;
 	live.channels = 1;
-	/* mode 0 with the keepalive off: nothing but REGISTERs reaches the
-	 * registrar sockets, so registrar_last always holds the last one */
-	live.restrict_source = 0;
 	live.dns_cache_update_mode = true;
 	fam_channel(&live, 0, "127.0.0.1", reg_a, local_port);
 	live.channel[0].timers.t1 = 500;
@@ -8816,7 +7394,6 @@ static void test_fail_resolve(void)
 	CHECK(dead_port && local_port);
 
 	event_test_mode(true);
-	fw_test_mode(true);
 
 	base_default();
 	live = base;
@@ -8931,7 +7508,6 @@ static void test_view_registered(void)
 	CHECK(reg_port && local_port);
 
 	event_test_mode(true);
-	fw_test_mode(true);
 
 	base_default();
 	live = base;
@@ -9087,13 +7663,11 @@ static void test_linger_round(void)
 	CHECK(uloop_fd_add(&fam_ufd4, ULOOP_READ) == 0);
 
 	event_test_mode(true);
-	fw_test_mode(true);
 	net_ct_udp_bound_test_set(60, 180);
 
 	base_default();
 	live = base;
 	live.channels = 1;
-	live.restrict_source = 2;
 	live.dns_cache_update_mode = false;
 	live.dns_linger = 2;
 	fam_channel(&live, 0, "127.0.0.1", reg_a, local_port);
@@ -9224,26 +7798,26 @@ static void test_linger_round(void)
 }
 
 /*
- * The independent expiry deadline. A mode 1 rule goes away when its window
- * ends, even when no answer arrives and no round runs. The linger timer alone
- * runs the reconcile then. The chains complete by hand, so the plan that the
- * cases read is always the chain that the last reconcile asked for.
+ * Retention expiry on its own. Under a 600 s bound a udp line runs its next
+ * round 300 s out. No answer follows either, so only the linger timer can
+ * empty its status list when its window ends.
  */
-static void test_linger_fw_timer(void)
+static void test_linger_timer(void)
 {
 	static struct cfg live;
 	static struct cfg none;
 	struct sip_dns_result res;
 	struct fam_target pool[1];
-	uint16_t reg_a, local_port;
+	uint64_t sent;
+	uint16_t reg_a, port_b, local_port;
 	unsigned int i;
-	bool saw1, saw2;
 
-	CASE("dns move: the expiry deadline removes the rule with no answer and no round");
+	CASE("linger: the timer alone ends the window with no answer and no round");
 	CHECK(uloop_init() == 0);
 	reg_a = udp_loopback_open(&fam_fd4);
+	port_b = fam_free_port();
 	local_port = fam_free_port();
-	CHECK(reg_a && local_port);
+	CHECK(reg_a && port_b && local_port);
 
 	fam_regs4 = 0;		/* the counter is cumulative across classes */
 	fam_ufd4.fd = fam_fd4;
@@ -9251,15 +7825,13 @@ static void test_linger_fw_timer(void)
 	CHECK(uloop_fd_add(&fam_ufd4, ULOOP_READ) == 0);
 
 	event_test_mode(true);
-	fw_test_mode(true);
-	net_ct_udp_bound_test_set(60, 180);
+	net_ct_udp_bound_test_set(600, 1800);
 
 	base_default();
 	live = base;
 	live.channels = 1;
-	live.restrict_source = 1;
 	live.dns_cache_update_mode = false;
-	live.dns_linger = 6;
+	live.dns_linger = 2;
 	fam_channel(&live, 0, "127.0.0.1", reg_a, local_port);
 	none = live;
 	none.channels = 0;
@@ -9267,73 +7839,257 @@ static void test_linger_fw_timer(void)
 	core_start(&live);
 	CHECK(fam_count_wait(&fam_regs4, 1));
 	CHECK(fam_wait(0, "state", "registered"));
-	for (i = 0; i < 200 && fw_plan_count(); i++)
-		fw_test_step_done(0);
-	CHECK_UINT(fw_plan_count(), 0);
 
-	/* The rotation holds one rule per member: the current one and the one
-	 * inside its window. A chain can coalesce behind whatever ran last,
-	 * so the sources are read off every chain the drain completes, never
-	 * off one transient plan. */
+	/* the second answer names 127.0.0.2 alone, so both members linger */
+	pool[0].host = "127.0.0.1";
+	pool[0].port = reg_a;
+	fam_answer(&res, pool, 1, false);
+	acct_dns_result_inject(0, &res);
 	pool[0].host = "127.0.0.2";
-	pool[0].port = 5060;
+	pool[0].port = port_b;
 	fam_answer(&res, pool, 1, true);
 	acct_dns_result_inject(0, &res);
-	saw1 = false;
-	saw2 = false;
-	for (i = 0; i < 400 && fw_plan_count(); i++) {
-		if (plan_has("-s 127.0.0.1"))
-			saw1 = true;
-		if (plan_has("-s 127.0.0.2"))
-			saw2 = true;
-		fw_test_step_done(0);
-	}
-	CHECK(saw1);
-	CHECK(saw2);
+	CHECK_UINT(status_array_count(0, "linger"), 2);
 
-	/* No answer and no round: the timer alone expires the member that
-	 * left and reconciles the rules once the window ends. The pump is
-	 * bounded by the clock the window runs on, because a loop pass can
-	 * return early on an unrelated event. */
-	saw1 = false;
-	saw2 = false;
-	{
-		struct timespec ts;
-		uint64_t now_ms, until_ms;
-
-		clock_gettime(CLOCK_MONOTONIC, &ts);
-		until_ms = (uint64_t)ts.tv_sec * 1000 +
-			   (uint64_t)ts.tv_nsec / 1000000 + 8000;
-		for (;;) {
-			clock_gettime(CLOCK_MONOTONIC, &ts);
-			now_ms = (uint64_t)ts.tv_sec * 1000 +
-				 (uint64_t)ts.tv_nsec / 1000000;
-			if (now_ms >= until_ms)
-				break;
-			uloop_run_timeout(20);
-			while (fw_plan_count()) {
-				if (plan_has("-s 127.0.0.1"))
-					saw1 = true;
-				if (plan_has("-s 127.0.0.2"))
-					saw2 = true;
-				fw_test_step_done(0);
-			}
-		}
-	}
-	CHECK(saw2);
-	CHECK(!saw1);
-	/* only the timer compacts the retention here: mode 1 runs no round
-	 * and no further answer arrives */
+	sent = ka_stat(0, "crlf_sent");
+	fam_pump_ms(2800);
+	CHECK_UINT(ka_stat(0, "crlf_sent"), sent);
 	CHECK_UINT(status_array_count(0, "linger"), 0);
 
 	core_reload(&live, &none);
 	for (i = 0; i < 400 && status_line0(NULL, 0); i++)
 		uloop_run_timeout(20);
+	CHECK_UINT(status_line0(NULL, 0), 0);
 	net_ct_udp_bound_test_set(0, 0);
 
 	uloop_fd_delete(&fam_ufd4);
 	close(fam_fd4);
 	fam_fd4 = -1;
+	uloop_done();
+}
+
+/* ------------------------------------------------- the uvoice set elements */
+
+/*
+ * The admits the fake recorded since the case zeroed phf.nadmit, for one
+ * address: device lo, IPv4, the line's port and the 2 s bound of the test.
+ */
+static unsigned int peer_admits(const char *host, uint16_t port)
+{
+	unsigned int i, n = 0;
+
+	for (i = 0; i < phf.nadmit; i++) {
+		const struct phf_peer *p = &phf.admit[i];
+
+		if (!strcmp(p->dev, "lo") && !strcmp(p->host, host) && !p->ipv6 &&
+		    p->port == port && p->timeout_s == 2)
+			n++;
+	}
+
+	return n;
+}
+
+/*
+ * The set elements a udp line asks the core for, read off the host fake,
+ * which records them and runs no nft. Line 0 names "lo", so its socket is
+ * scoped and every element carries that device. The test fixes the bound at
+ * 2 s, so a round runs every second. 127.0.0.2 to 127.0.0.4 route over lo,
+ * and a datagram ping to them needs no listener. The caller of the dialog
+ * sends from 127.0.0.4, an address that no target has, so the dialog gets
+ * an element of its own.
+ */
+static void test_peer_udp(void)
+{
+	static struct cfg live;
+	static struct cfg bare;
+	static struct cfg none;
+	struct sip_dns_result res;
+	struct fam_target pool[2];
+	uint64_t sent;
+	uint16_t reg_a, port_b, port_c, proxy_port, local_port;
+	int proxy_fd = -1;
+	unsigned int holds;
+	unsigned int i;
+
+	CASE("set: a udp line admits every destination of its round");
+	CHECK(uloop_init() == 0);
+	reg_a = udp_loopback_open(&fam_fd4);
+	proxy_port = udp_open_at(&proxy_fd, "127.0.0.4");
+	port_b = fam_free_port();
+	port_c = fam_free_port();
+	local_port = fam_free_port();
+	CHECK(reg_a && proxy_port && port_b && port_c && local_port);
+
+	fam_regs4 = 0;		/* the counter is cumulative across classes */
+	fam_ufd4.fd = fam_fd4;
+	fam_ufd4.cb = fam_cb4;
+	CHECK(uloop_fd_add(&fam_ufd4, ULOOP_READ) == 0);
+
+	event_test_mode(true);
+	net_ct_udp_bound_test_set(2, 6);
+
+	base_default();
+	live = base;
+	live.channels = 1;
+	live.dns_cache_update_mode = false;
+	live.dns_linger = 30;
+	fam_channel(&live, 0, "127.0.0.1", reg_a, local_port);
+	snprintf(live.channel[0].local_interface,
+		 sizeof(live.channel[0].local_interface), "lo");
+	bare = live;
+	bare.channel[0].local_interface[0] = 0;
+	none = live;
+	none.channels = 0;
+
+	holds = phf.n[PHF_PEER_HOLD];
+	core_start(&live);
+	CHECK(fam_count_wait(&fam_regs4, 1));
+	CHECK(fam_wait(0, "state", "registered"));
+
+	/* 127.0.0.3 leaves with the second answer and lingers; each changed
+	 * answer runs the round from the inject itself */
+	pool[0].host = "127.0.0.1";
+	pool[0].port = reg_a;
+	pool[1].host = "127.0.0.3";
+	pool[1].port = port_c;
+	fam_answer(&res, pool, 2, true);
+	acct_dns_result_inject(0, &res);
+	pool[1].host = "127.0.0.2";
+	pool[1].port = port_b;
+	phf.nadmit = 0;
+	fam_answer(&res, pool, 2, true);
+	acct_dns_result_inject(0, &res);
+	CHECK_UINT(phf.nadmit, 3);
+	CHECK_UINT(peer_admits("127.0.0.1", local_port), 1);
+	CHECK_UINT(peer_admits("127.0.0.2", local_port), 1);
+	CHECK_UINT(peer_admits("127.0.0.3", local_port), 1);
+	CHECK_UINT(phf.n[PHF_PEER_HOLD], holds);
+
+	CASE("set: and the next round writes the same elements again");
+	phf.nadmit = 0;
+	CHECK(fam_count_wait(&phf.nadmit, 3));
+	CHECK_UINT(phf.nadmit, 3);
+	CHECK_UINT(peer_admits("127.0.0.1", local_port), 1);
+	CHECK_UINT(peer_admits("127.0.0.2", local_port), 1);
+	CHECK_UINT(peer_admits("127.0.0.3", local_port), 1);
+
+	CASE("set: a live dialog destination outside the targets gets its element");
+	calls_init(NULL, NULL);
+	calls_host_bind(proto_host_fake());
+	calls_reload(&live);
+	calls_hal_codecs_set(~0u);
+	CHECK(loopback_invite_send(proxy_fd, proxy_port, local_port,
+				   "peer-call-1", NULL));
+	for (i = 0; i < 50 && !calls_line_busy(0); i++)
+		uloop_run_timeout(20);
+	CHECK(calls_line_busy(0));
+	CHECK(call_ring(0, 0));
+	CHECK(calls_line_dialog_dst(0, 0) != NULL);
+	phf.nadmit = 0;
+	CHECK(fam_count_wait(&phf.nadmit, 4));
+	CHECK_UINT(phf.nadmit, 4);
+	CHECK_UINT(peer_admits("127.0.0.1", local_port), 1);
+	CHECK_UINT(peer_admits("127.0.0.2", local_port), 1);
+	CHECK_UINT(peer_admits("127.0.0.3", local_port), 1);
+	CHECK_UINT(peer_admits("127.0.0.4", local_port), 1);
+	CHECK(call_reject(0, 0, 486));
+	for (i = 0; i < 50 && calls_line_dialog_dst(0, 0); i++)
+		uloop_run_timeout(20);
+	CHECK(calls_line_dialog_dst(0, 0) == NULL);
+	calls_done();
+	core_reload(&live, &none);
+	for (i = 0; i < 400 && status_line0(NULL, 0); i++)
+		uloop_run_timeout(20);
+	CHECK_UINT(status_line0(NULL, 0), 0);
+
+	/* the base interface "wan" names no netdev on the host */
+	CASE("set: a line that binds unscoped writes no element and says why");
+	warn_capture_begin();
+	core_reload(&none, &bare);
+	CHECK(fam_wait(0, "state", "registered"));
+	CHECK_UINT(warn_capture_count("binding unscoped"), 1);
+	warn_capture_end();
+	phf.nadmit = 0;
+	sent = ka_stat(0, "crlf_sent");
+	CHECK(ka_stat_wait(0, "crlf_sent", sent + 2));
+	CHECK_UINT(phf.nadmit, 0);
+
+	core_reload(&bare, &none);
+	for (i = 0; i < 400 && status_line0(NULL, 0); i++)
+		uloop_run_timeout(20);
+	CHECK_UINT(status_line0(NULL, 0), 0);
+	net_ct_udp_bound_test_set(0, 0);
+
+	uloop_fd_delete(&fam_ufd4);
+	close(fam_fd4);
+	close(proxy_fd);
+	fam_fd4 = -1;
+	uloop_done();
+}
+
+/*
+ * Set elements of a stream line. Its connection is its pinhole, so a round
+ * writes nothing and the line takes no hold. The keepalive runs every second,
+ * so two rounds pass quickly.
+ */
+static void test_peer_tcp(void)
+{
+	static struct cfg live;
+	static struct cfg none;
+	uint64_t sent;
+	uint16_t reg_port, local_port;
+	int probe4 = -1, probe6 = -1;
+	unsigned int holds;
+	unsigned int i;
+
+	CASE("set: a tcp line writes no element in its rounds");
+	CHECK(uloop_init() == 0);
+	reg_port = tcp_reg_open(&tcp_reg[0]);
+	local_port = tcp_port_hold(&probe4, &probe6);
+	CHECK(reg_port && local_port);
+	if (!reg_port || !local_port)
+		goto out;
+
+	event_test_mode(true);
+
+	base_default();
+	live = base;
+	live.channels = 1;
+	snprintf(live.transport, sizeof(live.transport), "tcp");
+	live.dns_cache_update_mode = false;
+	live.keepalive_enabled = true;
+	live.keepalive_interval = 1;
+	fam_channel(&live, 0, "127.0.0.1", reg_port, local_port);
+	snprintf(live.channel[0].local_interface,
+		 sizeof(live.channel[0].local_interface), "lo");
+	none = live;
+	none.channels = 0;
+
+	close(probe4);
+	close(probe6);
+	probe4 = -1;
+	probe6 = -1;
+	phf.nadmit = 0;
+	holds = phf.n[PHF_PEER_HOLD];
+	core_start(&live);
+	CHECK(fam_wait(0, "state", "registered"));
+	sent = ka_stat(0, "crlf_sent");
+	CHECK(ka_stat_wait(0, "crlf_sent", sent + 2));
+	CHECK_UINT(phf.nadmit, 0);
+	CHECK_UINT(phf.n[PHF_PEER_HOLD], holds);
+
+	core_reload(&live, &none);
+	for (i = 0; i < 400 && status_line0(NULL, 0); i++)
+		uloop_run_timeout(20);
+	CHECK_UINT(status_line0(NULL, 0), 0);
+	CHECK_UINT(phf.nadmit, 0);
+
+out:
+	if (probe4 >= 0)
+		close(probe4);
+	if (probe6 >= 0)
+		close(probe6);
+	tcp_reg_close(&tcp_reg[0]);
 	uloop_done();
 }
 
@@ -9391,7 +8147,6 @@ static bool flap_start(struct flap_fix *fx, unsigned int rport)
 	fam_registrar_answers(&fam_ufd4, true);
 
 	event_test_mode(true);
-	fw_test_mode(true);
 
 	base_default();
 	fx->live = base;
@@ -9639,7 +8394,6 @@ static void flap_tcp_case(void)
 		goto out;
 
 	event_test_mode(true);
-	fw_test_mode(true);
 
 	base_default();
 	live = base;
@@ -10253,7 +9007,6 @@ static void backoff_local_host_case(void)
 	CASE("backoff: a missing local address keeps the fixed five second "
 	     "retry");
 	event_test_mode(true);
-	fw_test_mode(true);
 
 	base_default();
 	live = base;
@@ -10560,7 +9313,6 @@ static void test_two_line_reload(void)
 	CHECK(uloop_fd_add(&fam_ufd4, ULOOP_READ) == 0);
 
 	event_test_mode(true);
-	fw_test_mode(true);
 
 	base_default();
 	live = base;
@@ -11247,7 +9999,6 @@ static void test_view_device(void)
 		 "lo");
 
 	event_test_mode(true);
-	fw_test_mode(true);
 	core_start(&live);
 	for (i = 0; i < 400 && registrar_answers < 2; i++)
 		uloop_run_timeout(20);
@@ -11666,14 +10417,10 @@ static void test_view_service_route(void)
 	CHECK(uloop_fd_add(&fam_ufd4b, ULOOP_READ) == 0);
 
 	event_test_mode(true);
-	fw_test_mode(true);
 
 	base_default();
 	live = base;
 	live.channels = 1;
-	/* the registration and the subscription are all that reaches these
-	 * sockets: no source restriction to reconcile and no keepalive */
-	live.restrict_source = 0;
 	/* a moved answer re-registers at once, which every case below the
 	 * last one needs */
 	live.dns_cache_update_mode = true;
@@ -11954,6 +10701,7 @@ static void test_grace_reload(void)
 	struct sip_dns_result res;
 	struct cfg_channel *ch;
 	char state[32];
+	uint64_t pings;
 	uint16_t reg_port;
 	unsigned int answers;
 	int next;
@@ -11987,7 +10735,6 @@ static void test_grace_reload(void)
 	ch->sip_local_port = 0;
 
 	event_test_mode(true);
-	fw_test_mode(true);
 	core_start(&live);
 	CHECK(posts_wait(1));
 	CHECK_UINT(registrar_answers, 1);
@@ -12041,9 +10788,12 @@ static void test_grace_reload(void)
 	snprintf(res.target[0].host, sizeof(res.target[0].host), "127.0.0.1");
 	res.target[0].port = reg_port;
 	CHECK(sip_dst_set(&res.target[0].dst, "127.0.0.1", reg_port));
+	pings = ka_stat(0, "crlf_sent");
 	acct_dns_result_inject(0, &res);
 	CHECK_UINT(registrar_answers, answers);
 	CHECK(!registrar_pending());
+	/* the pending gate holds the immediate round back as well */
+	CHECK_UINT(ka_stat(0, "crlf_sent"), pings);
 	status_line0(state, sizeof(state));
 	if (strcmp(state, "unregistered"))
 		printf("    fail the registration restarted: state %s\n", state);
@@ -12120,7 +10870,6 @@ int main(void)
 	test_dns_reload();
 	test_linger();
 	test_local_host_move();
-	test_proxy_collect();
 	test_sub_status();
 	test_conn_status();
 	test_conn_line();
@@ -12128,14 +10877,6 @@ int main(void)
 	test_reconnect_refresh_ok();
 	test_transport_maps();
 	test_sni();
-	test_firewall();
-	test_firewall_restrict();
-	test_firewall_pinhole();
-	test_firewall_dns_move();
-	test_firewall_redraw();
-	test_firewall_inflight();
-	test_firewall_retry();
-	test_firewall_change_report();
 	test_notify_route();
 	test_replaces_admission();
 	test_reg_events();
@@ -12157,7 +10898,9 @@ int main(void)
 	test_fail_resolve();
 	test_view_registered();
 	test_linger_round();
-	test_linger_fw_timer();
+	test_linger_timer();
+	test_peer_udp();
+	test_peer_tcp();
 	test_flap_outage();
 	test_dns_backoff();
 	/* beside the other two-channel live groups, before the account

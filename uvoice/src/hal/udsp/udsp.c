@@ -798,8 +798,8 @@ static void relay_read(struct uloop_fd *ufd, unsigned int events)
  * The backend's own transport. libudsp gets lib_fd and the relay drains the
  * other end on the uloop thread; the core's fd is only ever written.
  *
- * CLOEXEC for the reason main.c gives its own pair: the firewall helper and
- * the event publisher fork children that must not inherit a voice fd.
+ * CLOEXEC, for the reason that main.c gives: a child that the daemon spawns
+ * (nft, event and TLS helpers, call trace tools) must not inherit a voice fd.
  */
 static int relay_open(struct hal *h)
 {
@@ -2383,10 +2383,8 @@ int hal_udsp_dscp_mark(int fd, int family, uint8_t dscp)
  * that decides whether a DSCP reached the socket and exactly one place that
  * records it.
  *
- * CLOEXEC, because the firewall helper and the event publisher fork children
- * that must not inherit a voice socket, which is the reason main.c and the
- * event relay give for their own pairs; libudsp dups
- * these with F_DUPFD_CLOEXEC, so its copies already carry it.
+ * CLOEXEC, for the reason that main.c and relay_open() give. libudsp dups
+ * these sockets with F_DUPFD_CLOEXEC, so its copies carry the flag too.
  */
 static int media_fd_bind(struct hal *h, const struct hal_addr *local, uint16_t port,
 			 const char *bind_dev)

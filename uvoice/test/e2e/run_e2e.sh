@@ -23,6 +23,9 @@ default_sipp_tls=/tmp/uvoice-host/sipp-tls-build/sipp
 sipp_tls_bin=${SIPP_TLS_BIN:-$default_sipp_tls}
 host_prefix=${UVOICE_HOST_PREFIX:-/tmp/uvoice-host/prefix}
 artifact_root=${E2E_ARTIFACTS:-./e2e-artifacts}
+# The daemon under test must leave the host nftables alone: with no nft at
+# this path, it writes no set element (src/net/peer.c).
+export UVOICE_NFT=/nonexistent/uvoice-e2e/nft
 build_dir=
 current_daemon_pid=
 current_ubusd_pid=
@@ -9082,8 +9085,8 @@ cert_fetch_run()
 # A reload that lands there takes the busy arm of event_tls_cert_start(), parks
 # the request in tls_cert.restart and spawns nothing in the reload frame, which
 # is the frame under test. The daemon's own children are the answer: the TLS
-# helper is the only one it starts here (the event publisher and the firewall
-# script are both absent on this host).
+# helper is the only one it starts here (the event publisher is absent on this
+# host, and a tls line writes no set element).
 daemon_helper_wait()
 {
     local timeout_s=$1
@@ -9116,9 +9119,9 @@ daemon_helper_wait()
 # binds a new socket on the same port. A helper child that still held a copy of
 # the daemon's descriptors would keep the old socket in TCP_LISTEN, and Linux
 # refuses the bind against a TCP_LISTEN holder whatever SO_REUSEADDR says on
-# either side: the line would come up dead with "Address already in use" and
-# the firewall rules would go with it, until the next reload. src/spawn_run.c
-# returns only after the child closed the daemon's descriptors.
+# either side: the line has no listener and logs "Address already in use" until
+# the next reload. src/spawn_run.c returns only after the child closed the
+# daemon's descriptors.
 #
 # Thirty iterations, one assertion each. The username alternates so that every
 # write really moves the configuration, the status file is removed before the
@@ -9264,16 +9267,10 @@ reload_loop_run()
             "a bind failed during the loop: $(grep -m1 -F 'Address already in use' "$flow_dir/daemon.log")"
         return
     fi
-    if grep -qF "no active line" "$flow_dir/daemon.log"; then
-        flow_stop
-        result_print FAIL "$name" \
-            "the firewall reconcile found no active line: $(grep -m1 -F 'no active line' "$flow_dir/daemon.log")"
-        return
-    fi
     tls_bundle_record "$flow_dir" looped
     flow_stop
     result_print PASS "$name" \
-        "$iterations live reloads rebuilt the tls line, every one of them kept its listener, and the daemon log carries no failed bind and no line-less firewall reconcile"
+        "$iterations live reloads rebuilt the tls line, every one of them kept its listener, and the daemon log carries no failed bind"
 }
 
 # The fatal bring-up exit. No SIPp and no peer: what is under test is the
