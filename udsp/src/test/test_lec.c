@@ -12,9 +12,7 @@
  * fell against a signal that the test knows independently.
  *
  * The cases assert 25 dB of ERLE after one second of adaptation, at the 48 ms
- * default tail. bench_lec reads about 39 dB there on the composite hybrid at
- * -10 dBm0 (its per-path gate table). The hybrid, not the algorithm, bounds a
- * 16 ms tail.
+ * default tail. The hybrid, not the algorithm, bounds a 16 ms tail.
  */
 #include <math.h>
 #include <stdlib.h>
@@ -24,6 +22,7 @@
 
 #include "../dsp/dsp.h"
 #include "../dsp/lec.h"
+#include "../dsp/resamp.h"
 #include "bench/lec_paths.h"
 #include "bench/lec_paths_field.h"
 #include "bench/lec_replay.h"
@@ -32,6 +31,14 @@
 /* The engine tick is 10 ms at every line rate (core/clock.h), so a frame
  * count is a time and reads the same at 8 and 16 kHz. */
 #define FRAMES_PER_SECOND	100u
+
+/* LEC_COHERE_BAR, LEC_COHERE_FRAMES, LEC_COHERE_SHARE_MAX,
+ * LEC_PATH_CHANGE_RATIO and LEC_ERLE_ALPHA of dsp/lec.c. */
+#define COHERE_BAR		-0.10
+#define COHERE_FRAMES		32u
+#define COHERE_SHARE_MAX	0.5
+#define COHERE_PATH_RATIO	1.26
+#define COHERE_ALPHA		0.1
 
 /* Only the wideband leg adds the rate to a case name. An 8 kHz case name
  * stays the bare name, so a case that gains a 16 kHz leg keeps its name. */
@@ -60,12 +67,10 @@ static double energy_dbm0_get(double energy, unsigned count)
 }
 
 /*
- * The path carries the rate it was built at, and the canceller instance the
- * caller pairs with it runs the same frame, so one count serves both sides.
- * offset moves the reference against the drive (bench/lec_paths.h
- * ref_delay_run). half_db is a loss ahead of the reference alone, as the
- * engine applies it (udsp_ec_nlms_ref_loss_set): the drive of the path keeps
- * the line level.
+ * The path carries the rate it is built at, and the canceller instance that the
+ * caller pairs with it runs the same frame. offset moves the reference against
+ * the drive (ref_delay_run). half_db is a loss ahead of the reference alone, as
+ * the engine applies it; the drive keeps the line level.
  */
 static double erle_offset_run(struct udsp_ec *ec, struct echo_path *path,
 			      uint32_t *state, double far_dbm0, int offset,
@@ -753,26 +758,23 @@ static void far_speech_fill(int16_t *ref, unsigned f, uint32_t *state,
 		memset(ref, 0, UDSP_FRAME_SAMPLES * sizeof(*ref));
 }
 
-/* The fixed activity bar of dsp/lec.c (LEC_REF_ACTIVE_POWER), in the same
- * float arithmetic as the canceller, as a property of the signal. The bar
- * of the canceller equals it when the reference history holds a frame under
- * 396.8, and stands over it on a stationary far end. A case that needs the
- * view of the canceller reads reading.ref_bar, reading.background or
- * reading.window_run. */
+/*
+ * The fixed activity bar of dsp/lec.c (LEC_REF_ACTIVE_POWER), in the float
+ * arithmetic of the canceller, as a property of the signal. The canceller's bar
+ * stands over it on a stationary far end; a case that needs the canceller's
+ * view reads ref_bar, background or window_run of the reading.
+ */
 static bool frame_loud(const int16_t *frame, unsigned count)
 {
 	return udsp_ec_nlms_frame_power_get(frame, count) >= 2500.0f;
 }
 
 /*
- * The bootstrap failure on a weak hybrid. Real hybrids can return 22 to
- * 24 dB of ERL, so near-end speech at -25 dBm0 sits far under the classic
- * quarter-power expectation. Pristine adaptation then absorbs every burst of
- * that speech, and the filter spends the call re-learning and never settles.
- * With the learned bound, the bursts read as double talk and roll back, and
- * the spurts between them are enough to converge. The burst schedule of the
- * near end ends with the run. A pristine tracker collapses inside a burst that
- * it cannot see, so the read at the end tells the two apart.
+ * The bootstrap on a weak hybrid of 22 to 24 dB of ERL. Near speech at -25 dBm0
+ * sits far under the classic quarter-power expectation there. With the
+ * learned bound, the bursts read as double talk and roll back, and the spurts
+ * between them converge the filter. A tracker that adapts on every burst
+ * collapses inside a burst, so the read at the end tells the two apart.
  */
 static void bootstrap_test(void)
 {
@@ -829,10 +831,9 @@ static void bootstrap_test(void)
 			if (info.double_talk)
 				burst_flagged++;
 		}
-		/* The oracle counts the echo the filter had to remove, on the
-		 * frames the near end leaves clean (the probe's exclusion
-		 * rule): a burst and its hangover would count near speech as
-		 * residual. */
+		/* The reference counts the echo that the filter removes on the
+		 * frames that the near end leaves clean: a burst and its
+		 * hangover would count near speech as residual. */
 		quiet_run = burst ? 0 : quiet_run + 1u;
 		if (f + 1000u < total || quiet_run <= 30u)
 			continue;
@@ -892,8 +893,8 @@ static void gain_bound_test(void)
 	udsp_ec_nlms_info_get(ec, &info);
 
 	CASE("lec gain estimator reads the hybrid through reference DTX");
-	/* True power gain 10^-1.2 = 0.0631; the estimator may under-read by
-	 * its minimum-statistics bias but must stay within 3 dB. */
+	/* True power gain 10^-1.2 = 0.0631: the minimum statistic may
+	 * under-read it, within 3 dB. */
 	CHECK(info.echo_gain >= 0.0631f * 0.5f);
 	CHECK(info.echo_gain <= 0.0631f * 2.0f);
 	udsp_ec_nlms.destroy(ec);
@@ -923,13 +924,11 @@ static void dtx_far_fill(struct dtx_far *g, int16_t *ref)
 }
 
 /*
- * The hot-hybrid lockout (SLIC digital loopback, 0 dB echo). The detector
- * reads the unit echo as double talk from the first frame, and the verdict
- * can never change. Only the latch escape ends it. DTX far speech carries
- * short gaps that the hangover bridges, and every few spurts a pause long
- * enough to clear it. A hard dt_run reset at each pause keeps the escape
- * from ever firing. The decayed run drops by four per clear frame of a pause,
- * and still reaches the latch.
+ * The hot-hybrid lockout (SLIC digital loopback, 0 dB echo): the detector reads
+ * the unit echo as double talk from the first frame, and only the latch escape
+ * ends it. DTX far speech pauses often enough to clear a run that resets at
+ * each pause; the run that decays by four per clear frame still reaches the
+ * latch.
  */
 static void lockout_escape_test(void)
 {
@@ -1096,16 +1095,11 @@ static void probe_rearm_test(void)
 }
 
 /*
- * The combined-loss NLP gate. The far listener hears ERL plus ERLE, with the
- * hybrid loss taken from the conservative bound (echo_gain times headroom): a
- * 23 dB hybrid with a filter around 13 dB of ERLE already delivers the gate's
- * 33 dB, while the same filter on a 6 dB hybrid delivers about 20 and on a
- * 12 dB hybrid about 23, neither of which is enough to hand the line to the
- * comfort noise. The probe freezes all three instances mid-convergence, so the
- * tracker sits at the same ERLE by construction.
- *
- * half_db sets the reference loss of the instance and nothing else, so the
- * reference and the path stay those of a probe at 0.
+ * The combined-loss NLP gate, with the hybrid loss from echo_gain times the
+ * headroom. A 23 dB hybrid with a filter near 13 dB of ERLE delivers the 33 dB
+ * gate; the same filter on a 6 dB or 12 dB hybrid does not. The probe freezes
+ * its instances mid-convergence at one tracker ERLE. half_db sets the reference
+ * loss alone.
  */
 struct gate_probe {
 	bool nlp_far;
@@ -1172,12 +1166,9 @@ static void nlp_combined_loss_test(void)
 	nlp_gate_probe(UDSP_SAMPLE_RATE, 0, 12.0, 36, &mid);
 	nlp_gate_probe(UDSP_SAMPLE_RATE, 0, 17.0, 36, &edge);
 
-	/* The fixtures sit at about 16.6 dB of tracker ERLE: under the 18 dB
-	 * fast path, so the combined arm is the one engaging, and above the
-	 * effective echo-likeness floor (a filter bootstrapping from zero
-	 * carries its misalignment along the path, so the per-frame estimate
-	 * under-reads the mic by two decades of the residual and the margin
-	 * verdict holds only from about 16 dB). */
+	/* The fixtures sit under the 18 dB fast path, so the combined arm
+	 * engages, and over the ERLE from which a converging filter reads
+	 * echo-like. */
 	CASE("lec nlp engages on the combined loss of a weak hybrid");
 	CHECK(weak.erle >= 15.0f);
 	CHECK(weak.erle < 17.9f);
@@ -1190,18 +1181,17 @@ static void nlp_combined_loss_test(void)
 	CHECK(!hot.nlp_far);
 	CHECK(!hot.nlp_doubletalk);
 
-	/* About 26 dB of combined loss on the 12 dB hybrid: under the 33 dB
-	 * gate, and the case that catches the gate constant drifting loose. */
+	/* The 12 dB hybrid stands under the 33 dB gate: a gate constant that
+	 * drifts loose fails here. */
 	CASE("lec nlp refuses a combined loss under the gate");
 	CHECK(mid.erle >= 15.0f);
 	CHECK(mid.erle < 17.9f);
 	CHECK(!mid.nlp_far);
 	CHECK(!mid.nlp_doubletalk);
 
-	/* On the 17 dB hybrid the conservative bound reads about 31 dB of
-	 * combined loss and refuses; the raw minimum statistic would claim 34
-	 * and engage. This is the pin on taking the loss from echo_gain times
-	 * the headroom rather than from the raw lower bound. */
+	/* On the 17 dB hybrid the conservative bound refuses, where the raw
+	 * minimum statistic would engage: the case checks that the loss term
+	 * takes echo_gain times the headroom. */
 	CASE("lec nlp loss term takes the conservative bound");
 	CHECK(edge.erle >= 15.0f);
 	CHECK(edge.erle < 17.9f);
@@ -1227,14 +1217,11 @@ static bool turn_frame_fill(unsigned f, int16_t *ref, int16_t *near,
 }
 
 /*
- * The frames that need echo-likeness are the far-end DTX gap frames inside a
- * still-active tail window. The near talker speaks in the pauses of the far
- * end (normal turn-taking). In those frames, the echo estimate is near zero,
- * and the classic window bound still explains a quiet talker, so the detector
- * cannot fire. The ERLE tracker does not update, because the frame is
- * inactive. Nothing else therefore releases the engaged gate: without the
- * verdict per frame, the comfort noise replaces the whole talker, and the
- * far end hears garbled speech.
+ * The frames that need echo-likeness: far DTX gaps inside an active tail
+ * window, where a near talker answers. The estimate is near zero, the classic
+ * bound explains the talker, and the tracker does not update. Only the
+ * per-frame verdict then releases the gate; without it, comfort noise replaces
+ * the talker.
  */
 static void nlp_echo_like_test(void)
 {
@@ -1270,9 +1257,7 @@ static void nlp_echo_like_test(void)
 			engaged++;
 	}
 	/* 100 ms far spurts with 60 ms pauses; the near talker answers in the
-	 * pauses, 1 dB under the echo, far below the classic bound. The
-	 * discriminating frames are the gap frames whose window is still
-	 * active while the frame's own estimate explains nothing. */
+	 * pauses, 1 dB under the echo, far under the classic bound. */
 	for (f = 0; f < 2u * FRAMES_PER_SECOND; f++) {
 		int16_t near[UDSP_FRAME_SAMPLES];
 		bool near_now = turn_frame_fill(f, ref, near, &state,
@@ -1306,14 +1291,10 @@ static void nlp_echo_like_test(void)
 }
 
 /*
- * The engine calls the reset when the generation of the applied reference
- * moves. The coefficients then subtract an estimate misaligned against the
- * re-timed reference. The instance must therefore really forget, and every
- * piece of adaptive state must go with the coefficients. A kept window ring
- * fires the detector against a reference that is gone, and a kept NLP
- * cross-fade rewrites the next frame with comfort noise. A kept
- * reference-energy sum biases the NLMS step for the life of the instance. A
- * kept gain estimate skips the warmup that guards the minimum.
+ * The reset on a move of the reference generation must forget all adaptive
+ * state with the coefficients. A kept window ring fires the detector on a
+ * reference that is gone, and a kept cross-fade writes comfort noise. A kept
+ * energy sum biases the step, and a kept gain estimate skips its warm-up.
  */
 static void reset_test(void)
 {
@@ -1385,20 +1366,15 @@ static void reset_test(void)
 	CASE("lec reset instance reconverges");
 	erle = erle_run(ec, &path, &state, -10.0,
 			FRAMES_PER_SECOND + FRAMES_PER_SECOND / 2, 20);
-	/* A fresh instance reaches about 59 dB here; 45 leaves headroom and
-	 * still convicts a kept ref_power, whose biased NLMS denominator
-	 * caps the same run near 31 dB. */
+	/* A fresh instance clears the bound with headroom; a kept ref_power,
+	 * whose biased NLMS denominator caps the run far under it, fails. */
 	CHECK(erle >= 45.0);
 	udsp_ec_nlms.destroy(ec);
 }
 
-/*
- * The cost of the learned bound, as the bench row that changes to a late
- * hybrid shows it and the constants state it. After a hybrid step, the tighter
- * expectation holds more of the transition than a fixed 6 dB assumption
- * would. The escape must do the rest. This check bounds that cost against
- * regression. A constant change that slows the recovery further fails here.
- */
+/* The cost of the learned bound: after a hybrid step, the tighter expectation
+ * holds more of the transition than a fixed 6 dB bound. The escape must do the
+ * rest. A constant change that slows the recovery further fails here. */
 static void reconverge_test(unsigned rate)
 {
 	struct udsp_ec_nlms_info info;
@@ -1423,23 +1399,11 @@ static void reconverge_test(unsigned rate)
 }
 
 /*
- * The hybrid-change lockout. A hybrid that changes while the far end keeps
- * talking leaves the filter predicting the echo of the path that is gone: the
- * two responses are uncorrelated, the residual carries both energies, and the
- * detector reads the canceller's own damage as a near-end talker. Without the
- * path-change escape, the hold stands for its whole LEC_GEIGEL_LATCH_MAX
- * period at both rates.
- *
- * The far-end history moves into the replacement hybrid, so the frames after
- * the change carry the echo of a different response and not the silence of an
- * unfilled one: a dropout ends the hold by accident and would prove nothing.
- *
- * The line converges for 4 s, so the trust count of dsp/lec.c completes before
- * the change. A detector that still waits for the count sets the classic bar,
- * and the frames after the change adapt with no hold to escape. The seeds are
- * entries 7 to 10 of the seed walk of the bench (summary_seed_get). After
- * 4 s, 14 of its first 40 entries latch at each rate, and these four latch at
- * both.
+ * The hybrid-change lockout: the estimate predicts the echo of the path that is
+ * gone, the residual carries both energies, and the detector reads it as a
+ * talker. The far history moves into the replacement hybrid, so the change
+ * carries echo, not silence. The line converges 4 s, so the trust count
+ * completes; the seeds are entries 7 to 10 of summary_seed_get.
  */
 struct lockout_result {
 	double erle_late;
@@ -1485,9 +1449,7 @@ static void lockout_drive(unsigned rate, uint32_t seed,
 		if (run > out->hold_run)
 			out->hold_run = run;
 		held = info.hold_frames;
-		/* The second second after the change. With the trust held at
-		 * the change, the bench recovers from this change of hybrids
-		 * within 950 ms on each of forty seeds. */
+		/* The second second after the change. */
 		if (f < FRAMES_PER_SECOND)
 			continue;
 		for (i = 0; i < second.frame; i++) {
@@ -1525,9 +1487,7 @@ static void lockout_release_test(unsigned rate)
 	}
 
 	case_rate(rate, "lec path-change escape releases the hybrid lockout");
-	/* The latched instance measures -3.2 to -2.9 dB here and holds 200 of
-	 * these 200 frames. The released one measures 32.6 to 38.3 dB and holds
-	 * at most 31. */
+	/* Without the escape the instance stays latched. */
 	CHECK(worst_erle >= 20.0);
 	CHECK(worst_run <= 100u);
 	CHECK_UINT(probes, 4);
@@ -1535,14 +1495,10 @@ static void lockout_release_test(unsigned rate)
 }
 
 /*
- * The escape must never treat a near-end talker over an active far end as a
- * path change. The canceller must hand that talker through unchanged.
- * Near-end speech adds the same energy to the residual as to the microphone,
- * so it cannot reach the verdict of the escape. This case checks that by a
- * sample-for-sample comparison of the near end out of the canceller with the
- * near end that went in. The comparison catches an attenuation, an added
- * residual and a swallowed talker alike. The correlation gain beside it checks
- * the level (0 dB is unattenuated).
+ * The escape never treats a near talker over an active far end as a path
+ * change: near speech adds the same energy to residual and microphone. The case
+ * compares the near end out of the canceller with the near end in, sample for
+ * sample. It compares the level by a correlation gain (0 dB unattenuated).
  */
 static void near_end_preserve_test(unsigned rate)
 {
@@ -1593,10 +1549,8 @@ static void near_end_preserve_test(unsigned rate)
 
 	case_rate(rate, "lec keeps the near end whole through double talk");
 	CHECK(detected >= FRAMES_PER_SECOND);
-	/* Measured 64.63 dB at 8 kHz and 64.78 dB at 16 kHz, the same figures
-	 * to the last digit with the path-change escape in and without it: the
-	 * near end comes out of the canceller as it went in. A near end halved
-	 * on the way out reads 6.02 dB here and 6.02 dB of loss below. */
+	/* A near end halved on the way out reads 6.02 dB here and 6.02 dB of
+	 * loss below. */
 	CHECK(10.0 * log10(near_energy / error_energy) >= 30.0);
 	CHECK(fabs(-20.0 * log10(product / near_energy)) <= 0.5);
 	CHECK_UINT(info.probes, 0);
@@ -1605,18 +1559,10 @@ static void near_end_preserve_test(unsigned rate)
 }
 
 /*
- * A trial adapts against the verdict of the detector, so it moves the
- * trackers, the learned bound and the hangover with the coefficients. A
- * restore of the filter alone leaves the learned bound 0.31 dB louder than
- * before the trial. The classic expectation and the NLP loss gate read that
- * bound.
- *
- * Five seconds of unbroken near speech drive a trial that the near end fails;
- * a probe_finish that always keeps the trial filter fails this case.
- *
- * The first frame of the trial never adapts, because the detector holds when
- * the escape fires. At the frame where the probe count moves, the caller
- * therefore reads exactly the snapshot.
+ * A refused trial restores the trackers, the learned bound and the hangover
+ * with the coefficients. Five seconds of near speech drive a trial that the
+ * near end fails, so a probe_finish that keeps the trial fails this case. The
+ * first frame of the trial does not adapt, so it reads the snapshot.
  */
 static void probe_reject_test(void)
 {
@@ -1666,8 +1612,8 @@ static void probe_reject_test(void)
 	CASE("lec rejected trial gives the detector back");
 	CHECK_UINT(info.probes, 1);
 	CHECK(start_frame != 0u);
-	/* Restoring the filter alone leaves the learned bound at 0.174430
-	 * against the 0.162337 it started from. */
+	/* Restoring the filter alone leaves the learned bound off the value it
+	 * started from. */
 	CHECK(info.echo_gain == gain_at_start);
 	CHECK(info.coef_energy == coef_at_start);
 	CHECK(info.erle_db == erle_at_start);
@@ -1676,14 +1622,10 @@ static void probe_reject_test(void)
 }
 
 /*
- * The countdown of the trial spends the frames that the filter adapts on, not
- * the frames whose reference is active. Freeze holds the filter still for
- * reasons of the caller, and a countdown through it would close the trial on a
- * filter that never moved. It would judge the trial by a residual that could
- * not change. Measured with a countdown on the reference alone, the trial
- * closes inside a 2 s freeze. With that countdown, the filter is back at its
- * snapshot 50 frames after the release. With the adapt verdict, the trial is
- * still open and moving there.
+ * The countdown of a trial spends the frames that the filter adapts on, not the
+ * frames with an active reference. A countdown through a freeze would close the
+ * trial on a filter that never moved. After a 2 s freeze the trial is still
+ * open and moving.
  */
 static void probe_freeze_test(void)
 {
@@ -1737,29 +1679,22 @@ static void probe_freeze_test(void)
 	CHECK_UINT(info.probes, 1);
 	/* The frozen filter cannot move, so the trial cannot be judged. */
 	CHECK(coef_frozen == coef_at_start);
-	/* Released: the trial is still open and still adapting. A countdown
-	 * that spends the frozen frames closes it at 0.06305251 and leaves the
-	 * filter there; this one reads 0.07716025. */
+	/* Released: the trial is still open and still adapting. */
 	CHECK(coef_released != coef_at_start);
 	CHECK_UINT(info.diverge_resets, 0);
 	udsp_ec_nlms.destroy(ec);
 }
 
 /*
- * The stand-down after a refused trial (dsp/lec.c,
- * LEC_TRIAL_STANDDOWN_FRAMES). A hybrid that changes under a near-end talker
- * is the one case that arms the escape and then refuses its trial. The
- * energy of the talker keeps the trial from the 3 dB residual cut that the
- * verdict wants. Without the stand-down, the escape re-arms twenty frames
- * later and adapts another second on the same talker, again and again.
- *
- * Measured over fifteen seconds at both rates: 10 to 11 trials without the
- * stand-down, 3 with it, and 2 with no escape at all. The stand-down covers
- * one whole latch cycle, so the measured gap between trials is 601 frames,
- * and 145 without the carry-on.
+ * The stand-down after a refused trial (LEC_TRIAL_STANDDOWN_FRAMES), on a
+ * hybrid change under a near talker who refuses each trial. The two escapes
+ * draw one trial each, the second when its run completes after the first
+ * refusal (first_gap). Every later trial is a latch trial that carries both
+ * stand-downs, LEC_TRIAL_STANDDOWN_FRAMES apart or more (gap_min).
  */
 static void probe_cooldown_test(unsigned rate)
 {
+	struct udsp_ec_nlms_frame reading;
 	struct udsp_ec_nlms_info info;
 	struct echo_path first;
 	struct echo_path second;
@@ -1768,7 +1703,9 @@ static void probe_cooldown_test(unsigned rate)
 	uint32_t near_state = 0x13572468u ^ 0xfeedfaceu;
 	double product = 0.0;
 	double near_energy = 0.0;
+	unsigned arms[4] = { 0, 0, 0, 0 };
 	unsigned last_probe = 0;
+	unsigned first_gap = 0;
 	unsigned gap_min = 0;
 	unsigned probes = 0;
 	unsigned f;
@@ -1794,10 +1731,15 @@ static void probe_cooldown_test(unsigned rate)
 			mic[i] = sample_clamp((double)echo[i] + near[i]);
 		udsp_ec_nlms.run(ec, mic, ref);
 		udsp_ec_nlms_info_get(ec, &info);
+		udsp_ec_nlms_frame_get(ec, &reading);
 		if (info.probes != probes) {
 			unsigned gap = last_probe ? f + 1u - last_probe : 0u;
 
-			if (gap && (!gap_min || gap < gap_min))
+			if (probes < 4u)
+				arms[probes] = reading.trial_arm;
+			if (probes == 1u)
+				first_gap = gap;
+			else if (gap && (!gap_min || gap < gap_min))
 				gap_min = gap;
 			last_probe = f + 1u;
 			probes = info.probes;
@@ -1812,10 +1754,22 @@ static void probe_cooldown_test(unsigned rate)
 	udsp_ec_nlms_info_get(ec, &info);
 
 	case_rate(rate, "lec escape stands down after a trial the line refused");
-	CHECK(info.probes >= 2u);
-	CHECK(info.probes <= 3u);
-	/* One whole latch cycle between trials, whichever arm starts
-	 * them: LEC_GEIGEL_LATCH_MAX plus LEC_PROBE_FRAMES. */
+	printf("# %u trials, arms %s %s %s %s; %u frames between the first "
+	       "two, %u at least between the others\n", info.probes,
+	       lecr_trial_arm_name(arms[0]), lecr_trial_arm_name(arms[1]),
+	       lecr_trial_arm_name(arms[2]), lecr_trial_arm_name(arms[3]),
+	       first_gap, gap_min);
+	CHECK(info.probes >= 3u);
+	CHECK(info.probes <= 4u);
+	CHECK(arms[0] == UDSP_EC_NLMS_TRIAL_ARM_COHERE ||
+	      arms[0] == UDSP_EC_NLMS_TRIAL_ARM_PATH);
+	CHECK_UINT(arms[1], arms[0] == UDSP_EC_NLMS_TRIAL_ARM_COHERE ?
+		   UDSP_EC_NLMS_TRIAL_ARM_PATH : UDSP_EC_NLMS_TRIAL_ARM_COHERE);
+	/* The refused trial, then the run of the other escape: at least
+	 * LEC_PROBE_FRAMES plus LEC_PATH_CHANGE_FRAMES. */
+	CHECK(first_gap >= 100u + 20u);
+	/* One whole latch cycle between the later trials, whichever arm
+	 * starts them: LEC_GEIGEL_LATCH_MAX plus LEC_PROBE_FRAMES. */
 	CHECK(gap_min >= 600u);
 	CHECK(fabs(-20.0 * log10(product / near_energy)) <= 0.5);
 	CHECK_UINT(info.diverge_resets, 0);
@@ -1826,7 +1780,7 @@ static void probe_cooldown_test(unsigned rate)
  * The other side of the same rule. A latch trial that the line refuses on its
  * own, with no stand-down pending, hands the escape nothing to carry. A
  * stand-down there too keeps a real hybrid change after a refused latch trial
- * in lockout for 452 frames. The narrow rule escapes it inside 34 frames.
+ * in lockout, and the narrow rule escapes it.
  */
 static void latch_refusal_test(unsigned rate)
 {
@@ -1891,8 +1845,8 @@ static void latch_refusal_test(unsigned rate)
 	udsp_ec_nlms_info_get(ec, &info);
 
 	case_rate(rate, "lec latch refusal alone does not stand the escape down");
-	/* 452 held frames and 4.9 dB when a refused latch trial arms the
-	 * stand-down; 33 and 72.8 dB when only the escape's own does. */
+	/* A refused latch trial that arms the stand-down keeps the change held;
+	 * with only the escape's own stand-down the line recovers. */
 	CHECK(hold_run <= 100u);
 	CHECK(10.0 * log10(echo_energy / res_energy) >= 20.0);
 	CHECK_UINT(info.diverge_resets, 0);
@@ -1900,18 +1854,11 @@ static void latch_refusal_test(unsigned rate)
 }
 
 /*
- * The bootstrap false detection. While the filter converges, its echo
- * estimate under-reads the microphone by exactly the residual it still
- * leaves; an expectation that ignores that term reads a 1.5 dB excursion of
- * the echo power as a near-end talker, and one detection costs the whole
- * 24-frame hangover in the middle of the bootstrap. The fixtures are the seeds
- * where that cost is highest: on the composite hybrid at the 64 ms tail it
- * leaves the only one of forty seeds under the 25 dB gate at 8 kHz (22.09 dB
- * with 25 frames held, 27.49 dB with none), and the late hybrid holds on eight
- * of forty seeds at 16 kHz and five of forty at 8 kHz.
- *
- * The far end talks alone here, so there is no near end to protect and every
- * held frame is a false detection by construction.
+ * The bootstrap false detection: a converging estimate under-reads the
+ * microphone by the residual it leaves. An expectation without that term reads
+ * an excursion of the echo as a talker and holds a hangover. The fixtures are
+ * the seeds where that costs most. The far end talks alone, so every held frame
+ * is a false detection.
  */
 struct bootstrap_fixture {
 	unsigned rate;
@@ -2160,16 +2107,10 @@ static void upper_band_test(void)
 }
 
 /*
- * The tap that the fused pass contends for. One pass over the coefficients
- * holds the windows of two consecutive samples at once, and they collide on
- * the last tap of the older window. The push of the next sample writes exactly
- * there, unless the history ring keeps one sample more than the window
- * (dsp/lec.c, hist_push).
- *
- * Every other hybrid in this suite puts its energy well inside the tail, where
- * a corrupted last tap costs a fraction of a dB, unseen. This hybrid
- * puts the whole echo on the last tap of the filter, so only that tap can
- * cancel anything. A ring one sample too short then cannot reach the bar.
+ * The tap that the fused pass contends for: the windows of two consecutive
+ * samples collide on the last tap of the older one. The ring keeps one sample
+ * more than the window to avoid it (hist_push). This hybrid puts the whole echo
+ * on the last tap, so a ring one sample short cannot reach the bar.
  */
 static void last_tap_test(unsigned rate)
 {
@@ -2198,12 +2139,10 @@ static void last_tap_test(unsigned rate)
 }
 
 /*
- * The update that the fused pass cannot carry. The last sample of a frame has
- * no estimate behind it to fuse with, so its update stands alone at the end of
- * frame_filter_run. A reference that is silent for the whole frame except its
- * last sample makes that update the only one of the frame. Every earlier
- * sample sees a zero window and a zero error. The filter therefore moves only
- * if the trailing update runs.
+ * The update that the fused pass cannot carry: the last sample of a frame has
+ * no estimate to fuse with. A reference silent but for the frame's last sample
+ * makes that update the only one, so the filter moves only if the trailing
+ * update runs.
  */
 static void last_sample_test(unsigned rate)
 {
@@ -2229,74 +2168,16 @@ static void last_sample_test(unsigned rate)
 	udsp_ec_nlms.destroy(ec);
 }
 
-/*
- * The equivalence suite. On aarch64 the canceller carries two forms of the
- * per-tap loops: the canonical scalar one and an Advanced SIMD one that
- * accumulates the dot product in thirty-two partial sums instead of one. The
- * two are equivalent, not identical, so this suite runs each scenario through
- * both forms and bounds the difference.
- *
- * One hybrid drives both arms: the microphone frame is built once and handed
- * to two fresh instances, so the arms never see different samples and any
- * difference at the output is the canceller's own. Three things are read: how
- * far two emitted samples drift apart, whether the line delivers the same
- * ERLE, and whether any decision came out differently (a trial, a divergence
- * reset, a hold, a detector verdict, an engaged NLP).
- *
- * On a target with one path the cases print a skip note and pass: there is
- * nothing to compare against there.
- */
+/* The equivalence suite runs each scenario through the scalar and the Advanced
+ * SIMD loops on the same frames. It bounds the drift of the samples, the ERLE
+ * and each decision. A target with one path prints a skip note and passes. */
 #define EQUIV_DELTA_MAX		4u
 #define EQUIV_ERLE_DELTA_DB	0.1
 #define EQUIV_MEASURE_FROM	20u
 
-/*
- * What the two forms may differ by in the internal state at the end of a
- * scenario, on top of the emitted samples.
- *
- * The one difference between the forms is the order the dot product
- * accumulates in, worth about u*sqrt(taps) of relative error on the estimate
- * with u = 2^-24: 1.9e-6 at the 1024-tap ceiling. The coefficients inherit
- * that order through the step, and a sum of squares doubles a relative
- * figure, so coef_energy may differ by about 4e-6 in the worst case. The bar
- * is 1e-5, which is 14 times the worst value of this bench (7.1e-7 over
- * 96 runs on target boards) and 100 times inside the 1e-3 a single
- * mis-updated tap of a wrong kernel produces.
- *
- * erle_db is 10*log10 of a ratio whose numerator is input-derived and equal in
- * both arms; only the residual moves, by the estimate's perturbation divided
- * by the residual-to-microphone ratio. At 30 dB of tracked ERLE that is 5e-4
- * dB and it grows tenfold per 20 dB, so 0.05 dB covers past 65 dB. Measured
- * worst: 4.7e-4 dB.
- *
- * echo_gain is compared exactly, and that needs one more step than it looks.
- * echo_gain_update() consumes the frame's microphone power and the tail window
- * power, both computed from the input frames the two arms share, and it is
- * called on the frames whose reference is active, which is the same set in
- * both arms. Those updates are therefore identical by construction. The one
- * writer that is not input-derived is probe_finish(): its verdict compares the
- * live residual power against the residual measured before the trial, and the
- * residual is exactly what the two forms compute differently.
- *
- * A split verdict, one arm keeping the trial and the other restoring the
- * snapshot, is therefore the only route to a drifting echo_gain, and it cannot
- * pass unseen. The arm that kept the trial carries a whole second of
- * adaptation that the other threw away, so the two coefficient sets differ
- * macroscopically and the coef_energy bound above fails by orders of magnitude
- * before echo_gain is even read: the amplifying scenario's own trial moves
- * coef_energy from nothing to past the divergence bound, which is 1e5 times
- * the 1e-5 the comparison allows. The frame the trial starts on is pinned
- * separately, by the per-frame probes comparison, and the frame its countdown
- * ends on is pinned by the per-frame hold comparison, so the verdict is the
- * only thing left to argue about.
- *
- * The residual failure mode is a knife-edge verdict, where the trial's
- * improvement ratio sits within the rounding difference of LEC_PROBE_IMPROVE.
- * No run of this bench shows it. If it ever fires, it fails on
- * coef_energy rather than passing: read the printed coef figure first, because
- * a macroscopic one means a split verdict on a knife edge and not a defective
- * kernel.
- */
+/* Bounds of the internal state at the end of a scenario. echo_gain
+ * compares exactly, because only a split trial verdict moves it, and that
+ * verdict fails the coefficient energy bound first. */
 #define EQUIV_COEF_REL		1e-5
 #define EQUIV_ERLE_STATE_DB	0.05
 #define EQUIV_COVER_CASE	"lec equivalence scenarios reach every decision"
@@ -2327,15 +2208,9 @@ struct equiv_scenario {
 	unsigned near_from;
 	unsigned near_to;
 	bool nlp;
-	/*
-	 * What this scenario must make the canceller do, asserted here rather
-	 * than only in the suite total: a scenario that stopped reaching its
-	 * decisions would otherwise keep passing on the decisions of another
-	 * scenario.
-	 * coef_live demands that the state comparison ran on a filter that
-	 * carries energy, because rel_diff_get() of two zeroes is 0 and would
-	 * satisfy the bound without comparing anything.
-	 */
+	/* What this scenario must make the canceller do, so that a scenario
+	 * cannot pass on the decisions of another. coef_live: the state
+	 * comparison ran on a filter that carries energy. */
 	unsigned min_probes;
 	unsigned min_resets;
 	unsigned min_hold_run;
@@ -2500,15 +2375,9 @@ static void equiv_run(const struct equiv_scenario *s, struct equiv_result *out)
 	udsp_ec_nlms.destroy(simd);
 }
 
-/*
- * The scenarios walk what the canceller does, not only what it computes: the
- * plain convergence, the wideband worst case at the 64 ms tail, the detector
- * and the NLP under a near-end burst, the path-change escape, a tap count that
- * leaves a remainder for the four-wide tail of the vector loop (17 ms at 8 kHz
- * is 136 taps, eight past the fourth thirty-two-tap block), five seconds of
- * near speech that ends in a refused trial, and the upper-octave wideband
- * hybrid.
- */
+/* The scenarios: convergence, the wideband worst case at 64 ms, detector and
+ * NLP under a near burst, the path-change escape. Then 136 taps at 8 kHz for
+ * the four-wide tail, a refused trial, the upper-octave hybrid. */
 static const struct equiv_scenario equiv_scenarios[] = {
 	{
 		.name = "lec paths agree on the flat hybrid",
@@ -2562,50 +2431,21 @@ static const struct equiv_scenario equiv_scenarios[] = {
 		.seed = 0x60c7a5e5u, .frames = 300,
 		.hybrid = EQUIV_UPPER, .change_to = EQUIV_UPPER, .erl_db = 12.0,
 	},
-	/*
-	 * The decisions the quiet hybrids never reach. A hybrid that amplifies
-	 * is louder than every expectation the detector holds, so it holds
-	 * from the first frame and the latch escape is the only way out; the
-	 * trial it ends in then adapts against an echo whose solution carries
-	 * more energy than a passive path can, and the divergence watchdog
-	 * fires. One scenario therefore drives a hold that runs for the whole
-	 * run, an adaptation trial, and a coefficient reset, which is what
-	 * makes the per-frame decision oracle above worth reading.
-	 */
+	/* An amplifying hybrid holds from the first frame, and the latch trial
+	 * adapts toward more energy than a passive path holds. The watchdog
+	 * fires: a hold for the run, a trial and a reset. */
 	{
 		.name = "lec paths agree on an amplifying hybrid",
 		.rate = UDSP_SAMPLE_RATE, .tail_ms = 48,
 		.seed = 0x0c0ffee1u, .frames = 1500,
 		.hybrid = EQUIV_FLAT, .change_to = EQUIV_FLAT, .erl_db = -8.0,
-		/*
-		 * The step control throttles the step by the share of the
-		 * microphone the far end can explain. On a hybrid this loud,
-		 * the learned gain must climb before the step opens up again.
-		 * The runaway therefore reaches the watchdog bound at 11.6 s on
-		 * this shape and seed. The amplifying phase runs past that, so
-		 * the scenario reaches the reset it is here for.
-		 *
-		 * The line goes passive for the last two seconds. The
-		 * amplifying phase alone leaves nothing to compare: it ends
-		 * inside the hold that follows the trial, and probe_diverged
-		 * restores the snapshot of zeroes taken before the trial. Both
-		 * arms then end at coefficient energy zero, and the state
-		 * comparison is two zeroes against a relative bound. Two
-		 * seconds of a hybrid the canceller can solve end the run on a
-		 * converged filter instead (energy 0.063, tracked ERLE
-		 * 55.7 dB). That is a real comparison, and it leaves every
-		 * decision of the first nine seconds where it was.
-		 */
+		/* The step control slows the runaway, so the amplifying phase
+		 * runs past the reset; a passive last 2 s ends the run on a
+		 * converged filter, not on zeroes. */
 		.change_at = 1300, .change_erl_db = 12.0,
-		/*
-		 * The hold runs unbroken until the latch escape fires, and the
-		 * latch is LEC_GEIGEL_LATCH_MAX double-talk frames of dsp/lec.c
-		 * (500). The run cannot be shorter than that: the counter
-		 * climbs at most once per frame and the hold ends only when the
-		 * trial starts. The trial then adapts against an echo louder
-		 * than its own reference, which is a solution no passive path
-		 * has, so the divergence watchdog fires as well.
-		 */
+		/* The hold runs unbroken until the latch, LEC_GEIGEL_LATCH_MAX
+		 * frames. The trial then adapts on an echo louder than its
+		 * reference, so the watchdog fires as well. */
 		.min_probes = 1, .min_resets = 1, .min_hold_run = 500,
 		.coef_live = true,
 	},
@@ -2693,34 +2533,17 @@ static void equivalence_test(void)
 	udsp_ec_nlms_path_set(outer);
 }
 
-/*
- * The weak hybrid. The suite above and the per-path bench table validate on
- * hybrids of 0 to 23 dB whose microphone carries the echo and nothing else.
- * Real lines can return 26 to 30 dB, and their microphones carry the near
- * end's own noise floor as well. The echo of a quiet far end then comes within
- * about 10 dB of that floor.
- *
- * The row is specified by the ratio of echo to floor rather than by two
- * absolute levels, because the failure depends on how close the two come.
- *
- * Without the near-end floor term of the detector and the step control, at
- * 8 kHz, 41 percent of the far-active single-talk frames carry a double-talk
- * verdict with the near end silent. The filter then reaches 1.6 dB. The bars
- * below are the figures of the current canceller with margin. Each of them
- * fails without the floor term and the step control.
- */
+/* The weak hybrid: a 26 to 30 dB line, the echo of a quiet far end about 10 dB
+ * over the near floor. The fault depends on that ratio, so it sets the row.
+ * Each bar fails without the floor term and the step control. */
 #define WEAK_FAR_DBM0		-25.0
 #define WEAK_FLOOR_DBM0		-55.0
 #define WEAK_ERL_DB		28.0
 #define WEAK_WINDOW		10u
 
-/*
- * The burst bar. Without the step control, the worst window of talkover_test
- * reads +45.9 dB at 8 kHz. With it, the worst window reads +2.1 dB at 8 kHz
- * and +0.6 dB at 16 kHz, which is a filter at pass-through with nothing to
- * learn from. Three decibels separates those by an order of magnitude and
- * leaves the pass-through case room for the regression estimate's own noise.
- */
+/* The burst bar: with the step control the worst window of talkover_test stands
+ * near pass-through, and 3 dB leaves room for the noise of the regression
+ * estimate. */
 #define TALK_BURST_DB		3.0
 
 struct weak_stat {
@@ -2792,11 +2615,10 @@ static void weak_step(struct udsp_ec *ec, struct echo_path *path,
 }
 
 /*
- * What the filter removed: the residual with the injected floor energy taken
- * out. The floor and the misalignment are uncorrelated, so their energies add
- * and the subtraction is unbiased. This is the number the acceptance is
- * stated in, because the delivered ratio on such a line is bounded by the
- * floor whatever the canceller does.
+ * What the filter takes out: the residual less the injected floor energy. Floor
+ * and misalignment are uncorrelated, so their energies add and the subtraction
+ * is unbiased. The acceptance is stated in this figure, because the floor
+ * bounds the delivered ratio whatever the canceller does.
  */
 static double weak_filter_erle_get(double echo, double residual, double floor)
 {
@@ -2880,11 +2702,10 @@ static void weak_hybrid_test(unsigned rate)
 #define DIVERGE_AMP_FRAMES	(30u * FRAMES_PER_SECOND)
 
 /*
- * The divergence line. Far-end words converge the filter on the weak hybrid
- * for 5 s. A flat hybrid that amplifies by 8 dB, the hybrid of
- * watchdog_recovery_test, then replaces it under a white far end at
- * WEAK_FAR_DBM0. Its echo stands 8 dB over the reference, so the talker guard
- * of dsp/lec.c reads it as echo, and no passive path can return it.
+ * The divergence line: far words converge the filter on the weak hybrid for 5
+ * s. Then the hybrid of watchdog_recovery_test, flat and 8 dB amplifying,
+ * replaces it under a white far end. The talker guard reads its echo as echo,
+ * and no passive path returns it.
  */
 struct divergence_line {
 	struct echo_path weak;
@@ -2926,14 +2747,9 @@ static void divergence_frame_run(struct divergence_line *d, unsigned f)
 
 /*
  * On the hybrid that amplifies, a latch trial drives the coefficients through
- * LEC_COEF_ENERGY_MAX, and probe_diverged of dsp/lec.c ends it through the
- * reject path. The reject restores the filter that converged on the weak
- * hybrid, so a zeroed filter reads a coefficient energy of 0. The far end runs
- * without a pause, because the pauses of speech decay the latch run. The line
- * must run a trial and a reset, must never leave the filter zeroed, and must
- * reset at most once per trial. A near talker cannot carry a trial through
- * the bound (the comment above probe_diverged in dsp/lec.c). Without the
- * abort, the watchdog zeroes the filter 15 times.
+ * LEC_COEF_ENERGY_MAX, and probe_diverged restores the filter of the weak
+ * hybrid. The far end runs without a pause. The line must run a trial and a
+ * reset, never leave the filter zeroed, and reset at most once per trial.
  */
 static void probe_divergence_test(unsigned rate)
 {
@@ -2957,18 +2773,11 @@ static void probe_divergence_test(unsigned rate)
 	case_rate(rate, "lec undoes a trial the watchdog stops");
 	printf("# %u trials, %u resets, %u zeroed frames\n", info.probes,
 	       info.diverge_resets, zeroed);
-	/*
-	 * The latch still fires, and it must: five unbroken seconds of a
-	 * louder echo than any expectation is the documented design, and a
-	 * trial is how the canceller asks whether the hold was right.
-	 */
+	/* The latch fires: five unbroken seconds of an echo louder than any
+	 * expectation end in a trial. */
 	CHECK(info.probes >= 1u);
-	/*
-	 * A trial is exempt from the step throttle (talk_scale_get says why),
-	 * so it adapts at the full step toward the solution of the hybrid
-	 * that amplifies, and this scenario reaches the fault it is written
-	 * for.
-	 */
+	/* A trial is exempt from the talk scale, so it adapts at the full step
+	 * toward the hybrid that amplifies and reaches the fault. */
 	CHECK(info.diverge_resets >= 1u);
 	/* The filter is never left dead under a running trial. */
 	CHECK_UINT(zeroed, 0);
@@ -2981,13 +2790,9 @@ static void probe_divergence_test(unsigned rate)
 
 /*
  * The floor has one way in here: the first reference-silent frame is taken
- * whole. The seed of dsp/lec.c never moves a measured floor, and the rise
- * test guards only a floor that the tracker holds.
- * A near-end talkspurt in a far-end pause therefore sets the floor to the
- * level of that speech. The step control of dsp/lec.c reads that floor.
- * Without the branch that lets an active frame's residual falsify the floor,
- * the filter never adapts again while the far end keeps talking.
- * Measured over the run below: 5.4 dB of ERLE, against 59 dB with the branch.
+ * whole, so a near talkspurt in a far pause sets the floor at its level. The
+ * step control reads that floor; without the stale rule of an active frame's
+ * residual, the filter never adapts again while the far end talks.
  */
 static void noise_floor_stale_test(void)
 {
@@ -3012,22 +2817,9 @@ static void noise_floor_stale_test(void)
 	udsp_ec_nlms.destroy(ec);
 }
 
-/*
- * One quiet frame is not evidence. The residual of an active frame bounds the
- * near-end floor from above, so a residual under the floor falsifies it. But a
- * 10 ms residual is one realization of a near end that is not stationary. If
- * a single quiet frame throws a valid floor away, the cost is high. The floor
- * is only measured on a reference-silent frame, so a line whose far end keeps
- * talking never gets it back. The two terms that read the floor (the
- * detector's near-end term and the step control) then act as on a line with
- * no floor.
- *
- * The case runs the weak line of weak_hybrid_test with a quiet moment in the
- * near end every tenth frame, each one isolated, and asks for the behavior
- * that a line with a floor shows. LEC_NOISE_STALE_FRAMES of dsp/lec.c is what
- * separates them: with it at 1, the verdicts come back on 37 percent of the
- * far-active frames.
- */
+/* A quiet 10 ms frame is one realization of a near end, not evidence of a stale
+ * floor. A floor dropped under a talking far end does not come back. Every
+ * tenth frame of the weak line is quiet; the line must keep its floor. */
 #define WEAK_OUTLIER_EVERY	10u
 
 static void noise_floor_outlier_test(unsigned rate)
@@ -3047,11 +2839,9 @@ static void noise_floor_outlier_test(unsigned rate)
 	path_weak_init(&path, rate, WEAK_ERL_DB);
 	word_source_init(&far, rate, WEAK_FAR_DBM0, 0x13572468u);
 	for (f = 0; f < 20u * FRAMES_PER_SECOND; f++) {
-		/* The quiet moment goes on a frame the far end is talking on,
-		 * which is the frame the falsification arm reads. A quiet
-		 * moment in a far-end pause is not an outlier at all: it is a
-		 * measurement of a floor that really is lower, and the tracker
-		 * is supposed to follow it. */
+		/* The quiet moment falls on a frame that the far end talks on,
+		 * the frame that the stale rule reads. One in a far pause is a
+		 * lower floor that the tracker follows. */
 		bool quiet = f % WEAK_OUTLIER_EVERY == 0u && far.talking;
 
 		weak_step(ec, &path, &far, NULL, &floor_state, &st, &held,
@@ -3068,17 +2858,10 @@ static void noise_floor_outlier_test(unsigned rate)
 }
 
 /*
- * A hybrid that amplifies is the one case where the filter estimate justifies
- * the microphone it chases, so the runaway is real. Every reset here is a
- * trial abort through probe_diverged: the detector holds this hybrid from its
- * first frame, so the runaway happens inside a trial. An instrumented run of
- * the whole suite counts 15 trial aborts and 0 resets through the plain zero
- * branch of divergence_check. That branch and its re-seed of the live power
- * trackers are the defensive policy for a divergence with no snapshot.
- *
- * The case asserts that no published field is ever not a number, and that one
- * trial cannot trip the watchdog twice. It also asserts that the canceller
- * keeps learning afterwards.
+ * A hybrid that amplifies justifies the microphone that the filter chases, so
+ * the runaway is real. The detector holds it from the first frame, so each
+ * reset is a trial abort. No published field is ever not a number, one trial
+ * cannot trip the watchdog twice, and the canceller keeps learning afterwards.
  */
 static void watchdog_recovery_test(void)
 {
@@ -3112,25 +2895,12 @@ static void watchdog_recovery_test(void)
 	/* The scenario has to reach the branch it is about. */
 	CHECK(info.diverge_resets >= 1u);
 	CHECK_UINT(finite_bad, 0);
-	/*
-	 * On this hybrid a divergence stays reachable under the step
-	 * control. The microphone really does carry what the filter is
-	 * chasing, so the step control has nothing to withhold and the
-	 * runaway is the genuine one the watchdog exists for. No talk-over
-	 * case reaches the watchdog, so this case pins the undo path of the
-	 * trial. Every trip inside a trial ends that trial and puts the
-	 * snapshot back, so one trial cannot trip the watchdog twice. The
-	 * snapshot here is a filter of zeroes, because the detector holds
-	 * this hybrid from its first frame, so a zero reading of the
-	 * coefficient energy is the restore and not a zeroing.
-	 */
+	/* Each trip inside a trial ends it and restores the snapshot, here a
+	 * filter of zeroes. One trial therefore cannot trip the watchdog twice,
+	 * and a zero energy is the restore, not a zeroing. */
 	CHECK(info.diverge_resets <= info.probes);
-	/*
-	 * The line goes passive: a canceller carrying poison in either live
-	 * power would take the zero step for ever and cancel nothing, so the
-	 * recovery bar is itself the test of the re-seed. Two seconds is the
-	 * bound.
-	 */
+	/* The line goes passive. A live power that is not a number would take
+	 * the zero step for ever, so recovery within 2 s tests the reseed. */
 	path_history_carry(&passive, &path);
 	CHECK(erle_run(ec, &passive, &state, -10.0, 2u * FRAMES_PER_SECOND,
 		       20) >= 25.0);
@@ -3141,38 +2911,9 @@ static void watchdog_recovery_test(void)
 }
 
 /*
- * The frame the trial's countdown expires on. If ec_run resolves the
- * countdown before probe_diverged, a divergence there escapes the abort.
- * probe_finish then judges the diverged coefficients on a smoothed residual
- * that lags a divergent frame by a tenth. It can declare them an improvement
- * and keep them. The plain watchdog behind it then finds no trial open and
- * zeroes the line's filter.
- *
- * The case walks the boundary exactly: it counts the trial's budget in the
- * currency the trial spends, active frames, and puts the divergence on the
- * last one. A talker cannot cause that divergence. A full-scale talker on a
- * reference near the activity bar stands 47 to 48 dB over its window. The
- * talker guard of dsp/lec.c ends the trial before that frame adapts. A
- * talker under the guard does not carry the filter through the bound
- * (probe_divergence_test).
- *
- * The divergence therefore comes from the hybrid that amplifies by 8 dB,
- * which the guard reads as echo. A latch trial on the weak hybrid spends its
- * budget on the far end alone, and the reference then goes silent for
- * TRIAL_FLUSH_FRAMES frames. Those frames are inactive, so they spend no
- * budget, and they clear the history of the hybrid and of the canceller. The
- * hybrid that amplifies then takes the white far end of a fixed seed until
- * the coefficients cross the bound. A scout line counts those frames first,
- * with no budget spent before them, and the line spends the rest of the
- * budget before the silence. The crossing then falls on the last frame.
- *
- * A second instance is the independent check of what the abort had to
- * restore. It sees every frame this one sees, and the case freezes it on the
- * frame the trial starts, which is a frame the escape holds and therefore one
- * that changes no coefficient; its filter from then on is the snapshot. Two
- * frozen instances on identical frames produce identical output if and only
- * if they hold identical coefficients, so the comparison is a byte compare of
- * the filters through the only door the public interface has.
+ * A divergence on the last countdown frame of a trial must still abort, or
+ * probe_finish keeps the diverged filter and the watchdog zeroes it. The hybrid
+ * crosses on that frame; a twin frozen at the trial's start holds the snapshot.
  */
 #define TRIAL_BUDGET		100u
 #define TRIAL_QUIET_DBM0	-48.0
@@ -3250,12 +2991,10 @@ static void boundary_weak_run(struct boundary_line *b, bool talk)
 }
 
 /*
- * Converge for 2 s, so the filter the abort has to give back is a real one.
- * A talker 9 dB over the far end then joins and stays: the run the clear
- * frames cannot pay down reaches LEC_GEIGEL_LATCH_MAX, and the latch starts a
- * trial. The talker stands under the talker guard. The frame the trial starts
- * on is a double-talk frame, so it adapts on nothing. The twin freezes on
- * that frame, and its coefficients are the snapshot from then on.
+ * Converge for 2 s, so the abort gives back a real filter. A talker 9 dB over
+ * the far end, under the talker guard, then joins. It stays until the latch
+ * starts a trial on a double-talk frame, which adapts on nothing. The twin
+ * freezes on that frame and holds the snapshot from then on.
  */
 static void boundary_trial_start(struct boundary_line *b,
 				 struct udsp_ec_nlms_info *converged)
@@ -3390,16 +3129,9 @@ static void probe_boundary_test(unsigned rate)
 	CHECK_UINT(lead_info.diverge_resets, 1);
 	CHECK_UINT(reading.trial_end, UDSP_EC_NLMS_TRIAL_END_DIVERGED);
 	CHECK(lead_info.coef_energy > 0.0f);
-	/*
-	 * What the line heard of that frame. The abort undoes the update, so
-	 * the filter comparison below cannot see the one thing the frame
-	 * really cost: the output, which was computed while the coefficients
-	 * were diverging. That output is the only part of a reverted frame
-	 * the far end can hear, and it is required to stay under the
-	 * microphone that produced it. A filter running away adds energy, so
-	 * this is the assertion that a reverted frame is not a burst, against
-	 * the same bar the talk-over case calls one.
-	 */
+	/* The abort undoes the update but not the output of the frame, computed
+	 * while the filter diverged: it must stay under the microphone by the
+	 * bar of a burst. */
 	CHECK(last_out <= last_mic * pow(10.0, TALK_BURST_DB / 10.0));
 	/* The published energy is the restored filter's, to the bit: the twin
 	 * holds that filter and computes it the same way. */
@@ -3429,30 +3161,9 @@ static void probe_boundary_test(unsigned rate)
 	udsp_ec_nlms.destroy(b.twin);
 }
 
-/*
- * The hybrid that got louder. A line whose return loss steps from 23 dB to
- * 3 dB is the one case the learned gain cannot describe: the echo is twenty
- * decibels over anything the tracker has seen, the detector holds every frame
- * because the microphone exceeds every expectation it can form, the release
- * arm never opens because it only runs on clean frames, and path_change_get
- * cannot fire because a step in gain alone leaves the residual under its
- * ratio. The latch escape and its trial are the only way out, and they exist
- * for this case.
- *
- * The trial therefore cannot be throttled by the learned gain, or the
- * hypothesis vetoes its own test. With the step control applied to trial
- * frames, ten trials fire in sixty seconds and each fails its improvement
- * test. With the trial exempt, the line recovers in 5.5 s at both rates.
- *
- * The bound is the mechanism, not slack. The recovery cannot begin before the
- * latch does, and the latch is LEC_GEIGEL_LATCH_MAX active frames of
- * dsp/lec.c; the trial that follows carries the line past the bar inside two
- * measurement blocks. Measured at frame 550 at both rates on all twelve seeds
- * of the stride list, with no spread at all, because the latch is a frame
- * count and not a function of the noise. The bound is therefore the latch
- * plus three blocks, one block over the measurement, because the only thing a
- * different seed can move is which block first reads over the bar.
- */
+/* A louder hybrid, 23 dB of return loss to STEP_TO_DB: the learned gain cannot
+ * describe it, and path_change_get misses a gain step. The latch trial, free of
+ * the talk scale, recovers it within STEP_SETTLE_MAX. */
 #define STEP_FROM_DB		23.0
 #define STEP_TO_DB		3.0
 #define STEP_BAR_DB		10.0
@@ -3514,24 +3225,9 @@ static void louder_hybrid_test(unsigned rate)
 	udsp_ec_nlms.destroy(ec);
 }
 
-/*
- * Talk-over. Without the step control, a line holds in single talk and does
- * not hold in talk-over: each watchdog reset falls in an interval with a
- * talk-over second in it. On the bench without the step control, each such
- * reset comes from the plain zero branch, not a trial.
- * Each frame that adapts while the near end talks passes the estimate arm of
- * the detector at nearly full step.
- *
- * One such frame is enough. At the levels of a real call the near end stands
- * about 15 dB over the echo, so a single full-step frame moves the
- * coefficient energy by two orders of magnitude, and the frames after it are
- * hidden by the estimate arm the contamination itself raised.
- *
- * The case runs both talkers as words at the levels a real call has: a duet
- * first, where the two never fall out of step, and then the same two skewed
- * against each other, which is what talk-over is. Without the step control,
- * the two phases give 24 resets at 8 kHz.
- */
+/* Talk-over: without the step control, each frame that adapts under near talk
+ * passes the estimate arm at nearly full step and the watchdog resets. Both
+ * talkers speak words at call levels, in step and then skewed. */
 #define TALK_NEAR_DBM0		-10.0
 #define TALK_SKEW		15u
 #define TALK_DUET_FRAMES	2000u
@@ -3662,16 +3358,9 @@ static void talkover_test(unsigned rate)
 	/* And it must never hand the far end more of their own voice back
 	 * than the hybrid returned. */
 	CHECK(st.worst_window <= TALK_BURST_DB);
-	/*
-	 * The learned gain must still describe the hybrid after all that, not
-	 * the talker. A passive line cannot return more than it receives, so
-	 * a power gain at or above unity is a tracker that has been reading
-	 * near-end speech: the release arm of echo_gain_update runs on clean
-	 * frames only for exactly this reason, and without that gate the
-	 * tracker climbs to 5.74 here, at both rates, against the 0.376 it
-	 * holds with it. The line statistics report this value as
-	 * echo_gain_micro.
-	 */
+	/* The learned gain still describes the hybrid: a power gain at unity or
+	 * more reads near speech, which the release arm, gated to clean frames,
+	 * keeps out. The line statistics report it as echo_gain_micro. */
 	CHECK(info.echo_gain < 1.0f);
 	/*
 	 * The talk-over ends. A control that answers a talker by refusing to
@@ -3734,15 +3423,10 @@ static bool zero_skip_info_same(const struct udsp_ec_nlms_info *a,
 }
 
 /*
- * A frame whose whole reference window is zero skips the tap loops (dsp/lec.c
- * frame_zero_run), on the claim that the skipped work produces nothing. The
- * two forms therefore run side by side over one stimulus, with every emitted
- * sample and state field compared bit for bit on every frame. The run
- * converges on a hybrid and falls silent for a second, so the window drains.
- * It resumes, falls silent again under near-end speech, and resumes, with the
- * NLP on so that the comfort noise path runs through the silence too. The skip
- * count must match the geometry: a pause of P frames skips P minus the frames
- * that the window needs to drain. The full form skips none.
+ * The zero skip and the full form run side by side, bit for bit on every sample
+ * and state field. The line runs through silences with and without near speech
+ * and the NLP on. A pause of P frames skips P less the frames the window takes
+ * to drain; the full form skips none.
  */
 static void zero_skip_test(unsigned rate)
 {
@@ -3882,8 +3566,8 @@ static void verdict_silence_run(struct udsp_ec *ec, struct echo_path *path,
 		verdict_step(ec, path, ref, NULL, acted);
 }
 
-/* An instance whose processor was on for every frame counts each frame once,
- * and its active count is the count of the frames that read nlp_active. */
+/* An instance whose processor is on for every frame counts each frame once. Its
+ * active count is the count of the frames that read nlp_active. */
 static void verdict_identity_check(const struct udsp_ec *ec, unsigned acted)
 {
 	struct udsp_ec_nlms_info info;
@@ -3957,12 +3641,10 @@ static void nlp_quiet_count_test(void)
 }
 
 /*
- * The ERLE gate on the fixtures of nlp_gate_probe. On the 12 dB hybrid the
- * tracker sits under the 18 dB fast path and the combined loss under the
- * 33 dB gate, so the gate refuses the echo-like frames. On the 23 dB hybrid
- * the combined loss passes and the processor acts. A count that files an ERLE
- * refusal as a frame that is not echo-like fails the first half. A combined
- * arm that passes the frames it refuses fails it too.
+ * The ERLE gate on the fixtures of nlp_gate_probe: the 12 dB hybrid stands
+ * under both arms, so the gate refuses its echo-like frames. On the 23 dB
+ * hybrid the processor acts. A count that files an ERLE refusal as unlike, or
+ * an arm that passes what it refuses, fails.
  */
 static void nlp_erle_count_test(void)
 {
@@ -4083,13 +3765,9 @@ static void nlp_dt_count_test(void)
 	udsp_ec_nlms.destroy(ec);
 }
 
-/*
- * A near burst at PAUSE_BURST_DBM0 over far-end digital silence. On a quiet
- * frame its microphone stands over the echo-likeness bar of a line with no
- * measured floor, or with a floor far under the burst. The burst stands
- * 27 dB or more under the echo of the fixtures that use it. The floor that it
- * can set therefore moves the bars of an active frame by less than 0.1 dB.
- */
+/* A near burst over far digital silence: on a quiet frame it stands over the
+ * echo-likeness bar of a line without a floor. It stands 27 dB or more under
+ * the echo of the fixtures, so its floor barely moves their bars. */
 #define PAUSE_BURST_DBM0	-60.0
 /* The near talker of nlp_echo_like_test, 1 dB under the echo of its 23 dB
  * hybrid. */
@@ -4123,12 +3801,10 @@ static unsigned window_frames_get(const struct udsp_ec *ec)
 #define FLAP_FRAMES		(2u * FRAMES_PER_SECOND)
 
 /*
- * The line of the flap cases, on the fixture of nlp_unlike_count_test: from a
- * complete run, the far end leaves a gap of one frame in every period. A
- * near talker 1 dB under the echo fills the gap, so the frame reads unlike
- * while the window stays active. The detector does not fire, and the ERLE
- * tracker does not read the gap frame, which is not active. The line stays
- * open for the checks of the case.
+ * The line of the flap cases: from a complete run, the far end leaves a gap of
+ * one frame per period. A near talker 1 dB under the echo fills it, so the
+ * frame reads unlike in an active window. The detector does not fire, and the
+ * tracker does not read the inactive gap frame.
  */
 struct flap_line {
 	struct echo_path path;
@@ -4178,14 +3854,10 @@ static void flap_print(const struct flap_line *l)
 }
 
 /*
- * The engage hysteresis against a flap, a refused frame every few frames of
- * far speech (heard as garbled speech), on the line of flap_run. The far end
- * leaves a gap of one frame in every 4. The first refusal cuts the complete
- * run to LEC_NLP_DECAY_FRAMES. After 3 pass frames, each later refusal meets
- * a run under 8 and zeroes it, so the processor never acts. At 8 kHz the
- * detector can fire on a gap frame, and its dt frames are refusals too. A
- * rule that keeps the run through a refused frame fails here, as does a
- * larger cut.
+ * The engage hysteresis against a flap: a gap in every 4 frames. The first
+ * refusal cuts the run to LEC_NLP_DECAY_FRAMES, and each later one meets a run
+ * under 8 and zeroes it, so the processor never acts. A run kept through a
+ * refusal, or a larger cut, fails.
  */
 static void nlp_hysteresis_test(unsigned rate)
 {
@@ -4208,12 +3880,10 @@ static void nlp_hysteresis_test(unsigned rate)
 }
 
 /*
- * The cost of the cut run at the boundary of the flap guard, on the line of
- * flap_run. The far end leaves a gap of one frame in every 5, so 4 pass
- * frames stand between two refusals. Each refusal cuts the complete run to
- * LEC_NLP_DECAY_FRAMES, and the 4th pass frame completes it again. The
- * processor therefore acts on exactly one frame per cycle. A run zeroed on
- * each refusal acts on none, and a run kept through it acts on all 4.
+ * The cut run at the boundary of the flap guard: a gap in every 5 frames. The
+ * 4th pass frame completes the cut run again, so the processor acts on one
+ * frame per cycle. A run zeroed on each refusal acts on none; a run kept
+ * through it acts on all 4.
  */
 static void nlp_flap_cost_test(unsigned rate)
 {
@@ -4235,12 +3905,16 @@ static void nlp_flap_cost_test(unsigned rate)
 }
 
 #define CYCLE_FRAMES		10u
+/* The near burst at the end of a cycle: its frames stand over the quiet bar by
+ * more than LEC_NLP_PEAK_RATIO, or the line has no floor. Its first frame
+ * therefore zeroes the run. */
+#define CYCLE_BURST_FRAMES	2u
 
 /*
  * One cycle of the engage-run cases: far frames of far-end noise, then
- * digital silence, with a near burst on the last frame of the cycle when
- * near_state is given. It returns the first frame of the cycle that reads
- * nlp_active, or CYCLE_FRAMES when none does.
+ * digital silence. When near_state is given, a near burst covers the last
+ * CYCLE_BURST_FRAMES frames of the cycle. It returns the first frame of the
+ * cycle that reads nlp_active, or CYCLE_FRAMES when none does.
  */
 static unsigned cycle_run(struct udsp_ec *ec, struct echo_path *path,
 			  uint32_t *state, unsigned far, uint32_t *near_state,
@@ -4254,7 +3928,7 @@ static unsigned cycle_run(struct udsp_ec *ec, struct echo_path *path,
 
 		if (p < far)
 			verdict_far_run(ec, path, state, 1u, acted);
-		else if (near_state && p + 1u == CYCLE_FRAMES)
+		else if (near_state && p + CYCLE_BURST_FRAMES >= CYCLE_FRAMES)
 			near_step(ec, path, PAUSE_BURST_DBM0, near_state,
 				  acted);
 		else
@@ -4269,13 +3943,10 @@ static unsigned cycle_run(struct udsp_ec *ec, struct echo_path *path,
 #define SPURT_CYCLES		20u
 
 /*
- * The complement of nlp_hysteresis_test: short far spurts with pauses, on the
- * settled fixture of that case. A cycle is 3 frames of far-end noise and 7
- * of digital silence, so each cycle holds 7 eligible frames, one short of the
- * run. Digital silence is echo-like, so a quiet frame keeps the run. A near
- * burst on the last frame before the first spurt zeroes it. The first spurt
- * therefore waits, and every later spurt acts from its first frame. A rule
- * that zeroes the run on a quiet frame with no far-end background fails here.
+ * The complement of nlp_hysteresis_test: cycles of 3 frames of far noise and 7
+ * of digital silence, 7 eligible frames, one short of the run. Silence is
+ * echo-like and keeps the run, and a near burst zeroes it before the first
+ * spurt, so only the first spurt waits. Zeroing the run on silence fails.
  */
 static void nlp_spurt_test(unsigned rate)
 {
@@ -4327,14 +3998,10 @@ static void nlp_spurt_test(unsigned rate)
 #define WAIT_BLOCKS		7u
 
 /*
- * The engage run of LEC_NLP_ON_FRAMES on the fixture of reset_test, at the
- * line rate. A cycle holds 4 frames of far-end noise and 6 of digital
- * silence: positions 0 to 7 pass, and 8 and 9 are quiet. Digital silence is
- * echo-like and keeps the run, and a near burst on position 9 of every third
- * cycle zeroes it. The next cycle waits 7 frames and acts on its 8th, and
- * every other cycle acts on its first frame. A wrong count of the engage
- * frame fails here. So does a rule that engages early, zeroes the run on
- * silence or keeps it through the burst.
+ * The engage run on the fixture of reset_test: cycles of 4 frames of far noise
+ * and 6 of silence keep the run. A near burst at the end of every third cycle
+ * zeroes it. The next cycle then acts on its 8th frame, and every other cycle
+ * on its first. A wrong count, an early engage or a wrong zeroing fails.
  */
 static void nlp_wait_count_test(unsigned rate)
 {
@@ -4398,9 +4065,9 @@ static void nlp_wait_count_test(unsigned rate)
 #define REFUSAL_DT_NEAR_DBM0	-15.0
 #define REFUSAL_ERL_STEP_DB	15.0
 #define REFUSAL_ERLE_FRAMES	40u
-/* A zeroed run acts on its 8th eligible frame (LEC_NLP_ON_FRAMES of
- * dsp/lec.c), 7 counted from 0. A run cut to LEC_NLP_DECAY_FRAMES acts on
- * the 4th eligible frame after the refusal, 3 counted from 0. */
+/* A zeroed run acts on its 8th eligible frame (LEC_NLP_ON_FRAMES of dsp/lec.c),
+ * 7 counted from 0. A run cut to LEC_NLP_DECAY_FRAMES acts on the 4th after the
+ * refusal, CUT_WAIT counted from 0. */
 #define REFUSAL_WAIT		7u
 #define CUT_WAIT		3u
 
@@ -4480,12 +4147,9 @@ static void refusal_print(const char *what, const struct refusal_watch *w)
 
 /*
  * From a complete run, a near burst 7 dB over the echo fires the detector on
- * far speech. The burst frames and the hangover after them read dt, and the
- * microphone of a hangover frame is echo-like. The first of these refusals
- * cuts the run to LEC_NLP_DECAY_FRAMES, and the next one zeroes it. The far
- * speech after the hangover must wait 7 eligible frames and act on the 8th.
- * A rule that keeps the run through a dt frame fails here, and
- * nlp_erle_wait_test covers echo-like refused frames.
+ * far speech. Its first dt refusal cuts the run to LEC_NLP_DECAY_FRAMES, and
+ * the next zeroes it. The far speech after the hangover then acts on its 8th
+ * eligible frame. A run kept through a dt frame fails here.
  */
 static void nlp_dt_wait_test(unsigned rate)
 {
@@ -4529,14 +4193,10 @@ static void nlp_dt_wait_test(unsigned rate)
 }
 
 /*
- * From a complete run, the hybrid of the frozen fixture turns 3 dB quieter
- * while the far end talks. The filter then predicts more echo than the line
- * returns, so each frame stays echo-like, and the tracked ERLE falls under the
- * gate. The frames read erle until the hybrid returns and the tracker climbs
- * back. The first erle frame cuts the run to LEC_NLP_DECAY_FRAMES, and the
- * next one zeroes it. The far speech must then wait 7 eligible frames after
- * the last erle frame and act on the 8th. A rule that keeps the run through
- * an echo-like refused frame fails here.
+ * From a complete run, the hybrid turns 3 dB quieter under far speech, so the
+ * frames stay echo-like and read erle until it returns. The first erle frame
+ * cuts the run, and the next zeroes it. The far speech then acts on the 8th
+ * eligible frame after the last erle frame. A run kept through it fails.
  */
 static void nlp_erle_wait_test(unsigned rate)
 {
@@ -4597,13 +4257,10 @@ static void cut_leg_run(struct udsp_ec *ec, struct echo_path *path,
 }
 
 /*
- * The cut of a complete run, on the fixture of nlp_hysteresis_test. A single
- * unlike frame inside far speech cuts the run to LEC_NLP_DECAY_FRAMES, so
- * the processor acts on the 4th eligible frame after it. Of two unlike frames
- * with one pass frame between them, the second meets a run under 8 and
- * zeroes it. The processor then acts on the 8th eligible frame after it. A
- * run zeroed on every refusal fails the first leg, and a run kept through a
- * refusal fails both.
+ * The cut of a complete run: one unlike frame in far speech cuts it, so the
+ * processor acts on the 4th eligible frame after it. A second unlike frame one
+ * pass frame later zeroes it, so the processor acts on the 8th. A run zeroed on
+ * every refusal fails the first leg, and a run kept through one fails both.
  */
 static void nlp_cut_test(unsigned rate)
 {
@@ -4671,14 +4328,13 @@ static void peak_tap_test(unsigned rate)
 	}
 }
 
+#define RESET_RETURN_FRAMES	40u
+
 /*
- * The reset forgets the verdicts with the frames, because they describe one
- * alignment of the reference, and it forgets the peak with the filter. A
- * far-end pause and a near talker follow the fixture of reset_test, so each
- * of the six counts stands above 0 before the reset. So does the count of the
- * double-talk frames the detector fired on. A reset that leaves one of them,
- * or the peak, standing fails here. The trial and watchdog counters keep
- * their lifetime meaning.
+ * The reset forgets the verdict counts, which describe one alignment of the
+ * reference, and the peak with the filter. A pause, a near talker and a far
+ * return raise each count over 0 first. Trial and watchdog counters keep their
+ * lifetime meaning.
  */
 static void reset_count_test(void)
 {
@@ -4702,6 +4358,7 @@ static void reset_count_test(void)
 		noise_fill(near, UDSP_FRAME_SAMPLES, -15.0, &near_state);
 		verdict_step(ec, &path, ref, near, &acted);
 	}
+	verdict_far_run(ec, &path, &state, RESET_RETURN_FRAMES, &acted);
 	udsp_ec_nlms_info_get(ec, &before);
 	printf("# before the reset: active %u wait %u erle %u unlike %u "
 	       "dt %u fired %u quiet %u peak %u\n", before.nlp_active_frames,
@@ -4740,15 +4397,10 @@ static void reset_count_test(void)
 #define RAMP_DWELL_FRAMES	10u
 
 /*
- * The case covers the plain zero branch of the divergence watchdog; a trial
- * abort instead restores the snapshot and leaves energy in the filter. After
- * convergence the hybrid grows louder in 0.5 dB steps, each once the tracked
- * ERLE is back at 24 dB. The ERLE stays above 18 dB, so the detector stays
- * quiet; plain adaptation carries the coefficient energy past
- * LEC_COEF_ENERGY_MAX outside any trial. A zero branch that leaves the peak
- * standing fails. The ramp uses the 16 ms tail: talk_scale_get cuts the step
- * by the hybrid gain over the 6 dB assumption. In 10 s, a 48 ms tail reaches
- * -3.5 dB of ERL; the 16 ms tail trips the watchdog at -7 dB after 8.1 s.
+ * The plain zero branch of the watchdog: the hybrid grows louder in 0.5 dB
+ * steps while the ERLE stays over 18 dB. Plain adaptation, outside a trial,
+ * then carries the energy past LEC_COEF_ENERGY_MAX. The 16 ms tail reaches it
+ * within 10 s; a zero branch that leaves the peak standing fails.
  */
 static void divergence_peak_test(void)
 {
@@ -4949,15 +4601,10 @@ static void feed_skip_check(void)
 }
 
 /*
- * Two instances take the same frames; over a pause A runs frozen and B takes
- * the reference feed. On one frozen frame the outputs must match sample for
- * sample: with the taps held, only the history can differ. The match is exact:
- * a level bar on a converging filter cannot tell a stale window from the
- * spread between frames. The match misses the window ring, which never reaches
- * the estimate; fresh instances fed loud frames must not count the next silent
- * frame as quiet. Fed zeros keep the exact window sum, so a zero frame takes
- * the skip path once they cover the history. A fresh history is zero, so a
- * feed that pushed nothing would skip one frame early.
+ * Instance A runs frozen over a pause and B takes the reference feed: on one
+ * frozen frame the outputs must match sample for sample, so only the history
+ * differs. Fresh instances fed loud frames must not count the next silent frame
+ * as quiet, and fed zeros must reach the skip path exactly.
  */
 static void ref_feed_test(void)
 {
@@ -4968,15 +4615,11 @@ static void ref_feed_test(void)
 }
 
 /*
- * The main reflection of the composite hybrid starts 4 ms into the response,
- * and the case moves the reference against the drive. The onset then stands
- * 2 ms after tap 0, one period after it, or 1 ms before it. The delay sits on
- * the side that lags, so the echo before tap 0 stays in the microphone.
- *
- * The first two runs must read within 1 dB, and the third must read under
- * half of the first and under 3 dB. The millisecond before tap 0 holds 63 to
- * 65 percent of the echo energy, so no filter gains more than 2.0 dB. Each run
- * takes 3 s, because the start of a run depends on the initial history.
+ * The case moves the reference against the echo onset of the composite hybrid.
+ * The onset stands 2 ms after tap 0, a period after it, or 1 ms before it. The
+ * first two runs read within 1 dB; the third under half the first and under
+ * 3 dB, because the echo before tap 0 stays in the microphone. Each run takes
+ * 3 s.
  */
 static void ref_offset_test(unsigned rate)
 {
@@ -5041,12 +4684,10 @@ static void peak_zero_test(void)
 }
 
 /*
- * Two taps of equal magnitude report the first of them. The reference is one
- * impulse on sample 0, so sample i of the frame updates tap i alone, against
- * that one reference sample. The microphone carries +1000 on sample 20 and
- * -1000 on sample 50, so both taps take the same error magnitude and tie. The
- * first index wins a tie, so the peak reads tap 20. The frame must count no
- * hold, so the update stands.
+ * Two taps of equal magnitude report the first. One reference impulse on sample
+ * 0 and a microphone of +1000 on sample 20 and -1000 on sample 50 are the line.
+ * They give two taps the same error magnitude. The peak reads tap 20. The frame
+ * must count no hold, so the update stands.
  */
 static void peak_tie_test(void)
 {
@@ -5170,13 +4811,11 @@ static void trial_watch_print(const char *what, const struct trial_watch *w)
 #define PAUSE_LAST_FRAME	620u
 
 /*
- * A latch that comes due in a far-end pause starts its trial on the next
- * active frame. The hybrid steps from 12 dB to 3 dB of loss under a converged
- * filter. A near-end floor 6 dB under the echo joins the line. The detector
- * holds every frame, and the run reaches the latch inside a pause of 20
- * frames. The trial must start on frame 510, the first active frame after
- * the pause, and it must stand. A compare of the smoothed residual echo alone
- * would refuse it, and the test checks that from the frames it passes in.
+ * A latch that comes due in a far pause starts its trial on the next active
+ * frame. The hybrid steps from 12 dB to 3 dB under a converged filter and a
+ * near floor 6 dB under the echo. The trial must start on frame 510, after a
+ * pause of 20 frames, and stand, as the ratio rule and not the echo alone
+ * keeps.
  */
 static void latch_pause_test(void)
 {
@@ -5268,14 +4907,10 @@ static void syllable_run(struct udsp_ec *ec, struct echo_path *path,
 }
 
 /*
- * A trial is judged by the ratio of the residual echo to the microphone, not
- * by the residual echo alone. The far end follows a syllabic envelope with a
- * swing of 14 dB. At 3.5 cycles per second, a trial of 100 frames ends half a
- * cycle from its start. A trial on a hybrid 2.5 dB louder converges and must
- * stand, although it ends on a loud syllable. A trial on a near talker 3 dB
- * over the echo must fall and give back its snapshot, although it ends on a
- * quiet syllable. Each case also checks that a compare of the smoothed
- * residual echo alone would judge it the other way.
+ * A trial is judged by residual echo over microphone, not by the echo alone. On
+ * a far end with a 14 dB syllabic swing, a trial on a hybrid 2.5 dB louder
+ * stands on a loud syllable. A talker level with a hybrid turned 3 dB louder
+ * reads a changed path, and its trial falls on a quiet syllable.
  */
 static void probe_syllable_test(void)
 {
@@ -5311,6 +4946,7 @@ static void probe_syllable_test(void)
 	udsp_ec_nlms.nlp(ec, false);
 	path_flat_init(&path, UDSP_SAMPLE_RATE, 8, 12.0);
 	(void)erle_run(ec, &path, &state, -10.0, SYLLABLE_TRAIN_FRAMES, 20);
+	path_erl_set(&path, 9.0);
 	syllable_run(ec, &path, &state, &talker, 19u, &quiet);
 	udsp_ec_nlms.destroy(ec);
 
@@ -5339,13 +4975,9 @@ static double floor_dbov_get(double dbm0)
 
 /*
  * A trial takes an onset after a silent tail at a bounded step. A hot hybrid
- * behind a 12 ms bulk delay latches the detector over a near-end floor at
- * -40 dBm0. The trial adapts for 20 frames, then the reference falls silent
- * until the filter window holds no energy. An onset at -48 dBm0 under the
- * floor follows, and the bulk delay keeps its echo out of that frame. The
- * error on the onset frame is the floor alone, and the tracked floor in the
- * step denominator bounds the update. The onset frame must adapt, and the
- * coefficient energy must move by less than 0.001.
+ * behind a 12 ms bulk delay latches over a floor at -40 dBm0, and the reference
+ * goes silent. An onset at -48 dBm0 then carries the floor alone as error. The
+ * onset frame adapts, and the coefficient energy moves by less than 0.001.
  */
 static void probe_onset_test(void)
 {
@@ -5402,18 +5034,257 @@ static void probe_onset_test(void)
 	udsp_ec_nlms.destroy(ec);
 }
 
+/* G.168 test 3C t1 and t2, a trial on taps with no echo evidence. The composite
+ * hybrid carries white far bursts from a third into a frame, and two near
+ * sources talk from the start. The latch starts at 5 s. */
+#define BARE_FAR_DBM0		-20.0
+#define BARE_ERL_DB		6.0
+#define BARE_LOSS_HALF_DB	18u
+#define BARE_NEAR_OVER_DB	6.0
+#define BARE_FLOOR_DBM0		-70.0
+#define BARE_TAIL_MS		64u
+#define BARE_ON_MS		230u
+#define BARE_OFF_MS		70u
+#define BARE_LEAD_MS		2u
+#define BARE_LEAD_DB		30.0
+
+struct bare_line {
+	struct echo_path path;
+	struct udsp_ec *ec;
+	unsigned rate;
+	unsigned frame;
+	unsigned long pos;
+	unsigned long near_phase[2];
+	uint32_t far_state;
+	uint32_t near_state[2];
+	uint32_t hiss;
+	bool pause;
+};
+
+static void bare_line_init(struct bare_line *l, unsigned rate)
+{
+	memset(l, 0, sizeof(*l));
+	l->rate = rate;
+	l->frame = rate / 100u;
+	l->pos = l->frame * 2u / 3u;
+	l->near_phase[1] = rate / 4u;
+	l->far_state = 0x13572468u;
+	l->near_state[0] = 0x2468ace0u;
+	l->near_state[1] = 0x0badcafeu;
+	l->hiss = 0x2468acefu;
+	path_composite_init(&l->path, rate, BARE_ERL_DB);
+	l->ec = udsp_ec_nlms.create_rate(BARE_TAIL_MS, rate);
+	udsp_ec_nlms_ref_loss_set(l->ec, BARE_LOSS_HALF_DB);
+}
+
+/* One frame of the far end at the line: the burst, its lead and the
+ * silence between bursts, or silence alone while pause is set. */
+static void bare_far_fill(struct bare_line *l, int16_t *drive)
+{
+	unsigned long period = (BARE_ON_MS + BARE_OFF_MS) * l->rate / 1000u;
+	unsigned long on = BARE_ON_MS * l->rate / 1000u;
+	unsigned long lead = BARE_LEAD_MS * l->rate / 1000u;
+	double low = pow(10.0, -BARE_LEAD_DB / 20.0);
+	int16_t noise[UDSP_FRAME_MAX];
+	unsigned i;
+
+	noise_fill(noise, l->frame, BARE_FAR_DBM0, &l->far_state);
+	for (i = 0; i < l->frame; i++) {
+		unsigned long p = (l->pos + i) % period;
+
+		drive[i] = !l->pause && p < on ?
+			   sample_clamp((p < lead ? low : 1.0) * noise[i]) : 0;
+	}
+	l->pos += l->frame;
+}
+
+/* One frame of the line, with the near talker when talk is set. */
+static void bare_frame_run(struct bare_line *l, bool talk,
+			   struct udsp_ec_nlms_frame *reading,
+			   struct udsp_ec_nlms_info *info)
+{
+	double loss = pow(10.0, -(double)BARE_LOSS_HALF_DB / 40.0);
+	double near_dbm0 = BARE_FAR_DBM0 - BARE_ERL_DB + BARE_NEAR_OVER_DB;
+	int16_t drive[UDSP_FRAME_MAX];
+	int16_t ref[UDSP_FRAME_MAX];
+	int16_t echo[UDSP_FRAME_MAX];
+	int16_t floor[UDSP_FRAME_MAX];
+	int16_t near[2][UDSP_FRAME_MAX];
+	int16_t mic[UDSP_FRAME_MAX];
+	unsigned i;
+
+	bare_far_fill(l, drive);
+	css_fill(near[0], l->frame, near_dbm0, &l->near_state[0],
+		 &l->near_phase[0], l->rate);
+	css_fill(near[1], l->frame, near_dbm0, &l->near_state[1],
+		 &l->near_phase[1], l->rate);
+	path_run(&l->path, drive, echo);
+	noise_fill(floor, l->frame, BARE_FLOOR_DBM0, &l->hiss);
+	for (i = 0; i < l->frame; i++) {
+		double talker = talk ? (double)near[0][i] + near[1][i] : 0.0;
+
+		ref[i] = sample_clamp(loss * drive[i]);
+		mic[i] = sample_clamp((double)echo[i] + floor[i] + talker);
+	}
+	udsp_ec_nlms.run(l->ec, mic, ref);
+	udsp_ec_nlms_frame_get(l->ec, reading);
+	udsp_ec_nlms_info_get(l->ec, info);
+}
+
+/* The near end talks BARE_TALK_AFTER frames into the trial, then the far end
+ * runs alone for the 1.4 s of t2. BARE_REF_FRAMES of far end alone give the
+ * echo's coefficient energy. */
+#define BARE_TALK_AFTER		57u
+#define BARE_ALONE_FRAMES	140u
+#define BARE_LATCH_LIMIT	(8u * FRAMES_PER_SECOND)
+#define BARE_REF_FRAMES		(7u * FRAMES_PER_SECOND)
+#define BARE_COEF_RATIO		2.0
+#define BARE_ERLE_DB		18.0
+
+struct bare_figures {
+	float echo_coef;
+	float keep_coef;
+	float rise;
+	float erle_db;
+	unsigned start;
+	unsigned end;
+	unsigned arm;
+	unsigned how;
+};
+
+static void bare_run(unsigned rate, struct bare_figures *fig)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct bare_line l;
+	unsigned talk = BARE_LATCH_LIMIT;
+	float before = 0.0f;
+	unsigned f;
+
+	memset(fig, 0, sizeof(*fig));
+	bare_line_init(&l, rate);
+	for (f = 0; f < BARE_REF_FRAMES; f++)
+		bare_frame_run(&l, false, &reading, &info);
+	fig->echo_coef = info.coef_energy;
+	udsp_ec_nlms.destroy(l.ec);
+	bare_line_init(&l, rate);
+	for (f = 0; f < talk + BARE_ALONE_FRAMES; f++) {
+		bare_frame_run(&l, f < talk, &reading, &info);
+		if (!fig->arm && reading.trial_arm) {
+			fig->arm = reading.trial_arm;
+			fig->start = f;
+			talk = f + BARE_TALK_AFTER;
+		} else if (fig->arm && !fig->how) {
+			if (info.coef_energy - before > fig->rise)
+				fig->rise = info.coef_energy - before;
+			if (reading.trial_end) {
+				fig->how = reading.trial_end;
+				fig->end = f;
+				fig->keep_coef = info.coef_energy;
+			}
+		}
+		before = info.coef_energy;
+	}
+	fig->erle_db = info.erle_db;
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/* The latch run at which the near end of bare_snapshot_run stops, short of
+ * LEC_GEIGEL_LATCH_MAX of dsp/lec.c by less than one hangover. */
+#define BARE_SNAP_RUN		481u
+
+/*
+ * The line of bare_run with the latch due on a frame that adapts and fires
+ * (probe_snapshot_test): that frame starts the trial, and its update rolls
+ * back. fig takes the figures of bare_run; before and start the coefficient
+ * energy before and after the start frame.
+ */
+static void bare_snapshot_run(unsigned rate, struct bare_figures *fig,
+			      float *before, float *start)
+{
+	unsigned long period = (BARE_ON_MS + BARE_OFF_MS) * rate / 1000u;
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct bare_line l;
+	unsigned talk = BARE_LATCH_LIMIT;
+	float last = 0.0f;
+	unsigned f;
+
+	memset(fig, 0, sizeof(*fig));
+	*before = 0.0f;
+	*start = 0.0f;
+	bare_line_init(&l, rate);
+	for (f = 0; f < BARE_REF_FRAMES; f++)
+		bare_frame_run(&l, false, &reading, &info);
+	fig->echo_coef = info.coef_energy;
+	udsp_ec_nlms.destroy(l.ec);
+	bare_line_init(&l, rate);
+	for (f = 0; f < talk + BARE_ALONE_FRAMES; f++) {
+		bare_frame_run(&l, !l.pause && f < talk, &reading, &info);
+		if (!fig->arm && !l.pause && reading.dt_fired &&
+		    reading.dt_run >= BARE_SNAP_RUN) {
+			l.pause = true;
+		} else if (l.pause && !info.double_talk) {
+			l.pause = false;
+			l.pos = (l.pos / period + 1u) * period - l.frame / 3u;
+		}
+		if (!fig->arm && reading.trial_arm) {
+			fig->arm = reading.trial_arm;
+			fig->start = f;
+			*before = last;
+			*start = info.coef_energy;
+			talk = f + BARE_TALK_AFTER;
+		} else if (fig->arm && !fig->how) {
+			if (info.coef_energy - last > fig->rise)
+				fig->rise = info.coef_energy - last;
+			if (reading.trial_end) {
+				fig->how = reading.trial_end;
+				fig->end = f;
+				fig->keep_coef = info.coef_energy;
+			}
+		}
+		last = info.coef_energy;
+	}
+	fig->erle_db = info.erle_db;
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/*
+ * A trial on taps without echo evidence: the first trial is a latch trial, kept
+ * at BARE_COEF_RATIO times the echo's coefficient energy or less. The ERLE
+ * after the far end alone reaches BARE_ERLE_DB. Without the step floor of such
+ * a trial, the burst after silence drives it diverged on the talker.
+ */
+static void trial_bare_test(unsigned rate)
+{
+	struct bare_figures fig;
+
+	bare_run(rate, &fig);
+	case_rate(rate, "lec trial on taps without echo evidence keeps a "
+		  "filter of the echo on a line that starts in double talk");
+	printf("# echo coefficient energy %.3f; first trial arm %u from frame "
+	       "%u, end %u on frame %u, coefficient energy %.3f at its end, "
+	       "%.2f of the echo; largest rise in one frame %.3f; ERLE %.1f dB "
+	       "after %u frames of the far end alone\n", fig.echo_coef,
+	       fig.arm, fig.start, fig.how, fig.end, fig.keep_coef,
+	       fig.keep_coef / fig.echo_coef, fig.rise, fig.erle_db,
+	       BARE_ALONE_FRAMES);
+	CHECK_UINT(fig.arm, UDSP_EC_NLMS_TRIAL_ARM_LATCH);
+	CHECK(fig.start < BARE_LATCH_LIMIT);
+	CHECK_UINT(fig.how, UDSP_EC_NLMS_TRIAL_END_KEPT);
+	CHECK(fig.keep_coef <= BARE_COEF_RATIO * fig.echo_coef);
+	CHECK(fig.erle_db >= BARE_ERLE_DB);
+}
+
 #define WINDOW_BURST_FRAMES	50u
 #define WINDOW_PAUSE_FRAMES	8u
 #define WINDOW_FLOOR_DBM0	-40.0
 
 /*
- * The canceller measures the near-end floor only once its whole reference
- * window is quiet. Adaptation stays held, and a far-end burst behind a 40 ms
- * bulk delay starts on the first frame, so no quiet window comes first. The
- * echo tail then fills the first four frames of the pause, 18 dB over a
- * near-end floor at -40 dBm0. The test checks that the first of those frames
- * carries the echo. After eight frames of pause, the tracked floor must read
- * the near-end level within 1 dB.
+ * The floor is measured only on a whole quiet window. A far burst behind a
+ * 40 ms bulk delay starts on the first frame. Its tail fills four pause frames
+ * 18 dB over a floor at -40 dBm0. After eight pause frames the tracked floor
+ * must read the near level within 1 dB.
  */
 static void noise_floor_window_test(void)
 {
@@ -5485,15 +5356,10 @@ static void nlp_floor_step(struct udsp_ec *ec, struct echo_path *path,
 }
 
 /*
- * The processor stays engaged over a near-end floor 8 dB under the echo. A
- * converged filter on a 30 dB hybrid gets far-end bursts of 100 ms, 30 ms gaps
- * and a floor at -48 dBm0. The last two frames of each gap carry the floor
- * alone, and the echo-likeness test counts the tracked floor with its
- * headroom as their echo. The headroom covers the floor's excursion and a
- * seed less than 1 dB under the true level. The processor must act on 29 of
- * 32 gap frames: all 32 on this seed, and about 78 percent without the
- * headroom. A near talker 8 dB over the floor must still release it, and the
- * detector must stay clear.
+ * The processor stays engaged over a near floor 8 dB under the echo. In the
+ * gaps of far bursts, the echo-likeness test counts the floor with its headroom
+ * as echo. The processor acts on 29 of 32 gap frames or more. A near talker
+ * 8 dB over the floor still releases it, and the detector stays clear.
  */
 static void nlp_floor_test(void)
 {
@@ -5602,14 +5468,10 @@ static void reading_frame_run(struct udsp_ec *ec, struct echo_path *path,
 }
 
 /*
- * The frame reading on the fixture of nlp_dt_count_test. The far end alone
- * raises no verdict in one second, at an ERLE under the 18 dB trust line. One
- * near-end frame at -15 dBm0 then fires with a hold of 0. The hangover keeps
- * double talk for the next 23 far-end frames, so the lone verdict counts 24
- * double-talk frames and 1 fired frame. The reading fires on exactly the
- * frames where the microphone reaches the bar. A late hold read, a fired
- * count of hold frames, a stale fired flag or an unset verdict word fails
- * here.
+ * The frame reading: one near frame at -15 dBm0 fires with a hold of 0 after a
+ * far end that raises no verdict. The hangover keeps 23 more frames, so the
+ * verdict counts 24 dt frames and 1 fired frame. The reading fires exactly
+ * where the microphone reaches the bar.
  */
 static void reading_verdict_test(void)
 {
@@ -5677,13 +5539,10 @@ static void reading_verdict_test(void)
 }
 
 /*
- * The window count of the frame reading on a 48 ms instance from silence.
- * The window covers 5 frames at both rates, so 3 loud frames keep it active
- * for 4 zero frames after them. The count reads 1 to 3 on the loud frames and
- * 4 on the first zero frame. That frame is the tail: the window is active and
- * the frame's own reference is quiet. The fifth zero frame empties the window
- * and ends both. A count that is never reset and a tail read from the window
- * alone fail here.
+ * The window count of a 48 ms instance: the window covers 5 frames, so 3 loud
+ * frames keep it active for 4 zero frames. The count reads 1 to 3, then 4 on
+ * the first zero frame, the tail; the fifth zero frame ends both. A count that
+ * never resets, or a tail read from the window alone, fails.
  */
 static void reading_window_test(unsigned rate)
 {
@@ -5749,12 +5608,9 @@ static void reading_reset_test(void)
 
 #define READING_PAUSE_FRAMES	10u
 #define READING_FAR_FRAMES	20u
-/*
- * The far-end training of the floor fixture, and the longer training after
- * which the trust count of dsp/lec.c is complete. A case that reads a bar of
- * the trusted estimate takes the longer one. The training carries no near
- * floor, so the tracked ERLE stays over the trust line while the count runs.
- */
+/* The far-end training of the floor fixture, and the longer one that completes
+ * the trust count of dsp/lec.c for a case on a trusted bar. With no near floor
+ * the tracked ERLE stays over the trust line while the count runs. */
 #define READING_TRAIN_FRAMES	150u
 #define READING_TRUST_TRAIN_FRAMES	250u
 
@@ -5777,15 +5633,10 @@ static unsigned reading_floor_frames_run(struct udsp_ec *ec,
 }
 
 /*
- * The floor term of the bar, on the fixture of reset_count_test with a
- * near-end floor at -40 dBm0. The fixture trains until the trust count of
- * dsp/lec.c completes, so the estimate sets the bar. The tracker needs 5
- * frames of a far-end pause to measure the floor, and the pause lasts 10.
- * Far-end frames and a second pause follow, and its first tail frame still
- * carries the echo of the 8 ms hybrid. On the first tail frame with an
- * estimate under half the floor, the bar must reach the margin times the
- * headroom times the floor. A bar taken before the floor term, a bar without
- * the headroom, or a fired flag that disagrees with the bar, fails here.
+ * The floor term of the bar: trained until the trust count completes, with a
+ * floor at -40 dBm0 measured in a pause. On the first tail frame with an
+ * estimate under half the floor, the bar reaches the margin times the headroom
+ * times the floor. A bar without either term, or a disagreeing flag, fails.
  */
 static void reading_floor_test(void)
 {
@@ -5830,11 +5681,9 @@ static void reading_floor_test(void)
 	       (double)tail.estimate_power, (double)tail.bar,
 	       (double)tail.noise_power);
 	CHECK(tail.ref_quiet);
-	/* 1.41 is LEC_GEIGEL_MARGIN and 2.0 LEC_GEIGEL_FLOOR_HEADROOM of
-	 * dsp/lec.c. The bar is every term plus the floor with its headroom,
-	 * times the margin. It therefore never sits under the margin times the
-	 * headroom times the floor. A bar without the floor term, or without
-	 * the headroom, can. */
+	/* 1.41 is LEC_GEIGEL_MARGIN and 2.0 LEC_GEIGEL_FLOOR_HEADROOM: the bar
+	 * is every term plus the floor with its headroom, times the margin, so
+	 * it never stands under their product with the floor. */
 	CHECK(tail.bar >= 1.41f * 2.0f * tail.noise_power);
 	CHECK_UINT(bar_miss, 0);
 	udsp_ec_nlms.destroy(ec);
@@ -6030,12 +5879,10 @@ static void hangover_short_check(const struct udsp_ec_nlms_frame *verdict)
 }
 
 /*
- * A floor excursion on the fixture of reading_floor_test. A far end at
- * -45 dBm0 keeps the window active and puts the estimate under the floor. One
- * near-end frame then reaches the bar by less than 3 dB, within 12 dB of the
- * floor. It sets a hangover of 4 frames, so double talk lasts for 3 far-end
- * frames and ends on the fourth. A detector that gives every verdict a
- * hangover of 24 frames fails here.
+ * A floor excursion: a far end at -45 dBm0 puts the estimate under the floor.
+ * One near frame within 3 dB of the bar and 12 dB of the floor sets a hangover
+ * of 4 frames. Double talk ends on the fourth far frame. A detector that
+ * gives every verdict 24 frames fails here.
  */
 static void hangover_floor_test(void)
 {
@@ -6111,14 +5958,9 @@ static void hangover_loud_test(void)
 	udsp_ec_nlms.destroy(line.ec);
 }
 
-/*
- * A verdict inside a running hangover, on the fixture of hangover_floor_test.
- * A floor excursion sets a hangover of 4 frames. On the next frame a second
- * excursion meets that hangover and the repeat limit, and sets the long
- * hangover. It stands under twice the bar and within 12 dB of the floor. A
- * detector with neither the hangover check nor the repeat limit gives it the
- * short hangover and fails here.
- */
+/* A verdict inside a running hangover: a second excursion on the frame after
+ * the first meets the hangover and the repeat limit. It takes the long one,
+ * although it stands within the marginal and soft bounds. */
 static void hangover_rearm_test(void)
 {
 	struct udsp_ec_nlms_info before, after;
@@ -6274,14 +6116,10 @@ static bool hangover_talk_step(struct hangover_line *line, double near_dbm0,
 #define HANGOVER_TALK_ADAPT_MAX		8u
 
 /*
- * The talker of doubletalk_probe stands 3 dB over the echo of a 12 dB hybrid.
- * The filter converges with a near-end floor 12 dB under the echo on the
- * line, and a far-end pause measures that floor. The floor keeps the tracked
- * ERLE under 18 dB, so the detector uses the loose classic bar. The first
- * talk frames stand under that bar and adapt: 5 on this seed, all before the
- * first verdict. Every verdict stands 16 to 18 dB over the floor, so the soft
- * ratio alone gives it the long hangover. The case fails when more than 8 of
- * the 300 talk frames adapt.
+ * The talker of doubletalk_probe, 3 dB over the echo of a 12 dB hybrid. The
+ * line's floor, 12 dB under the echo, keeps the ERLE under the trust line. Its
+ * verdicts stand far over the floor, so the soft ratio gives the long hangover.
+ * The case fails when more than 8 of the 300 talk frames adapt.
  */
 static void hangover_talker_test(void)
 {
@@ -6332,14 +6170,9 @@ static void hangover_talker_test(void)
 
 #define HANGOVER_HEADROOM_DBM0	-37.0
 
-/*
- * The upper bound of the floor headroom, on the fixture of
- * reading_floor_test, trained until the trust count completes. The far end
- * stops, and the second frame of the pause is a tail frame whose estimate is
- * under half the floor. The bar there stands 4.5 dB over the floor. A near-end
- * frame 5.5 dB over the floor must fire. A headroom of 3 puts the bar 6.3 dB
- * over the floor and fails here.
- */
+/* The upper bound of the floor headroom: on a tail frame with an estimate under
+ * half the floor, the bar stands 4.5 dB over the floor. A near frame 5.5 dB
+ * over it fires. A headroom of 3 puts the bar 6.3 dB over and fails. */
 static void hangover_headroom_test(void)
 {
 	struct udsp_ec_nlms_frame reading;
@@ -6392,12 +6225,10 @@ static void hangover_repeat_run(unsigned n, struct hangover_result *result)
 }
 
 /*
- * The repeat limit, on the fixture of hangover_floor_test. A floor excursion
- * sets a hangover of 4 frames, and far-end frames with no verdict follow. A
- * second excursion 24 frames after the first counts 23 frames without a
- * verdict, under the limit of 24, and takes the long hangover. One 25 frames
- * after the first takes the short hangover again. A talker whose marginal
- * frames fire every few frames therefore meets the long hangover.
+ * The repeat limit: an excursion 24 frames after the first counts 23 frames
+ * without a verdict, under the limit, and takes the long hangover. One 25
+ * frames after takes the short one. A talker that fires every few frames meets
+ * the long hangover.
  */
 static void hangover_repeat_test(void)
 {
@@ -6416,14 +6247,9 @@ static void hangover_repeat_test(void)
 	CHECK_UINT(result.fired, 1);
 }
 
-/*
- * The start of the repeat count. A reset keeps the measured floor and puts
- * the count back at the limit. An excursion on the frame after a reset
- * therefore takes the short hangover. A fresh instance starts at the limit
- * too. A far-end pause of 10 frames measures its floor, and an excursion on
- * frame 14 takes the short hangover. A count that starts at 0 gives either
- * excursion the long hangover.
- */
+/* The start of the repeat count: a reset keeps the floor and puts the count
+ * back at the limit, and a fresh instance starts there too. An excursion just
+ * after either takes the short hangover. A count that starts at 0 fails. */
 static void hangover_repeat_start_test(void)
 {
 	struct udsp_ec_nlms_frame reading;
@@ -6474,13 +6300,10 @@ static void hangover_repeat_start_test(void)
 #define HANGOVER_SPARSE_ADAPT_MAX	498u
 
 /*
- * A talker who fires every fifth frame, which the repeat limit must cover.
- * A 24 dB hybrid carries a far end at -20 dBm0 over a floor at -45 dBm0 that
- * a far-end pause measures. Every fifth near-end frame is at -36 dBm0 and the
- * frames between are at -50 dBm0. A verdict within 24 frames of the last one
- * takes the long hangover. On this seed 400 of the 415 adapted frames fall in
- * the 4 trials of the latch escape. Without the repeat limit, 2930 of the 3000
- * talk frames adapt.
+ * A talker who fires every fifth frame: a 24 dB hybrid and a far end at -20
+ * dBm0 over a floor at -45 dBm0. Every fifth near frame stands at -36 dBm0 over
+ * -50. The repeat limit gives its verdicts the long hangover, so few talk
+ * frames adapt outside the trials of the latch.
  */
 static void hangover_sparse_test(void)
 {
@@ -6518,16 +6341,9 @@ static void hangover_sparse_test(void)
 	udsp_ec_nlms.destroy(line.ec);
 }
 
-/*
- * The call of the replay cases. Far-end bursts of noise pass through the
- * composite hybrid, a near-end floor is on every frame, and near-end bursts
- * over the far end fire the detector. The first instance has one reset, one
- * freeze stretch, one stretch with the processor off and one stretch of FEED
- * records for an open loop. It also has one skip of the engine: the tick
- * jumps, the instance sees nothing, and the next record carries SKIPPED and
- * the count. The second instance starts on FEED records for an inactive
- * stream.
- */
+/* The call of the replay cases: far noise bursts through the composite hybrid
+ * over a near floor, and near bursts that fire the detector. The first instance
+ * adds a reset, a freeze, the processor off, FEED records and a skip. */
 #define REPLAY_PERIOD		70u
 #define REPLAY_FAR_ON		40u
 #define REPLAY_FAR_DBM0		-10.0
@@ -6705,12 +6521,12 @@ static bool replay_stretch_get(unsigned f, unsigned from, unsigned frames)
 	return f >= from && f < from + frames;
 }
 
-static bool replay_call_build(struct replay_call *c, unsigned rate)
+/* The line of a synthetic call, with room for records records. */
+static bool replay_call_init(struct replay_call *c, unsigned rate,
+			     unsigned records)
 {
-	unsigned f;
-
 	memset(c, 0, sizeof(*c));
-	c->recs = calloc(REPLAY_RECORDS, sizeof(*c->recs));
+	c->recs = calloc(records, sizeof(*c->recs));
 	if (!c->recs)
 		return false;
 	c->rate = rate;
@@ -6718,6 +6534,15 @@ static bool replay_call_build(struct replay_call *c, unsigned rate)
 	c->floor_state = 0x2468ace0u;
 	c->near_state = 0x0badcafeu;
 	path_composite_init(&c->path, rate, REPLAY_ERL_DB);
+	return true;
+}
+
+static bool replay_call_build(struct replay_call *c, unsigned rate)
+{
+	unsigned f;
+
+	if (!replay_call_init(c, rate, REPLAY_RECORDS))
+		return false;
 	for (f = 0; f < REPLAY_FIRST_FRAMES; f++) {
 		if (f == REPLAY_SKIP_AT) {
 			c->tick += REPLAY_SKIP_TICKS;
@@ -6764,12 +6589,9 @@ static bool replay_file_write(const struct lecr_record *recs, unsigned count,
 	return ok;
 }
 
-/*
- * What the replay of a file saw. twin_frames counts the RUN frames on which
- * neither this frame nor the one before read ACTIVE. On them the processor
- * left the residual alone, so the shadow output must equal the replay
- * output.
- */
+/* What the replay of a file saw. twin_frames counts the RUN frames on which
+ * neither this frame nor the one before read ACTIVE, where the shadow output
+ * must equal the replay output. */
 struct replay_seen {
 	struct lecr_segment seg[REPLAY_SEGMENTS];
 	unsigned segments;
@@ -6836,9 +6658,8 @@ static int replay_buffer_run(char *buf, size_t size, bool shadow,
 	return replay_buffer_skip_run(buf, size, shadow, 0, a, seen);
 }
 
-/* A copy of the records of a call that the caller edited, through the
- * writer and the replay. The answer is false when the file was not
- * written. */
+/* A copy of the records of a call that the caller edited, through the writer
+ * and the replay. The answer is false when the writer fails. */
 static bool replay_recs_run(const struct replay_call *c,
 			    const struct lecr_record *recs, unsigned skip_s,
 			    struct lecr_agree *a, struct replay_seen *seen)
@@ -6919,11 +6740,10 @@ static void replay_bytes_check(const uint8_t *b, const struct lecr_record *rec)
 }
 
 /*
- * The file of the synthetic call through the writer and the reader. The
- * file header carries the magic, version 2, the rate, the samples, the count
- * and the NEW flag at the offsets of the table. Every record reads back equal
- * to the record written. A writer that swaps two planes or writes big-endian
- * fails the byte checks.
+ * The file of the synthetic call through the writer and the reader. The header
+ * carries the magic, version 2, rate, samples, count and NEW at the offsets of
+ * the table, and every record reads back equal. A writer that swaps two planes
+ * or writes big-endian fails the byte checks.
  */
 static void replay_file_check(const struct replay_call *c, char *buf,
 			      size_t size)
@@ -6968,15 +6788,10 @@ static void replay_file_check(const struct replay_call *c, char *buf,
 }
 
 /*
- * The replay of a synthetic call (bench/lec_replay.h) at the rate given. A
- * live instance runs the call in the order of chan_lec_run, writes one record
- * per tick, and the file keeps every field. Each RUN replays bit for bit, the
- * shadow output matches where the processor did not act, and each segment
- * tally equals the live counters. A file without its first NEW reads
- * INCOMPLETE, and a frames mismatch or a gap reads FAIL. A gap is a jump
- * without a loss that the skip count does not explain, and a loss drops its
- * segment. A replay that ignores RESET, FREEZE, NLP, FEED, NEW or SKIPPED
- * fails, and so does a tally that counts a pass without ACTIVE as active.
+ * The replay of a synthetic call (bench/lec_replay.h): each RUN replays bit for
+ * bit, and the shadow output matches where the processor did not act. Each
+ * segment tally equals the live counters. A missing first NEW reads INCOMPLETE;
+ * a frames mismatch or an unexplained jump reads FAIL.
  */
 static void replay_call_test(unsigned rate)
 {
@@ -7261,12 +7076,10 @@ static bool capture_fixture_planes_ok(const struct lecr_record *rec,
 }
 
 /*
- * The replay file of the ctest fixture test_lec_capture_fixture, through the
- * reader of bench/lec_replay.h. lec-capture.py writes it and ctest names it
- * in UDSP_LEC_CAPTURE_FIXTURE; the case skips when the variable is unset.
- * The expected values are literals here, and the docstring of
- * fixture_records() in the tool documents the same values. A writer that
- * swaps two planes, moves a field or writes big-endian fails here.
+ * The replay file of the ctest fixture test_lec_capture_fixture, which
+ * lec-capture.py writes and UDSP_LEC_CAPTURE_FIXTURE names (unset: skip). The
+ * literals here and the docstring of fixture_records() state the same values. A
+ * writer that swaps two planes, moves a field or writes big-endian fails.
  */
 static void capture_fixture_test(void)
 {
@@ -7362,9 +7175,8 @@ static void capture_verdict_word_test(void)
 			      map[i].word));
 }
 
-/* Three records of the synthetic call, by their index. They are a FEED of the
- * open-loop stretch, the NEW of the second instance and the last RUN before
- * its END. */
+/* Three records of the synthetic call, by their index: a FEED of the open-loop
+ * stretch, the second instance's NEW record and the last RUN before its END. */
 #define REPLAY_FEED_PROBE	(REPLAY_FEED_FROM + 5u)
 #define REPLAY_SECOND_NEW	(REPLAY_FIRST_FRAMES + 1u)
 #define REPLAY_SECOND_LAST	(REPLAY_RECORDS - 2u)
@@ -7537,11 +7349,9 @@ static void replay_early_edit(unsigned f, struct lecr_record *rec,
 
 /*
  * The default exclusion of lec_replay leaves 15 s of each segment out of the
- * steady-state figures. The control and continuity checks count from the
- * first record. A segment whose first 15 s disagree passes on the 500 frames
- * after them, and fails without the exclusion. The synthetic call is 12 s
- * long, so no segment has a body under the default. A frames mismatch and a
- * gap in that time still read FAIL.
+ * steady-state figures, while control and continuity count from the first
+ * record. A segment whose first 15 s disagree passes on the 500 frames after
+ * them and fails without the exclusion; a mismatch or a gap there still fails.
  */
 static void replay_skip_test(void)
 {
@@ -7661,6 +7471,130 @@ static void replay_bound_test(void)
 	CHECK_UINT(replay_bound_faults(0, 0, 210u, 12u), LECR_FAULT_FIRED);
 	CHECK_UINT(replay_bound_faults(0, 0, 40u, 5u), 0);
 	CHECK_UINT(replay_bound_faults(0, 0, 40u, 6u), LECR_FAULT_FIRED);
+}
+
+/*
+ * The two jumps of the gap fixture, in the shape of a capture whose archive
+ * lost FEED records. Before RUN record at, the live instance takes feeds FEED
+ * records that the file loses. The engine then skips skipped periods, which
+ * the RUN record carries. Each jump is feeds + skipped + 1 = 7 ticks,
+ * and the record accounts for skipped + 1 of them. The lost FEED records
+ * carry the far end.
+ */
+static const struct replay_gap {
+	unsigned at;
+	unsigned feeds;
+	uint16_t skipped;
+} replay_gaps[] = {
+	{ 220u, 4u, 2u },
+	{ 420u, 3u, 3u },
+};
+
+#define REPLAY_GAPS		(sizeof(replay_gaps) / sizeof(replay_gaps[0]))
+#define REPLAY_GAP_RUNS		600u
+#define REPLAY_GAP_JUMP		7u
+/* The RUN records, the seven lost FEED records and the END. */
+#define REPLAY_GAP_RECORDS	(REPLAY_GAP_RUNS + 8u)
+
+/* One lineage at 8 kHz from NEW to END, with the processor on, the jumps of
+ * replay_gaps and no other FEED. The records of the file leave out the
+ * FEED records that the live instance took. */
+static bool replay_gap_build(struct replay_call *c)
+{
+	unsigned g = 0, k = 0, kept = 0;
+	unsigned f, j;
+
+	if (!replay_call_init(c, UDSP_SAMPLE_RATE, REPLAY_GAP_RECORDS))
+		return false;
+	for (f = 0; f < REPLAY_GAP_RUNS; f++) {
+		if (k < REPLAY_GAPS && f == replay_gaps[k].at) {
+			for (j = 0; j < replay_gaps[k].feeds; j++)
+				replay_tick_run(c, g++, false,
+						LECR_FLAG_SKIP_OPEN, false,
+						false, true);
+			c->tick += replay_gaps[k].skipped;
+			c->skip_next = replay_gaps[k].skipped;
+			k++;
+		}
+		replay_tick_run(c, g++, f == 0u, 0, false, false, true);
+	}
+	replay_end_push(c);
+	for (j = 0; j < c->count; j++)
+		if (c->recs[j].kind != LECR_KIND_FEED)
+			c->recs[kept++] = c->recs[j];
+	c->count = kept;
+	return !c->failed;
+}
+
+/*
+ * A lineage has two tick gaps of 7 ticks each: skipped 2 accounts for 3, and
+ * skipped 3 for 4. The live instance took FEED records in the gaps, and the
+ * file lacks them. The replay closes the open segment as lossy at each gap
+ * and goes on. Every RUN replays, in three lossy segments that NEW and the
+ * two gaps open. Frame counts agree across both gaps, output after them
+ * differs, and the gaps alone fail the file. A replay that stops at a gap
+ * fails on the replayed and segment counts.
+ */
+static void replay_gap_test(void)
+{
+	static const unsigned from[] = {
+		LECR_FROM_NEW, LECR_FROM_GAP, LECR_FROM_GAP,
+	};
+	struct replay_seen seen;
+	struct replay_call call;
+	struct lecr_agree a;
+	bool built = replay_gap_build(&call);
+	bool ran = built && replay_recs_run(&call, call.recs, 0, &a, &seen);
+	unsigned i;
+
+	CASE("lec replay goes on past a tick gap without a recorded loss");
+	CHECK(built);
+	CHECK(ran);
+	if (!ran) {
+		free(call.recs);
+		return;
+	}
+	printf("# %u of %u RUN records replayed in %u segments; %u gaps, %u "
+	       "records skipped, %u frames mismatches, %u RUN records "
+	       "differ\n", a.runs, REPLAY_GAP_RUNS, a.segments, a.gaps,
+	       a.skipped, a.frames_bad, seen.diffs);
+	CHECK_UINT(seen.runs, REPLAY_GAP_RUNS);
+	CHECK_UINT(a.runs, REPLAY_GAP_RUNS);
+	CHECK_UINT(a.skipped, 0);
+	CHECK_UINT(a.segments, 3);
+	CHECK_UINT(seen.segments, 3);
+	CHECK_UINT(a.gaps, REPLAY_GAPS);
+	CHECK_UINT(a.losses + a.skip_marks, 0);
+	CHECK_UINT(a.frames_bad, 0);
+	CHECK_UINT(a.evaluated, 0);
+	CHECK_UINT(lecr_agree_result(&a), LECR_FAIL);
+
+	CASE("lec replay opens a lossy segment at each tick gap");
+	for (i = 0; i < 3u && i < seen.segments; i++) {
+		const struct lecr_segment *s = &seen.seg[i];
+		unsigned first = i ? replay_gaps[i - 1u].at : 0u;
+		unsigned end = i < REPLAY_GAPS ? replay_gaps[i].at :
+						 REPLAY_GAP_RUNS;
+
+		printf("# segment %u from %s, ticks %llu to %llu, %u RUN "
+		       "records, lossy %u, frames agree on %u, out on %u\n",
+		       s->index, lecr_from_name(s->from),
+		       (unsigned long long)s->tick_first,
+		       (unsigned long long)s->tick_last, s->runs, s->lossy,
+		       s->frames_same, s->out_same);
+		CHECK_UINT(s->from, from[i]);
+		CHECK(s->lossy);
+		CHECK_UINT(s->runs, end - first);
+		CHECK_UINT(s->frames_same, s->runs);
+		if (i)
+			CHECK_UINT(s->tick_first - seen.seg[i - 1u].tick_last,
+				   REPLAY_GAP_JUMP);
+	}
+	/* Before the first gap, the replay is the live run. After it, the
+	 * replay lacks the far end of the lost FEED records. */
+	CHECK_UINT(seen.seg[0].out_same, seen.seg[0].runs);
+	CHECK(seen.seg[1].out_same < seen.seg[1].runs);
+	free(call.recs);
 }
 
 #define PAUSE_ERL_DB		24.0
@@ -7922,33 +7856,41 @@ static void floor_short_pause_test(void)
 }
 
 /*
- * One frame of a frozen instance whose microphone reads dbov exactly: a
- * square wave at the amplitude of that level. With far set, far-end noise
- * makes the frame active. The filter holds no energy, so the residual is the
- * microphone. It returns the tracked floor, and sets *quiet when the whole
- * window of the frame was quiet.
+ * One frame of samples of a frozen instance whose microphone reads dbov
+ * exactly: a square wave at the amplitude of that level. With far set, far-end
+ * noise makes the frame active. The filter holds no energy, so the residual is
+ * the microphone. It returns the tracked floor, and sets *quiet when the whole
+ * window of the frame is quiet.
  */
-static float exact_frame_run(struct udsp_ec *ec, int dbov, bool far,
-			     uint32_t *state, bool *quiet)
+static float exact_samples_run(struct udsp_ec *ec, unsigned samples, int dbov,
+			       bool far, uint32_t *state, bool *quiet)
 {
 	int16_t amplitude = (int16_t)lrint(32767.0 * pow(10.0, -dbov / 20.0));
 	struct udsp_ec_nlms_frame reading;
 	struct udsp_ec_nlms_info info;
-	int16_t ref[UDSP_FRAME_SAMPLES];
-	int16_t mic[UDSP_FRAME_SAMPLES];
+	int16_t ref[UDSP_FRAME_MAX];
+	int16_t mic[UDSP_FRAME_MAX];
 	unsigned i;
 
-	for (i = 0; i < UDSP_FRAME_SAMPLES; i++)
+	for (i = 0; i < samples; i++)
 		mic[i] = i % 2u ? (int16_t)-amplitude : amplitude;
-	CHECK(udsp_cn_level_get(mic, UDSP_FRAME_SAMPLES) == dbov);
+	CHECK(udsp_cn_level_get(mic, samples) == dbov);
 	memset(ref, 0, sizeof(ref));
 	if (far)
-		noise_fill(ref, UDSP_FRAME_SAMPLES, PAUSE_FAR_DBM0, state);
+		noise_fill(ref, samples, PAUSE_FAR_DBM0, state);
 	udsp_ec_nlms.run(ec, mic, ref);
 	udsp_ec_nlms_info_get(ec, &info);
 	udsp_ec_nlms_frame_get(ec, &reading);
 	*quiet = reading.window_run == 0u;
 	return info.noise_dbov;
+}
+
+/* exact_samples_run on a frame of an 8 kHz instance. */
+static float exact_frame_run(struct udsp_ec *ec, int dbov, bool far,
+			     uint32_t *state, bool *quiet)
+{
+	return exact_samples_run(ec, UDSP_FRAME_SAMPLES, dbov, far, state,
+				 quiet);
 }
 
 /* n active frames at dbov. */
@@ -7962,11 +7904,9 @@ static void exact_far_run(struct udsp_ec *ec, int dbov, unsigned n,
 		(void)exact_frame_run(ec, dbov, true, state, &quiet);
 }
 
-/*
- * Far-end pause frames at dbov until n of them are quiet-window frames, the
- * readings of the tracker. *tail counts the frames before them whose window
- * was still active. It returns the tracked floor.
- */
+/* Far-end pause frames at dbov until n of them are quiet-window frames, the
+ * readings of the tracker. *tail counts the frames before them whose window is
+ * still active. It returns the tracked floor. */
 static float exact_quiet_run(struct udsp_ec *ec, int dbov, unsigned n,
 			     uint32_t *state, unsigned *tail)
 {
@@ -8045,16 +7985,16 @@ static void floor_bound_test(void)
 	udsp_ec_nlms.destroy(ec);
 }
 
-/* A floor at 60 dBov reads 49 frames at 50 dBov, one frame at dbov, 49 more
- * at 50 dBov, and then one more. */
-static void floor_break_check(int dbov)
+/* A floor at 60 dBov reads lead frames at 50 dBov, one frame at dbov, 49
+ * more at 50 dBov, and then one more. */
+static void floor_break_check(unsigned lead, int dbov)
 {
 	uint32_t state = 0x27182819u;
 	struct udsp_ec *ec = exact_line_create(60, &state);
 	float broken;
 	float held;
 
-	CHECK(exact_read_run(ec, 50, 49u, &state) == 60.0f);
+	CHECK(exact_read_run(ec, 50, lead, &state) == 60.0f);
 	broken = exact_read_run(ec, dbov, 1u, &state);
 	held = exact_read_run(ec, 50, 49u, &state);
 	printf("# floor %.2f dBov after the reading at %d dBov, %.2f dBov 49 "
@@ -8065,32 +8005,32 @@ static void floor_break_check(int dbov)
 }
 
 /*
- * An in-band or a quieter reading ends a rise run. A floor at 60 dBov reads
- * 49 frames at 50 dBov, one at 60 or 62 dBov and 49 more at 50 dBov. It
- * holds. The next frame at 50 dBov completes a run of 50 and sets the floor
- * to 50. A run that the reading keeps, or a shorter run, fails here.
+ * An in-band reading ends a rise run that holds fewer than
+ * LEC_NOISE_CREEP_SHARE readings per in-band reading, and a quieter reading
+ * ends any rise run. The floor holds after 49 more louder readings, and the
+ * 50th completes a run that sets it. noise_creep_test covers a kept reading.
  */
 static void floor_run_break_test(void)
 {
 	CASE("lec starts the rise run again after an in-band reading");
-	floor_break_check(60);
+	floor_break_check(9u, 60);
 
 	CASE("lec starts the rise run again after a quieter reading");
-	floor_break_check(62);
+	floor_break_check(49u, 62);
 }
 
-#define QUIET3_READINGS		3u
-#define QUIET3_ACTIVE		10u
-#define QUIET3_CYCLES		17u
+#define QUIET6_READINGS		6u
+#define QUIET6_ACTIVE		10u
+#define QUIET6_CYCLES		9u
 
 /*
- * Quiet windows of 3 frames between far-end bursts of 10 frames, with a floor
- * that rose from 60 to 50 dBov. Each window adds 3 readings to the rise run,
- * and the run holds across the bursts. After 16 windows, 48 readings, the
- * floor holds. The 17th window completes the run and sets the floor to 50. A
- * run that the bursts clear fails here.
+ * Quiet windows of 6 frames between far-end bursts of 10 frames, with a floor
+ * that rose from 60 to 50 dBov. The rise run holds its readings across the
+ * bursts, and the 9th window completes it and sets the floor to 50 dBov. The
+ * 50 readings come from 9 windows, fewer than the agreement run needs, so a
+ * rise run that the bursts clear fails here.
  */
-static void floor_quiet3_test(void)
+static void floor_quiet6_test(void)
 {
 	uint32_t state = 0x16180340u;
 	struct udsp_ec *ec;
@@ -8099,23 +8039,457 @@ static void floor_quiet3_test(void)
 	unsigned tails = 0;
 	unsigned c;
 
-	CASE("lec adds up the rise readings of quiet windows of 3 frames");
+	CASE("lec adds up the rise readings of quiet windows of 6 frames");
 	ec = exact_line_create(60, &state);
-	for (c = 0; c < QUIET3_CYCLES; c++) {
+	for (c = 0; c < QUIET6_CYCLES; c++) {
 		unsigned tail;
 
-		exact_far_run(ec, 50, QUIET3_ACTIVE, &state);
+		exact_far_run(ec, 50, QUIET6_ACTIVE, &state);
 		before_last = floor;
-		floor = exact_quiet_run(ec, 50, QUIET3_READINGS, &state,
+		floor = exact_quiet_run(ec, 50, QUIET6_READINGS, &state,
 					&tail);
 		tails += tail;
 	}
-	printf("# floor %.2f dBov after 16 windows, %.2f dBov after 17, %u "
+	printf("# floor %.2f dBov after 8 windows, %.2f dBov after 9, %u "
 	       "tail frames\n", (double)before_last, (double)floor, tails);
-	CHECK_UINT(tails, 4u * QUIET3_CYCLES);
+	CHECK_UINT(tails, 4u * QUIET6_CYCLES);
 	CHECK(before_last == 60.0f);
 	CHECK(floor == 50.0f);
 	udsp_ec_nlms.destroy(ec);
+}
+
+/* The agreement line: a frozen 48 ms instance whose microphone reads whole dBov
+ * levels (exact_samples_run). A far noise burst of AGREE_BURST_FRAMES leads
+ * each quiet window, which reads once the reference window is quiet. */
+#define AGREE_BURST_FRAMES	10u
+
+struct agree_line {
+	struct udsp_ec *ec;
+	unsigned frame;
+	uint32_t state;
+};
+
+/* A line at rate whose floor reads dbov, taken whole from its first frame. */
+static void agree_line_init(struct agree_line *l, unsigned rate, int dbov)
+{
+	bool quiet;
+
+	l->ec = udsp_ec_nlms.create_rate(48, rate);
+	l->frame = rate / 100u;
+	l->state = 0x2545f491u;
+	udsp_ec_nlms.freeze(l->ec, true);
+	(void)exact_samples_run(l->ec, l->frame, dbov, false, &l->state,
+				&quiet);
+	CHECK(quiet);
+}
+
+/* n more readings at dbov in the quiet window that is open. It returns the
+ * floor after the last. */
+static float agree_read_run(struct agree_line *l, int dbov, unsigned n)
+{
+	float floor = 127.0f;
+	unsigned i;
+
+	for (i = 0; i < n; i++) {
+		bool quiet;
+
+		floor = exact_samples_run(l->ec, l->frame, dbov, false,
+					  &l->state, &quiet);
+		CHECK(quiet);
+	}
+	return floor;
+}
+
+/*
+ * A burst of len frames whose microphone reads burst_dbov, with far-end noise
+ * on frame i when bit i of far is set. Pause frames at dbov follow until n of
+ * them are readings: one quiet window. It returns the floor after the last
+ * reading.
+ */
+static float agree_pattern_run(struct agree_line *l, unsigned far,
+			       unsigned len, int burst_dbov, int dbov,
+			       unsigned n)
+{
+	float floor = 127.0f;
+	unsigned read = 0;
+	unsigned i;
+	bool quiet;
+
+	for (i = 0; i < len; i++)
+		(void)exact_samples_run(l->ec, l->frame, burst_dbov,
+					(far >> i) & 1u, &l->state, &quiet);
+	while (read < n) {
+		floor = exact_samples_run(l->ec, l->frame, dbov, false,
+					  &l->state, &quiet);
+		read += quiet;
+	}
+	return floor;
+}
+
+/*
+ * A far burst of AGREE_BURST_FRAMES whose filter output reads burst_dbov,
+ * then pause frames at dbov until n of them are readings: one quiet window.
+ * It returns the floor after the last reading.
+ */
+static float agree_window_run(struct agree_line *l, int burst_dbov, int dbov,
+			      unsigned n)
+{
+	return agree_pattern_run(l, (1u << AGREE_BURST_FRAMES) - 1u,
+				 AGREE_BURST_FRAMES, burst_dbov, dbov, n);
+}
+
+/* count quiet windows of n readings at dbov, each after a burst at dbov. It
+ * returns the floor after the last reading. */
+static float agree_windows_run(struct agree_line *l, int dbov, unsigned n,
+			       unsigned count)
+{
+	float floor = 127.0f;
+	unsigned w;
+
+	for (w = 0; w < count; w++)
+		floor = agree_window_run(l, dbov, dbov, n);
+	return floor;
+}
+
+/*
+ * The count of the agreement run, LEC_NOISE_AGREE_READINGS. A floor at
+ * 60 dBov reads quiet windows of 2 frames at 54 dBov and holds through 31
+ * readings. The 32nd completes the run, and the floor takes its mean plus
+ * LEC_NOISE_AGREE_BIAS_DB, 55 dBov. A run of 24 readings, or a floor at the
+ * mean of the run, fails here.
+ */
+static void agree_readings_test(unsigned rate)
+{
+	struct agree_line l;
+	float held;
+	float floor;
+
+	case_rate(rate, "lec raises the floor on the 32nd reading of the "
+		  "agreement run");
+	agree_line_init(&l, rate, 60);
+	(void)agree_windows_run(&l, 54, 2u, 15u);
+	held = agree_window_run(&l, 54, 54, 1u);
+	floor = agree_read_run(&l, 54, 1u);
+	printf("# %u Hz: floor %.2f dBov after 31 readings, %.2f dBov after "
+	       "32\n", rate, (double)held, (double)floor);
+	CHECK(held == 60.0f);
+	CHECK(floor == 55.0f);
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/*
+ * The count of quiet windows of the agreement run, LEC_NOISE_AGREE_PAUSES.
+ * Windows of 4 frames at 54 dBov over a floor at 60 dBov hold the floor through
+ * 9 windows. The 10th sets it to 55 dBov. A count of 8 windows, or of
+ * readings in place of windows, fails here.
+ */
+static void agree_pauses_test(unsigned rate)
+{
+	struct agree_line l;
+	float held;
+	float floor;
+
+	case_rate(rate, "lec raises the floor on readings from 10 quiet "
+		  "windows");
+	agree_line_init(&l, rate, 60);
+	held = agree_windows_run(&l, 54, 4u, 9u);
+	floor = agree_window_run(&l, 54, 54, 1u);
+	printf("# %u Hz: floor %.2f dBov after 9 windows of 4 readings, %.2f "
+	       "dBov on the first reading of the 10th\n", rate, (double)held,
+	       (double)floor);
+	CHECK(held == 60.0f);
+	CHECK(floor == 55.0f);
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/*
+ * The readings of one quiet window are one look at the near end. A floor at
+ * 60 dBov reads 49 frames at 54 dBov in one window, and holds. The 50th
+ * reading completes the rise run, and the floor takes its mean, 54 dBov. An
+ * agreement run that counts each reading as a window fails here.
+ */
+static void agree_window_test(unsigned rate)
+{
+	struct agree_line l;
+	float held;
+	float floor;
+
+	case_rate(rate, "lec counts the readings of one quiet window as one "
+		  "look in the agreement run");
+	agree_line_init(&l, rate, 60);
+	held = agree_window_run(&l, 54, 54, 49u);
+	floor = agree_read_run(&l, 54, 1u);
+	printf("# %u Hz: floor %.2f dBov after 49 readings of one window, "
+	       "%.2f dBov after 50\n", rate, (double)held, (double)floor);
+	CHECK(held == 60.0f);
+	CHECK(floor == 54.0f);
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/* 16 quiet windows of 2 readings, at the first level and the second in turn,
+ * on a line whose floor reads floor_dbov. Each burst reads the first level,
+ * the louder one, so no burst falsifies the run. *held is the floor after
+ * 15. */
+static float agree_band_run(unsigned rate, int floor_dbov, const int levels[2],
+			    float *held)
+{
+	struct agree_line l;
+	float floor = 127.0f;
+	unsigned w;
+
+	agree_line_init(&l, rate, floor_dbov);
+	for (w = 0; w < 16u; w++) {
+		if (w == 15u)
+			*held = floor;
+		floor = agree_window_run(&l, levels[0], levels[w % 2u], 2u);
+	}
+	udsp_ec_nlms.destroy(l.ec);
+	return floor;
+}
+
+/* 30 quiet windows of 2 readings at 51, 55, 60 and 55 dBov in turn, after
+ * bursts at 51 dBov. The floor of the line reads 64 dBov. It returns the
+ * floor after the last reading. */
+static float agree_ramp_run(unsigned rate)
+{
+	static const int levels[4] = { 51, 55, 60, 55 };
+	struct agree_line l;
+	float floor = 127.0f;
+	unsigned w;
+
+	agree_line_init(&l, rate, 64);
+	for (w = 0; w < 30u; w++)
+		floor = agree_window_run(&l, 51, levels[w % 4u], 2u);
+	udsp_ec_nlms.destroy(l.ec);
+	return floor;
+}
+
+/* On a line whose floor reads 63 dBov, after bursts at 50 dBov: 13 readings
+ * at 50 dBov in windows of 4. From the second reading of the 4th window on,
+ * 59 dBov follows, in 4 windows of 3 and 4 windows of 4. held is the floor
+ * after the 12th window; the return is the floor after the first reading of
+ * the 13th. */
+static float agree_restart_run(unsigned rate, float *held)
+{
+	struct agree_line l;
+	float floor;
+	unsigned w;
+
+	agree_line_init(&l, rate, 63);
+	(void)agree_windows_run(&l, 50, 4u, 3u);
+	(void)agree_window_run(&l, 50, 50, 1u);
+	(void)agree_read_run(&l, 59, 3u);
+	for (w = 0; w < 8u; w++)
+		*held = agree_window_run(&l, 50, 59, w < 4u ? 3u : 4u);
+	floor = agree_window_run(&l, 50, 59, 1u);
+	udsp_ec_nlms.destroy(l.ec);
+	return floor;
+}
+
+/*
+ * The band of the agreement run, LEC_NOISE_AGREE_DB, spans all its readings.
+ * Readings 8 dB apart raise the floor, and 9 dB apart hold it, also in steps of
+ * 4 and 5 dB. A reading out of the band restarts the run with that reading and
+ * its window. A band of 6 or 10 dB, or one around the mean, fails here.
+ */
+static void agree_band_test(unsigned rate)
+{
+	static const int within[2] = { 50, 58 };
+	static const int beyond[2] = { 50, 59 };
+	float held_within;
+	float held_beyond;
+	float floor_within;
+	float floor_beyond;
+	float floor_ramp;
+	float held_restart = 127.0f;
+	float floor_restart;
+
+	case_rate(rate, "lec raises the floor on readings within 8 dB of each "
+		  "other");
+	floor_within = agree_band_run(rate, 62, within, &held_within);
+	floor_beyond = agree_band_run(rate, 63, beyond, &held_beyond);
+	floor_ramp = agree_ramp_run(rate);
+	floor_restart = agree_restart_run(rate, &held_restart);
+	printf("# %u Hz: readings 8 dB apart: floor %.2f dBov after 15 "
+	       "windows, %.2f dBov after 16; 9 dB apart: %.2f and %.2f "
+	       "dBov; steps of 5 dB over 9 dB: %.2f dBov after 30 windows; "
+	       "restart in the 4th window: %.2f dBov after 12 windows, %.2f "
+	       "dBov on the first reading of the 13th\n", rate,
+	       (double)held_within, (double)floor_within, (double)held_beyond,
+	       (double)floor_beyond, (double)floor_ramp, (double)held_restart,
+	       (double)floor_restart);
+	CHECK(held_within == 62.0f);
+	CHECK(floor_within == 55.0f);
+	CHECK(held_beyond == 63.0f);
+	CHECK(floor_beyond == 63.0f);
+	CHECK(floor_ramp == 64.0f);
+	CHECK(held_restart == 63.0f);
+	CHECK(floor_restart == 60.0f);
+}
+
+/* Quiet windows of 1 reading at 54 dBov after bursts of len frames at
+ * burst_dbov. Far-end noise is on the frames that the bits of far mark. The
+ * floor of the line reads 60 dBov. floor[0] is the floor after 31 windows,
+ * floor[1] after 32 and floor[2] after 40. */
+static void agree_falsify_run(unsigned rate, unsigned far, unsigned len,
+			      int burst_dbov, float floor[3])
+{
+	struct agree_line l;
+	float now = 127.0f;
+	unsigned w;
+
+	agree_line_init(&l, rate, 60);
+	for (w = 1; w <= 40u; w++) {
+		now = agree_pattern_run(&l, far, len, burst_dbov, 54, 1u);
+		if (w == 31u)
+			floor[0] = now;
+		if (w == 32u)
+			floor[1] = now;
+	}
+	floor[2] = now;
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/*
+ * The falsification of the agreement run: LEC_NOISE_STALE_FRAMES active frames
+ * in a row whose filter output stands more than LEC_NOISE_STALE_DB under the
+ * run's level restart it. Bursts that miss a condition leave the run and the
+ * floor rises; bursts that meet all three hold it.
+ */
+static void agree_falsify_test(unsigned rate)
+{
+	static const struct {
+		unsigned far;
+		unsigned len;
+		int dbov;
+		bool kept;
+	} legs[5] = {
+		{ 0x3ffu, 10u, 57, true },
+		{ 0x3ffu, 10u, 58, false },
+		{ 0x7u, 3u, 58, true },
+		{ 0xfu, 4u, 58, false },
+		{ 0x1bu, 5u, 58, true },
+	};
+	static const char *const names[5] = {
+		"10 frames 3 dB under", "10 frames 4 dB under", "3 frames",
+		"4 frames", "2, a gap and 2 frames",
+	};
+	unsigned i;
+
+	case_rate(rate, "lec starts the agreement run over on far bursts "
+		  "quieter than it");
+	for (i = 0; i < 5u; i++) {
+		float floor[3];
+
+		agree_falsify_run(rate, legs[i].far, legs[i].len, legs[i].dbov,
+				  floor);
+		printf("# %u Hz, bursts of %s: floor %.2f, %.2f and %.2f dBov "
+		       "after 31, 32 and 40 windows\n", rate, names[i],
+		       (double)floor[0], (double)floor[1], (double)floor[2]);
+		CHECK(floor[0] == 60.0f);
+		CHECK(floor[1] == (legs[i].kept ? 55.0f : 60.0f));
+		if (!legs[i].kept)
+			CHECK(floor[2] == 60.0f);
+	}
+}
+
+/*
+ * The floor after a stale drop of a floor that an agreement run raised by
+ * LEC_NOISE_AGREE_RISE_DB. Far bursts at the floor before the rise drop it, and
+ * the first reading after each drop takes the dropped level. The floor
+ * therefore stays within 8 dB of where it began. A first reading taken whole
+ * fails here.
+ */
+static void agree_stale_test(unsigned rate)
+{
+	struct agree_line l;
+	float raised;
+	float floor = 127.0f;
+	unsigned w;
+
+	case_rate(rate, "lec takes no floor louder than the one that the stale "
+		  "rule dropped");
+	agree_line_init(&l, rate, 60);
+	raised = agree_windows_run(&l, 40, 2u, 16u);
+	for (w = 0; w < 10u; w++)
+		floor = agree_window_run(&l, 60, 40, 2u);
+	printf("# %u Hz: floor %.2f dBov after 16 windows at 40 dBov, %.2f dBov "
+	       "after 10 more between bursts at 60 dBov\n", rate,
+	       (double)raised, (double)floor);
+	CHECK(raised == 52.0f);
+	CHECK(floor == 52.0f);
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/* The silent frames that agree_feed_test feeds after its far burst: more
+ * than the 5 frames of the 48 ms window at either rate. */
+#define AGREE_FEED_QUIET_FRAMES	8u
+
+/*
+ * A far burst that arrives through udsp_ec_nlms_ref_feed ends a quiet window.
+ * After 9 windows of readings, a far burst and silent frames arrive through
+ * the feed alone. The next reading of run() opens the 10th window and
+ * completes the agreement run. A feed that leaves the quiet window open fails
+ * here.
+ */
+static void agree_feed_test(unsigned rate)
+{
+	int16_t ref[UDSP_FRAME_MAX];
+	struct agree_line l;
+	float held;
+	float floor;
+	unsigned i;
+	bool quiet;
+
+	case_rate(rate, "lec opens a new quiet window after a far burst of the "
+		  "reference feed");
+	agree_line_init(&l, rate, 60);
+	held = agree_windows_run(&l, 54, 4u, 9u);
+	for (i = 0; i < AGREE_BURST_FRAMES + AGREE_FEED_QUIET_FRAMES; i++) {
+		memset(ref, 0, sizeof(ref));
+		if (i < AGREE_BURST_FRAMES)
+			noise_fill(ref, l.frame, PAUSE_FAR_DBM0, &l.state);
+		udsp_ec_nlms_ref_feed(l.ec, ref);
+	}
+	floor = exact_samples_run(l.ec, l.frame, 54, false, &l.state, &quiet);
+	printf("# %u Hz: floor %.2f dBov after 9 windows of 4 readings, %.2f "
+	       "dBov on the first reading after the fed burst\n", rate,
+	       (double)held, (double)floor);
+	CHECK(quiet);
+	CHECK(held == 60.0f);
+	CHECK(floor == 55.0f);
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/*
+ * The rise bound of the agreement run, LEC_NOISE_AGREE_RISE_DB. Readings
+ * 12 dB louder than a floor at 60 dBov complete a run. The floor rises 8 dB
+ * to 52 dBov, and both runs start over. The next run takes the floor to the
+ * readings plus the bias, 49 dBov. A run without the bound, or a bound that
+ * leaves a run in place, fails here.
+ */
+static void agree_cap_test(unsigned rate)
+{
+	struct agree_line l;
+	float held[2];
+	float floor[2];
+
+	case_rate(rate, "lec raises the floor by at most 8 dB per agreement "
+		  "run");
+	agree_line_init(&l, rate, 60);
+	held[0] = agree_windows_run(&l, 48, 2u, 15u);
+	floor[0] = agree_window_run(&l, 48, 48, 2u);
+	held[1] = agree_windows_run(&l, 48, 2u, 15u);
+	floor[1] = agree_window_run(&l, 48, 48, 2u);
+	printf("# %u Hz: floor %.2f dBov after 15 windows, %.2f dBov after "
+	       "16, %.2f dBov after 31, %.2f dBov after 32\n", rate,
+	       (double)held[0], (double)floor[0], (double)held[1],
+	       (double)floor[1]);
+	CHECK(held[0] == 60.0f);
+	CHECK(floor[0] == 52.0f);
+	CHECK(held[1] == 52.0f);
+	CHECK(floor[1] == 49.0f);
+	udsp_ec_nlms.destroy(l.ec);
 }
 
 #define AGE_TAIL_FRAMES		4u
@@ -8199,12 +8573,10 @@ static void floor_reset_test(void)
 #define FAN_LOWPASS_HZ		300.0
 
 /*
- * The near speech of a line over every frame that holds it. A frame holds near
- * speech when the near plane alone crosses the activity bar (frame_loud). The
- * energies give the regression gain of the output on the near speech and the
- * output against the microphone. An exposure frame is a frame with near
- * speech whose echo estimate (estimate_power of the frame reading) stands at
- * or over the power of the near plane less 10 dB.
+ * The near speech of a line over the frames that hold it, where the near plane
+ * alone crosses the activity bar. It holds the energies of the regression gain
+ * and the exposure frames, whose echo estimate stands at or over the near power
+ * less 10 dB.
  */
 struct near_stat {
 	unsigned frames;
@@ -8253,19 +8625,11 @@ static double near_gain_db_get(double product, double near)
 }
 
 /*
- * The fan line of the seed cases: a flat 24 dB hybrid at 8 ms, the default
- * tail, the processor off and a near-end floor at -72 dBm0. A far-end fan at
- * -38 dBm0 never pauses. Its echo returns at -62 dBm0 by the bound of the
- * line at 8 kHz, and at -63 dBm0 at 16 kHz. That is over the -65 dBm0 of the
- * cap of dsp/lec.c, so the far-end floor keeps the fan frames active and the
- * seed reads them. The echo stands 10 dB over the floor. Far-end words at
- * -20 dBm0 go on top of the fan. fan_line_set gives the line another fan
- * level and another hybrid. The filter ERLE counts the frames without near
- * speech whose reference crosses the fixed bar, from measure on: the echo
- * over the residual less the floor. With measure_words set it counts the
- * frames whose far words cross the fixed bar instead. word_loud says that
- * the far words of the last frame crossed it, and out holds the output of
- * the last frame. speech takes the near speech of every frame.
+ * The fan line: a flat 24 dB hybrid at 8 ms with the processor off. A near
+ * floor at -72 dBm0 lies under a far fan at -38 dBm0 that never pauses. Its
+ * echo stands over the -65 dBm0 cap, so the fan frames stay active, 10 dB over
+ * the floor. Far words go on top; the fields count the filter ERLE, the near
+ * speech and the output of the last frame.
  */
 struct fan_line {
 	struct echo_path path;
@@ -8410,13 +8774,10 @@ static bool fan_window_get(const struct fan_line *line)
 }
 
 /*
- * A far end that never pauses, at the line rate. The fan line runs for 30 s.
- * The seed must measure the floor within 10 s (FAN_SEED_BOUND), within 1.5 dB
- * of -72 dBm0, on a frame of an active window. After 10 s the window must stay
- * active, with no trial, no reset and double talk on under 10 percent of the
- * frames. The seed comes at 1.8 s at 8 kHz and 4.5 s at 16 kHz. Without the
- * seed, the line reads no floor and no double talk, because the fan echo
- * stands 10 dB over the floor.
+ * A far end that never pauses: over 30 s the seed measures the floor within
+ * FAN_SEED_BOUND, within 1.5 dB of -72 dBm0, on an active window. After 10 s
+ * the window stays active with no trial or reset and double talk on under 10
+ * percent of frames. Without the seed, the line reads no floor.
  */
 static void fan_seed_test(unsigned rate)
 {
@@ -8473,22 +8834,16 @@ static void fan_seed_test(unsigned rate)
 #define TURNS_NEAR_START	250u
 #define TURNS_NEAR_DBM0		-20.0
 #define TURNS_SEED_BOUND	(15u * FRAMES_PER_SECOND)
-/*
- * The fan of fan_turns_test, with the far-end floor of dsp/lec.c switched off.
- * With the fan at FAN_DBM0 the seed comes at 0.9 s, before the first near
- * turn. The line then tests no seed under the turns, and a build without the
- * talker guard runs no trial on it.
- */
+/* The fan of fan_turns_test with the far-end floor off: at FAN_DBM0 the seed
+ * comes before the first near turn, so the line tests no seed under the
+ * turns. */
 #define TURNS_FAN_DBM0		-48.0
 
 /*
- * The fan line at 16 kHz carries a talker in turns, with the fan at
- * -48 dBm0 and the far-end floor switched off. The far words and a near
- * talker at -20 dBm0 take turns of 3 s in a cycle of 5 s. The seed must come
- * within 15 s, and the floor must end within 1.5 dB of -72 dBm0. The line
- * must run no trial and no reset, before the seed and after it. The near
- * turn stands 28 dB over the fan, so the talker guard of dsp/lec.c clears the
- * latch run before the seed.
+ * The fan at -48 dBm0 with the far-end floor off, at 16 kHz. Far words and a
+ * near talker at -20 dBm0 take turns of 3 s in 5 s. The seed comes within
+ * 15 s, the floor ends within 1.5 dB of -72 dBm0, and no trial or reset runs.
+ * The talker guard clears the latch run before the seed.
  */
 static void fan_turns_test(void)
 {
@@ -8549,12 +8904,10 @@ static void fan_turns_test(void)
 #define MEASURED_NOISE_DBM0	-60.0
 
 /*
- * A measured floor under a far end that never pauses. A far-end pause of 1 s
- * measures the floor at -72 dBm0. The fan at -38 dBm0 and the words follow,
- * and the fan frames stay active. From 5 s a stationary near-end noise at
- * -60 dBm0 joins the microphone. For the 14 s after the pause the floor must
- * stay within 1.5 dB of -72 dBm0. A seed that also runs on a measured floor
- * takes the noise in as the floor.
+ * A measured floor under a far end that never pauses: a pause measures -72
+ * dBm0, then the fan and the words run. From 5 s a near noise at -60 dBm0
+ * joins. The floor stays within 1.5 dB of -72 dBm0; a seed that also runs on a
+ * measured floor takes the noise in.
  */
 static void fan_measured_test(void)
 {
@@ -8595,11 +8948,11 @@ static void fan_measured_test(void)
 #define RESEED_FRAMES		(2u * FRAMES_PER_SECOND)
 
 /*
- * A seeded floor that the filter output falsifies. The fan line at 8 kHz
- * runs until the seed and then 1 s more. The near-end floor then drops to
- * -82 dBm0. The stale rule drops the old floor. Within 2 s the seed must
- * measure the new one within 1.5 dB, on a frame of an active window. A seed
- * that opens once per instance leaves the line without a floor.
+ * A seeded floor that the filter output falsifies. The fan line at 8 kHz runs
+ * until the seed and then 1 s more. The near-end floor then drops to -82 dBm0,
+ * and the stale rule drops the seeded floor. Within 2 s the seed must measure
+ * the lower floor within 1.5 dB, on a frame of an active window. A seed that
+ * opens once per instance leaves the line without a floor.
  */
 static void fan_reseed_test(void)
 {
@@ -8649,15 +9002,9 @@ static void fan_reseed_test(void)
 	udsp_ec_nlms.destroy(line.ec);
 }
 
-/*
- * A fan in a narrow band. The fan of the line at 8 kHz is low-passed by a
- * first-order filter at 300 Hz and keeps its level of -38 dBm0. A band that
- * the far words do not teach leaves more fan echo in the filter output. The
- * seed must read the floor within 1.5 dB of -72 dBm0, on a frame of an active
- * window. The far words of this line teach the band under 300 Hz. The seed
- * therefore reads as it does under a white fan, with or without gate (c) of
- * dsp/lec.c.
- */
+/* A fan low-passed at 300 Hz at -38 dBm0: the far words teach the band under
+ * 300 Hz. The seed then reads the floor within 1.5 dB of -72 dBm0 on an active
+ * window, as under a white fan. Gate (c) does not change the result. */
 static void fan_lowpass_test(void)
 {
 	struct udsp_ec_nlms_info info;
@@ -8691,18 +9038,15 @@ static void fan_lowpass_test(void)
 }
 
 #define STEP_MEASURE_FROM	(10u * FRAMES_PER_SECOND)
-/* A canceller without the seed reads 23.87 dB on the fan line. */
+/* The filter ERLE of a canceller without the seed on the fan line. */
 #define STEP_HEAD_ERLE_DB	23.9
 #define STEP_ERLE_TOL_DB	1.0
 
 /*
- * A seeded floor and the step control. The fan line at 8 kHz runs for 30 s,
- * and the filter ERLE counts the far-end frames of the last 20 s. The step
- * control of dsp/lec.c reads the seeded floor. The ERLE must come within 1 dB
- * of the figure of a canceller without the seed, which measures no floor on
- * this line. A step that a measured floor freezes fails here. A seed louder
- * than the floor does not: it closes the step on the fan-only frames, and
- * the ERLE rises.
+ * A seeded floor and the step control: over the last 20 s of 30 the filter ERLE
+ * comes within 1 dB of a canceller without the seed. A step that a measured
+ * floor freezes fails; a seed louder than the floor closes the step on fan-only
+ * frames, and the ERLE rises.
  */
 static void fan_step_test(void)
 {
@@ -8728,12 +9072,10 @@ static void fan_step_test(void)
 #define BLOCK_NEAR_DBM0		-19.0
 
 /*
- * Gate (f) of dsp/lec.c on a line without a floor. A flat 12 dB hybrid
- * converges for 1.5 s on a white far end at -10 dBm0. A steady white talker
- * 3 dB over the echo then speaks for 1 s. In a second instance the hybrid
- * gets 6 dB louder for 3 s. The tracked ERLE reads over 50 dB, so gates (b)
- * to (e) pass both. The floor must stay unmeasured in both; without gate (f)
- * the seed takes the talker and the misaligned echo in as the floor.
+ * Gate (f) on a line without a floor: after convergence, a steady white talker
+ * 3 dB over the echo, and in a second instance a hybrid 6 dB louder. The ERLE
+ * passes gates (b) to (e) in both, and the floor stays unmeasured. Without gate
+ * (f) the seed takes the talker or the misaligned echo in.
  */
 static void seed_block_test(unsigned rate)
 {
@@ -8827,13 +9169,10 @@ static void seed_trial_frame_run(struct udsp_ec *ec, struct echo_path *path,
 }
 
 /*
- * A flat 24 dB hybrid with a floor at -72 dBm0 converges on a white far end
- * at -20 dBm0. Gate (c) of dsp/lec.c keeps the seed shut there. A talker at
- * -10 dBm0 then builds the latch run to 485 frames.
- * At the fan level of -38 dBm0 the frames qualify, and the latch starts a
- * trial before the seed run is full. The trial frames clear the run, so the
- * seed must come 20 frames after the last trial frame. A run that the trial
- * keeps seeds earlier.
+ * A flat 24 dB hybrid with a floor at -72 dBm0 converges on a far end at
+ * -20 dBm0. Gate (c) keeps the seed shut there. A talker then builds the latch
+ * run, and at the fan level the latch starts a trial before the seed run is
+ * full. The trial frames clear the run, so the seed comes 20 frames after it.
  */
 static void seed_trial_test(void)
 {
@@ -8988,21 +9327,24 @@ static void snap_line_build(struct snap_line *s, double far_dbm0)
 }
 
 /*
- * The snapshot of a trial that starts on a frame that adapted and then fired.
- * The snapshot line comes to a due latch, and the latch comes due on the next
- * frame, which adapts and fires. The twin freezes before that frame, and the
- * talker refuses the trial of the first instance. Both filters then freeze,
- * and their energies and outputs must be equal to the bit.
+ * The snapshot of a trial that starts on a frame that adapted and fired: the
+ * talker refuses it. Both frozen filters then match to the bit, as does the
+ * energy that the start frame reports. On the line of bare_snapshot_run, the
+ * trial on taps without echo evidence passes trial_bare_test.
  */
 static void probe_snapshot_test(void)
 {
 	struct udsp_ec_nlms_frame reading;
 	struct udsp_ec_nlms_info lead_info;
 	struct udsp_ec_nlms_info twin_info;
+	struct bare_figures bare;
 	struct snap_line s;
+	float bare_before;
+	float bare_start;
 	unsigned differ = 0;
 	unsigned f;
 
+	bare_snapshot_run(UDSP_SAMPLE_RATE, &bare, &bare_before, &bare_start);
 	snap_line_build(&s, SNAP_FAR_DBM0);
 	udsp_ec_nlms.freeze(s.twin, true);
 	CASE("lec trial restores the filter that its start frame ended with");
@@ -9012,11 +9354,16 @@ static void probe_snapshot_test(void)
 		if (f)
 			continue;
 		udsp_ec_nlms_info_get(s.lead, &lead_info);
+		udsp_ec_nlms_info_get(s.twin, &twin_info);
 		udsp_ec_nlms_frame_get(s.lead, &reading);
+		printf("# start frame: coefficient energy %.9f against the "
+		       "twin's %.9f\n", (double)lead_info.coef_energy,
+		       (double)twin_info.coef_energy);
 		CHECK(s.clear_before);
 		CHECK(s.run_before >= SNAP_LATCH_FRAMES);
 		CHECK_UINT(lead_info.probes, 1);
 		CHECK(reading.dt_fired);
+		CHECK(lead_info.coef_energy == twin_info.coef_energy);
 	}
 	udsp_ec_nlms.freeze(s.lead, true);
 	for (f = 0; f < SNAP_COMPARE_FRAMES; f++) {
@@ -9036,6 +9383,17 @@ static void probe_snapshot_test(void)
 	CHECK_UINT(differ, 0);
 	udsp_ec_nlms.destroy(s.lead);
 	udsp_ec_nlms.destroy(s.twin);
+	printf("# taps without echo evidence: trial arm %u from frame %u, "
+	       "coefficient energy %.6f before its start frame and %.6f after "
+	       "it; end %u on frame %u at %.3f, %.2f of the echo; ERLE %.1f dB "
+	       "after the far end alone\n", bare.arm, bare.start,
+	       (double)bare_before, (double)bare_start, bare.how, bare.end,
+	       bare.keep_coef, bare.keep_coef / bare.echo_coef, bare.erle_db);
+	CHECK_UINT(bare.arm, UDSP_EC_NLMS_TRIAL_ARM_LATCH);
+	CHECK(bare_start == bare_before);
+	CHECK_UINT(bare.how, UDSP_EC_NLMS_TRIAL_END_KEPT);
+	CHECK(bare.keep_coef <= BARE_COEF_RATIO * bare.echo_coef);
+	CHECK(bare.erle_db >= BARE_ERLE_DB);
 }
 
 #define RING_DBM0		-20.0
@@ -9244,12 +9602,10 @@ static void ring_trust_tone_run(struct ring_line *line)
 }
 
 /*
- * The trust rule on a filter that learned a ringback. The tone earns the
- * filter a tracked ERLE over the 18 dB trust line. Its coefficient energy
- * stands more than 10 dB under the learned gain. The second burst runs for
- * 3 s, so the trust count of dsp/lec.c is complete at the end of the
- * ringback. The energy rule alone must then refuse the trust. No frame of the
- * first second of far-end words must fire on a bar that the estimate set.
+ * The trust rule on a filter that learned a ringback. The tone earns a tracked
+ * ERLE over the trust line, but its coefficient energy stands more than 10 dB
+ * under the learned gain. The energy rule alone then refuses the trust, and no
+ * frame of the first far words fires on an estimate bar.
  */
 static void ring_trust_test(unsigned rate)
 {
@@ -9285,14 +9641,10 @@ static void ring_trust_test(unsigned rate)
 }
 
 /*
- * The ringback line, then 20 s of far-end words, reproduces the hold of a
- * stale trusted estimate. The ringback must earn the filter a tracked ERLE of
- * 18 dB or more. The trust rules of dsp/lec.c refuse that trust at the end of
- * the ringback. The words must then run no trial and hold double talk on 20
- * percent or less of the first 2 s. The line must run no reset and hold at
- * most 20 percent of the active frames of the last 8 s. The filter ERLE of
- * those frames must reach 15 dB, where a canceller without the stale run
- * reads 0.7 dB.
+ * The ringback line, then 20 s of far words: the hold of a stale trusted
+ * estimate. The trust rules refuse the tone's trust, so the words run no trial.
+ * They hold double talk on 20 percent or less of the first 2 s. The last 8 s
+ * hold 20 percent at most, with no reset, and the filter ERLE reaches 15 dB.
  */
 static void stale_hold_test(unsigned rate)
 {
@@ -9367,13 +9719,10 @@ static void ring_white_run(struct ring_line *line, unsigned frames)
 }
 
 /*
- * A talker that the far end cannot explain starts no trial of the stale run.
- * The ringback line converges on white noise for 3 s. Far-end words then run
- * for 20 s with a near talker at the same level, 24 dB over the echo. The
- * detector fires on the trusted estimate on more frames than the stale run
- * needs, and each of those frames stands over the classic bar. The stale run
- * must stay under its trigger, and the line must run no trial and no reset.
- * A stale run that counts every trusted verdict starts a trial.
+ * A talker that the far end cannot explain starts no stale-run trial. Far words
+ * with a near talker 24 dB over the echo fire on the trusted estimate, but each
+ * frame stands over the classic bar. The stale run stays under its trigger,
+ * with no trial and no reset.
  */
 static void stale_talker_test(void)
 {
@@ -9415,10 +9764,9 @@ static void stale_talker_test(void)
 	CHECK_UINT(info.diverge_resets, 0);
 }
 
-/* LEC_TRIAL_STANDDOWN_FRAMES plus LEC_PROBE_FRAMES of dsp/lec.c: the
- * shortest distance between the starts of two trials of the stale run, in
- * active frames. LEC_TRIAL_STANDDOWN_FRAMES alone is the shortest distance
- * between two trials of any arm under a talker who never pauses. */
+/* The shortest distance between two stale-run trial starts in active frames,
+ * stand-down plus trial; the stand-down alone separates trials of any arm under
+ * a talker who never pauses. */
 #define EXPOSE_CADENCE		700u
 #define EXPOSE_ANY_CADENCE	600u
 #define EXPOSE_FRAMES		(30u * FRAMES_PER_SECOND)
@@ -9427,14 +9775,10 @@ static void stale_talker_test(void)
 #define EXPOSE_LEAK_DB		3.0
 
 /*
- * The trials of one exposure run. A trial is the stale run's when the frame
- * before it read a stale run at the trigger and a latch run under its own.
- * A trial counts as kept when the coefficient energy it ends with stands
- * more than 1 percent from the energy it started with. The gaps count active
- * frames, the frames whose own reference is active. The energies cover the
- * trial frames: the microphone, the output, the echo, the echo that the
- * output leaves (the output less the near speech and the floor), and the near
- * speech against the output.
+ * The trials of one exposure run: a stale-run trial follows a stale run at the
+ * trigger and a latch run under its own. A trial counts as kept when its end
+ * energy stands more than 1 percent from its start. Gaps count active frames;
+ * the energies cover the trial frames.
  */
 struct expose_stat {
 	unsigned trials;
@@ -9585,15 +9929,10 @@ static void expose_bounds_check(const struct expose_stat *st)
 #define QUIET_UNDER_DB		2.0
 
 /*
- * The ringback line converges on white noise, then far-end words run for
- * 60 s with near words 2 dB under the echo. The talker fires on the estimate
- * under the classic bar, so the stale run starts trials, and the talker fails
- * each one. The line must run one trial in the first 20 s and no reset, and
- * each trial must restore the coefficient energy within 1 percent. Two trials
- * must stand 700 active frames apart or more, because a rejected trial stands
- * the stale run down. Without that stand-down, the next trial follows after
- * 330 to 530 active frames. The trial frames keep the bounds of the steady
- * talker, and the talker passes them 1.5 dB quieter.
+ * Near words 2 dB under the echo on far words for 60 s fire under the classic
+ * bar. The stale run then starts trials that the talker refuses. One comes in
+ * the first 20 s, and each restores the energy within 1 percent. Two stand at
+ * least 700 active frames apart, within the bounds of the steady talker.
  */
 static void stale_quiet_test(void)
 {
@@ -9637,15 +9976,10 @@ static void stale_quiet_test(void)
 }
 
 /*
- * A white near talker at the echo level joins the white far end of the
- * converged ringback line for 30 s. Each frame fires on the trusted estimate
- * under the classic bar, and the stale run starts the first trial. The latch
- * arm starts the others, and each of them carries the stand-down of the stale
- * run on. Each trial must be rejected, and two trials must stand 600 active
- * frames apart or more, the cadence of the latch arm alone. In the trial
- * frames the near speech must pass within 2 dB, and the output must stay
- * under the microphone plus 3 dB. The echo that the output leaves must stay
- * 3 dB or more under the echo.
+ * A white near talker at echo level on the converged ringback line for 30 s:
+ * the stale run starts the trials and the latch run waits on the independent
+ * talker. Each trial is refused, EXPOSE_ANY_CADENCE frames apart or more; in
+ * the trial frames near speech passes within 2 dB, and the echo stays reduced.
  */
 static void expose_steady_test(void)
 {
@@ -9745,14 +10079,10 @@ static void expose_turns_test(void)
 #define STOP_ERLE_LOSS_DB	3.0
 
 /*
- * A talker between the two bars who stops during the trial. The ringback
- * line converges on white noise and measures its filter ERLE over the last
- * second. A white near talker at the echo level then joins the white far end.
- * The stale run starts a trial, the talker stops 50 frames into it, and the
- * far end talks on alone for 3 s. The trial ends without the talker, so its
- * verdict can keep a filter that adapted on the talker. That costs at most
- * 3 dB of filter ERLE, and the trial frames keep the bounds of the steady
- * talker.
+ * A talker between the two bars stops 50 frames into a stale-run trial, and the
+ * far end then talks alone for 3 s. The verdict can keep a filter that adapted
+ * on the talker, at a cost of 3 dB of filter ERLE at most. The trial frames
+ * keep the bounds of the steady talker.
  */
 static void expose_stop_test(void)
 {
@@ -9830,14 +10160,10 @@ static void twin_ring_run(struct ring_line *lead, struct ring_line *twin,
 }
 
 /*
- * The filter after a rejected trial of the stale run, against a frozen twin.
- * Two ringback lines take the same frames: white noise, then a white near
- * talker at the echo level until the first line starts a trial. The twin
- * freezes on that frame, so its filter holds the snapshot of the trial. The
- * talker refuses the trial, and both lines then freeze and take 20 frames of
- * the far end alone. Two frozen filters give one output on one frame only
- * when they hold the same coefficients. The outputs must be equal sample for
- * sample.
+ * The filter after a refused stale-run trial against a twin frozen on the
+ * trial's start frame: both freeze after the refusal and take 20 frames of far
+ * end alone. Their outputs must match sample for sample, which holds only when
+ * they hold the same coefficients.
  */
 static void expose_twin_test(void)
 {
@@ -10042,13 +10368,10 @@ static void change_frame_run(struct udsp_ec *ec, struct echo_path *path,
 }
 
 /*
- * A talker between the two bars during talk-over, then a hybrid change. A
- * flat 12 dB hybrid at 8 ms converges for 4 s on a white far end at
- * -10 dBm0. The near-end floor stands at -70 dBm0. A white near talker at the
- * level of the echo then joins for 400 frames. The stale run starts a trial
- * after 200 of them, and the talker refuses it. The talker stops, and the
- * hybrid changes to the late one at 28 ms. marks takes each frame when it is
- * not NULL.
+ * A talker between the two bars during talk-over, then a hybrid change. A flat
+ * 12 dB hybrid converges, and a white talker at echo level joins for 400 frames
+ * and refuses a stale-run trial. The hybrid then changes to the late one at 28
+ * ms. marks takes each frame when it is not NULL.
  */
 static void change_run(unsigned rate, struct change_result *out,
 		       struct trial_marks *marks)
@@ -10099,14 +10422,10 @@ static void change_run(unsigned rate, struct change_result *out,
 #define CHANGE_HEAD_SETTLED	125u
 
 /*
- * A talker between the two bars during talk-over, then a hybrid change. The
- * talker refuses a trial of the stale run and stops, and the flat 12 dB
- * hybrid changes to the late one. The rejected trial stands the stale run
- * down and not the path-change escape, so the escape must answer the change.
- * Without the stale run, the line runs one trial, for the change, and reaches
- * 20 dB of ERLE 125 frames after it (CHANGE_HEAD_SETTLED). The line must
- * run one trial more, settle within those 125 frames and run no reset. A
- * stale-run trial that stands the escape down keeps the change in lockout.
+ * The refused stale-run trial stands the stale run down and not the path-change
+ * escape, so the escape answers the change. The line runs one trial more than
+ * without the stale run, settles within CHANGE_HEAD_SETTLED frames and runs no
+ * reset.
  */
 static void change_test(unsigned rate)
 {
@@ -10167,14 +10486,10 @@ static void return_white_run(struct ring_line *line, double talk_dbm0,
 }
 
 /*
- * A talker on the frame that the far end returns on starts no trial of the
- * stale run. On the converged ringback line, a white near talker at the echo
- * level joins the white far end until the run reaches 200. Both pause for
- * 500 ms: the hangover runs out, and the run stays at 200 or more. On the
- * first frame of the return, a talker at -20 dBm0 speaks, 15 dB or more over
- * the classic bar. The run must read 0 after that frame, and the line must
- * run no trial on it or on the next 100 active frames. A build that reads the
- * run before the clear starts a trial on that frame.
+ * A talker on the frame of the far return starts no stale-run trial. After a
+ * run of 200 and a 500 ms pause, a talker 15 dB or more over the classic bar
+ * speaks on the return. The run reads 0 after that frame, and no trial starts
+ * on it or the next 100 active frames.
  */
 static void stale_return_test(unsigned rate)
 {
@@ -10240,16 +10555,15 @@ static void stale_return_test(unsigned rate)
 #define CARRY_LIMIT_FRAMES	(10u * FRAMES_PER_SECOND)
 
 /*
- * One trial of the carry case. start counts the frames to the frame the trial
- * starts on, and end the frames to the first frame after the trial. The arm
- * follows from the runs of the frame before the start. The stale run at its
- * trigger with the latch run under its own is the stale run's. Both runs under
- * their triggers is the path-change escape's. A trial counts as kept by the
- * rule of struct expose_stat.
+ * One trial of the carry case: start and end count the frames to its start and
+ * past its end. The runs of the frame before name the arm: a stale run at its
+ * trigger with the latch run under, the stale run's; both under, the
+ * path-change escape's. Kept as in struct expose_stat.
  */
 struct carry_trial {
 	unsigned start;
 	unsigned end;
+	unsigned arm;
 	bool path;
 	bool stale;
 	bool kept;
@@ -10281,6 +10595,7 @@ static void carry_trial_run(struct udsp_ec *ec, struct echo_path *path,
 		udsp_ec_nlms_frame_get(ec, &reading);
 		if (info.probes != probes) {
 			t->start = f + 1u;
+			t->arm = reading.trial_arm;
 			t->stale = before.stale_run >= TALKER_STALE_FRAMES &&
 				   before.dt_run < TALKER_LATCH_FRAMES;
 			t->path = before.stale_run < TALKER_STALE_FRAMES &&
@@ -10295,28 +10610,54 @@ static void carry_trial_run(struct udsp_ec *ec, struct echo_path *path,
 }
 
 /*
- * A refused trial of the stale run inside the stand-down of the path-change
- * escape carries that stand-down on. On the converged change line, a talker
- * 3 dB over the echo refuses the trial of the escape after a change to the
- * late hybrid. The flat hybrid returns, and a talker at the echo level
- * refuses a trial of the stale run inside the stand-down. After 150 frames of
- * the far end alone, the late hybrid returns under the louder talker. The
- * next trial must be the escape's, more than 600 frames after the second
- * refusal. Without the carry, the escape comes back with the rest of the
- * first stand-down.
+ * Frames of the change line with a near talker at talk_dbm0 until a trial of
+ * arm starts, or for limit frames. It returns the frames to that start, limit
+ * for none. first takes the arm of the first trial that starts, NONE for
+ * none.
+ */
+static unsigned carry_arm_run(struct udsp_ec *ec, struct echo_path *path,
+			      uint32_t state[3], double talk_dbm0,
+			      unsigned limit, unsigned arm, unsigned *first)
+{
+	struct udsp_ec_nlms_frame reading;
+	double echo_energy = 0.0;
+	double res_energy = 0.0;
+	unsigned f;
+
+	*first = UDSP_EC_NLMS_TRIAL_ARM_NONE;
+	for (f = 0; f < limit; f++) {
+		change_frame_run(ec, path, state, true, talk_dbm0,
+				 &echo_energy, &res_energy);
+		udsp_ec_nlms_frame_get(ec, &reading);
+		if (reading.trial_arm == UDSP_EC_NLMS_TRIAL_ARM_NONE)
+			continue;
+		if (*first == UDSP_EC_NLMS_TRIAL_ARM_NONE)
+			*first = reading.trial_arm;
+		if (reading.trial_arm == arm)
+			return f + 1u;
+	}
+	return limit;
+}
+
+/*
+ * A refused stale-run trial inside an escape's stand-down carries it: a talker
+ * refuses a path-change trial, then a stale-run trial inside its stand-down.
+ * When the late hybrid returns, no path-change trial starts within 600 frames
+ * of the second refusal, and the coherence escape answers first.
  */
 static void stale_carry_test(unsigned rate)
 {
 	struct udsp_ec_nlms_info info;
 	struct carry_trial change;
 	struct carry_trial stale;
-	struct carry_trial next;
 	struct echo_path first;
 	struct echo_path second;
 	struct udsp_ec *ec = udsp_ec_nlms.create_rate(48, rate);
 	uint32_t state[3] = { 0x13572468u, 0xfeedfaceu, 0x2468acefu };
 	double echo_energy = 0.0;
 	double res_energy = 0.0;
+	unsigned next_arm;
+	unsigned again_at;
 	unsigned gap;
 	unsigned f;
 
@@ -10336,32 +10677,37 @@ static void stale_carry_test(unsigned rate)
 		change_frame_run(ec, &first, state, false, CHANGE_ECHO_DBM0,
 				 &echo_energy, &res_energy);
 	path_history_carry(&second, &first);
-	carry_trial_run(ec, &second, state, CARRY_LOUD_DBM0, CARRY_LIMIT_FRAMES,
-			&next);
+	again_at = carry_arm_run(ec, &second, state, CARRY_LOUD_DBM0,
+				 CARRY_LIMIT_FRAMES, change.arm, &next_arm);
 	udsp_ec_nlms_info_get(ec, &info);
 	udsp_ec_nlms.destroy(ec);
 	/* The refusal falls on the frame before end, and the frame at end and
 	 * the clear frames follow it. */
-	gap = 1u + CARRY_CLEAR_FRAMES + next.start;
+	gap = 1u + CARRY_CLEAR_FRAMES + again_at;
 
-	case_rate(rate, "lec carries the stand-down of the path-change escape "
-		  "through a refused stale-estimate trial");
-	printf("# escape trial %u frames after the change, kept %u; stale-run "
-	       "trial %u frames after the refusal of the escape trial, stale "
-	       "%u, kept %u; next trial %u frames after the refusal of the "
-	       "stale-run trial, escape %u; %u trials, %u resets\n",
-	       change.start, change.kept, 1u + stale.start,
-	       stale.stale, stale.kept, gap, next.path, info.probes,
+	case_rate(rate, "lec carries the stand-down of an escape through a "
+		  "refused stale-estimate trial");
+	printf("# %s escape trial %u frames after the change, kept %u; "
+	       "stale-run trial %u frames after the refusal of the escape "
+	       "trial, stale %u, kept %u; next trial of the %s escape %u "
+	       "frames after the refusal of the stale-run trial (%u for "
+	       "none), first trial after it %s; %u trials, %u resets\n",
+	       lecr_trial_arm_name(change.arm), change.start, change.kept,
+	       1u + stale.start, stale.stale, stale.kept,
+	       lecr_trial_arm_name(change.arm), gap,
+	       1u + CARRY_CLEAR_FRAMES + CARRY_LIMIT_FRAMES,
+	       lecr_trial_arm_name(next_arm), info.probes,
 	       info.diverge_resets);
 	CHECK(change.end > 0u);
 	CHECK(change.path);
+	CHECK_UINT(change.arm, UDSP_EC_NLMS_TRIAL_ARM_PATH);
 	CHECK(!change.kept);
 	CHECK(stale.end > 0u);
 	CHECK(stale.stale);
+	CHECK_UINT(stale.arm, UDSP_EC_NLMS_TRIAL_ARM_STALE);
 	CHECK(!stale.kept);
 	CHECK(1u + stale.start < CARRY_COOLDOWN);
-	CHECK(next.start > 0u);
-	CHECK(next.path);
+	CHECK_UINT(next_arm, UDSP_EC_NLMS_TRIAL_ARM_COHERE);
 	CHECK(gap > CARRY_COOLDOWN);
 	CHECK_UINT(info.diverge_resets, 0);
 }
@@ -10373,13 +10719,10 @@ static void stale_carry_test(unsigned rate)
 #define REPAY_DECAY		4u
 
 /*
- * The clear frames of an active window repay the stale run. A white talker at
- * the echo level joins the white far end of the converged ringback line until
- * the run reaches 160. The far end then talks alone for 48 frames, and each
- * clear frame after the hangover repays 4. The run must read 160 less 4 per
- * clear frame. The talker then joins again for 100 frames, and the line must
- * run no trial. A run that the clear frames do not repay reaches the trigger
- * of 200 and starts a trial.
+ * The clear frames of an active window repay the stale run. After a run of 160,
+ * the far end talks alone, and each clear frame repays 4. The run then reads
+ * 160 less 4 per clear frame. A talker after it starts no trial. A run that is
+ * not repaid reaches 200 and starts one.
  */
 static void stale_repay_test(unsigned rate)
 {
@@ -10429,14 +10772,16 @@ static void stale_repay_test(unsigned rate)
 	CHECK_UINT(info.probes, 0);
 }
 
-#define MARK_LATCH_DBM0		-19.0
+/* The talker of the latch leg, 12 dB over the echo: the estimate holds under
+ * 0.10 of its microphone energy, so the latch run grows on its frames. */
+#define MARK_LATCH_DBM0		-10.0
 #define MARK_LATCH_FRAMES	650u
 #define MARK_PAUSE_PHASE	21u
 #define MARK_PAUSE_FRAMES	(20u * FRAMES_PER_SECOND)
 
-/* The step line of the talker cases: a white far end at TALKER_FAR_DBM0 on a
- * flat hybrid that steps from 12 dB to 3 dB, and a white talker 16 dB over
- * the far end on trial frame 10. */
+/* The step line of the talker cases: a white far end at TALKER_FAR_DBM0 and a
+ * flat hybrid stepping from TALKER_STEP_FROM_DB to TALKER_STEP_TO_DB. A white
+ * talker TALKER_OVER_DB over the far end joins on TALKER_TRIAL_FRAME. */
 #define TALKER_FAR_DBM0		-20.0
 #define TALKER_OVER_DB		16.0
 #define TALKER_TRIAL_FRAME	10u
@@ -10475,7 +10820,8 @@ static void trial_word_check(void)
 		{ UDSP_EC_NLMS_TRIAL_ARM_LATCH, "latch" },
 		{ UDSP_EC_NLMS_TRIAL_ARM_PATH, "path" },
 		{ UDSP_EC_NLMS_TRIAL_ARM_STALE, "stale" },
-		{ UDSP_EC_NLMS_TRIAL_ARM_STALE + 1u, "?" },
+		{ UDSP_EC_NLMS_TRIAL_ARM_COHERE, "cohere" },
+		{ UDSP_EC_NLMS_TRIAL_ARM_COHERE + 1u, "?" },
 	}, ends[] = {
 		{ UDSP_EC_NLMS_TRIAL_END_NONE, "" },
 		{ UDSP_EC_NLMS_TRIAL_END_KEPT, "kept" },
@@ -10510,9 +10856,10 @@ static void trial_reset_check(struct udsp_ec *ec, unsigned arm, unsigned end)
 }
 
 /*
- * The fixture of latch_refusal_test on the change line: a talker 3 dB over
- * the echo of a converged late hybrid refuses the latch trial. The instance
- * resets on the end frame, and the frame after the reset closes the trial.
+ * The latch refusal of latch_refusal_test on the change line: a talker 12 dB
+ * over the echo of a converged late hybrid (MARK_LATCH_DBM0) refuses the
+ * latch trial. The instance resets on the end frame, and the frame after the
+ * reset closes the trial.
  */
 static void trial_latch_leg(void)
 {
@@ -10568,12 +10915,10 @@ static void trial_change_leg(void)
 }
 
 /*
- * The fixture of probe_pause_test: the DTX far end on the flat 0 dB hybrid,
- * from word phase MARK_PAUSE_PHASE. At that phase the latch run comes due
- * inside a far-end pause, so the trial waits for the next active frame. At
- * phase 0 the run comes due on an active frame, and no frame waits. The trial
- * frames inside the pauses do not adapt. The arm must read on the start frame
- * only, and the end on the end frame only.
+ * The fixture of probe_pause_test: from word phase MARK_PAUSE_PHASE the latch
+ * comes due inside a far pause and the trial waits for the next active frame;
+ * at phase 0 none waits. Trial frames in the pauses do not adapt; the arm reads
+ * on the start frame only, and the end on the end frame only.
  */
 static void trial_pause_leg(void)
 {
@@ -10696,14 +11041,11 @@ static void trial_diverge_leg(void)
 }
 
 /*
- * lec_replay prints the trial fields of the frame reading for each frame. A
- * start frame must read its arm and probing 0, an end frame its end and
- * probing 1, and every other frame NONE. A reset on a start frame or an end
- * frame clears both fields. At 8 kHz, talkers refuse a latch trial and a
- * stale-run trial, and the line keeps a path-change trial. A latch comes due
- * in a far-end pause, a talker ends a latch trial, and the watchdog stops
- * latch trials on the hybrid that amplifies. The words of lecr_trial_arm_name
- * and lecr_trial_end_name must match the enum values.
+ * lec_replay prints the trial fields of each frame: a start frame reads its arm
+ * and probing 0, an end frame its end and probing 1. Every other frame reads
+ * NONE, and a reset on either clears both. The lines cover each arm and each
+ * end, and the words of lecr_trial_arm_name and lecr_trial_end_name match the
+ * enums.
  */
 static void trial_mark_test(void)
 {
@@ -10757,13 +11099,10 @@ static void dense_talker_fill(struct dense_talker *t, int16_t *dst,
 #define LATCH_TALK_FRAMES	(30u * FRAMES_PER_SECOND)
 
 /*
- * A near talker over a far end that never pauses: a fan at -26 dBm0 on the
- * 24 dB hybrid of the fan line. The filter trains on the fan alone for 3 s,
- * and a dense talker at -10 dBm0 then talks for 30 s. More than half of the
- * frames of each word stand more than 12 dB over the fan. The talker guard
- * of dsp/lec.c therefore clears the latch run on each word. The line must run
- * no trial, no reset and no exposure frame, and the near speech must pass
- * within 2 dB. A canceller without the guard runs 5 trials at each rate.
+ * A near talker over a far end that never pauses: a dense talker at -10 dBm0
+ * over a fan at -26 dBm0. Most of its word frames stand 12 dB over the fan, so
+ * the talker guard clears the latch run on each word. No trial, no reset, no
+ * exposure frame, and the near speech passes within 2 dB.
  */
 static void latch_talker_test(unsigned rate)
 {
@@ -10800,12 +11139,249 @@ static void latch_talker_test(unsigned rate)
 	CHECK_UINT(sp->exposure, 0);
 }
 
+#define LOUDER_TALK_ERL_DB	12.0
+#define LOUDER_TALK_STEP_DB	3.0
+#define LOUDER_TALK_OVER_DB	9.0
+#define LOUDER_TALK_FRAMES	600u
+
 /*
- * The first run of trial_talker_test. A flat 12 dB hybrid converges for
- * 1.5 s on a white far end at -20 dBm0 and steps to 3 dB. The detector holds
- * the louder echo, and the latch starts a trial on a held frame. The twin
- * freezes after that frame, so its filter is the snapshot. On trial frame 10
- * a white talker 16 dB over the far end joins.
+ * A white near talker over a path that got louder with the same shape. The
+ * residual echo carries a copy of the estimate, so the latch rule of
+ * dsp/lec.c reads no independent talker (the LEC_LATCH_NCC_BAND comment).
+ * The filter must be trusted on the step, and the latch must start a trial
+ * within LOUDER_TALK_FRAMES frames of it.
+ */
+static void latch_louder_talker_test(unsigned rate)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct echo_path path;
+	struct udsp_ec *ec = udsp_ec_nlms.create_rate(48, rate);
+	uint32_t state = 0x9a8b7c6du;
+	uint32_t near_state = 0x2468acefu;
+	double near_dbm0 = -10.0 - LOUDER_TALK_ERL_DB + LOUDER_TALK_OVER_DB;
+	unsigned arm = UDSP_EC_NLMS_TRIAL_ARM_NONE;
+	unsigned started = 0;
+	bool trusted;
+	unsigned f;
+
+	udsp_ec_nlms.nlp(ec, false);
+	path_flat_init(&path, rate, 8, LOUDER_TALK_ERL_DB);
+	(void)erle_run(ec, &path, &state, -10.0, 3u * FRAMES_PER_SECOND, 20);
+	udsp_ec_nlms_frame_get(ec, &reading);
+	udsp_ec_nlms_info_get(ec, &info);
+	trusted = reading.trusted;
+	path_erl_set(&path, LOUDER_TALK_ERL_DB - LOUDER_TALK_STEP_DB);
+	for (f = 0; f < LOUDER_TALK_FRAMES && !started; f++) {
+		int16_t ref[UDSP_FRAME_MAX];
+		int16_t echo[UDSP_FRAME_MAX];
+		int16_t near[UDSP_FRAME_MAX];
+		int16_t mic[UDSP_FRAME_MAX];
+		unsigned i;
+
+		noise_fill(ref, path.frame, -10.0, &state);
+		path_run(&path, ref, echo);
+		noise_fill(near, path.frame, near_dbm0, &near_state);
+		for (i = 0; i < path.frame; i++)
+			mic[i] = sample_clamp((double)echo[i] + near[i]);
+		udsp_ec_nlms.run(ec, mic, ref);
+		udsp_ec_nlms_frame_get(ec, &reading);
+		if (reading.trial_arm == UDSP_EC_NLMS_TRIAL_ARM_NONE)
+			continue;
+		started = f + 1u;
+		arm = reading.trial_arm;
+	}
+	udsp_ec_nlms.destroy(ec);
+
+	case_rate(rate, "lec latch starts a trial on a louder path under a "
+		  "near talker");
+	printf("# hybrid %.0f dB louder, talker %.0f dB over the old echo: "
+	       "trusted %d on the step, %u trials before it; first trial on "
+	       "frame %u, arm %s\n", LOUDER_TALK_STEP_DB, LOUDER_TALK_OVER_DB,
+	       trusted, info.probes, started, lecr_trial_arm_name(arm));
+	CHECK(trusted);
+	CHECK_UINT(info.probes, 0);
+	CHECK(started > 0u);
+	CHECK_UINT(arm, UDSP_EC_NLMS_TRIAL_ARM_LATCH);
+}
+
+#define ROLLBACK_ERL_DB		12.0
+#define ROLLBACK_FAR_DBM0	-10.0
+#define ROLLBACK_TALK_DBM0	-10.0
+#define ROLLBACK_TRAIN_FRAMES	(3u * FRAMES_PER_SECOND)
+
+/* Both instances of the rollback cases on the converged flat hybrid: a white
+ * far end, no near end, the processor off. */
+static void rollback_line_train(struct udsp_ec *lead, struct udsp_ec *twin,
+				struct echo_path *path, uint32_t *state)
+{
+	int16_t ref[UDSP_FRAME_MAX];
+	int16_t lead_out[UDSP_FRAME_MAX];
+	int16_t twin_out[UDSP_FRAME_MAX];
+	unsigned f;
+
+	udsp_ec_nlms.nlp(lead, false);
+	udsp_ec_nlms.nlp(twin, false);
+	for (f = 0; f < ROLLBACK_TRAIN_FRAMES; f++) {
+		noise_fill(ref, path->frame, ROLLBACK_FAR_DBM0, state);
+		twin_step(lead, twin, path, ref, NULL, lead_out, twin_out,
+			  NULL);
+	}
+}
+
+/*
+ * The output of a frame that the detector rolls back (the frame_undo comment
+ * of dsp/lec.c). A lead and a twin converge a flat hybrid on identical
+ * frames. A near talker at the far-end level then starts halfway into a
+ * frame on which the twin is frozen. The lead must fire on that frame and
+ * roll it back, and its output must equal the twin's, sample for sample.
+ */
+static void rollback_output_test(unsigned rate)
+{
+	struct udsp_ec_nlms_frame before;
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct udsp_ec_nlms_info twin_info;
+	struct echo_path path;
+	struct udsp_ec *lead = udsp_ec_nlms.create_rate(48, rate);
+	struct udsp_ec *twin = udsp_ec_nlms.create_rate(48, rate);
+	uint32_t state = 0x13572468u;
+	uint32_t near_state = 0xfeedfaceu;
+	int16_t ref[UDSP_FRAME_MAX];
+	int16_t near[UDSP_FRAME_MAX];
+	int16_t lead_out[UDSP_FRAME_MAX];
+	int16_t twin_out[UDSP_FRAME_MAX];
+	unsigned differ = 0;
+	unsigned i;
+
+	path_flat_init(&path, rate, 8, ROLLBACK_ERL_DB);
+	rollback_line_train(lead, twin, &path, &state);
+	udsp_ec_nlms_frame_get(lead, &before);
+	noise_fill(ref, path.frame, ROLLBACK_FAR_DBM0, &state);
+	noise_fill(near, path.frame, ROLLBACK_TALK_DBM0, &near_state);
+	for (i = 0; i < path.frame / 2u; i++)
+		near[i] = 0;
+	udsp_ec_nlms.freeze(twin, true);
+	twin_step(lead, twin, &path, ref, near, lead_out, twin_out, NULL);
+	udsp_ec_nlms_frame_get(lead, &reading);
+	udsp_ec_nlms_info_get(lead, &info);
+	udsp_ec_nlms_info_get(twin, &twin_info);
+	for (i = 0; i < path.frame; i++)
+		differ += lead_out[i] != twin_out[i];
+	udsp_ec_nlms.destroy(lead);
+	udsp_ec_nlms.destroy(twin);
+
+	case_rate(rate, "lec rolled-back frame emits the output of the "
+		  "coefficients it started with");
+	printf("# talker frame: trusted %d before it, fired %d, coefficient "
+	       "energy %.9f against the twin's %.9f; %u of %u samples differ "
+	       "from the frozen twin\n", before.trusted, reading.dt_fired,
+	       (double)info.coef_energy, (double)twin_info.coef_energy,
+	       differ, path.frame);
+	CHECK(before.trusted);
+	CHECK(!before.dt_fired);
+	CHECK_UINT(before.hold_left, 0);
+	CHECK(reading.dt_fired);
+	CHECK(!reading.probing);
+	CHECK(info.coef_energy == twin_info.coef_energy);
+	CHECK_UINT(differ, 0);
+}
+
+#define MASK_STEP_DB		6.0
+#define MASK_OVER_DB		2.5
+#define MASK_NEXT_FRAMES	3u
+#define MASK_RUN_FRAMES		(3u * FRAMES_PER_SECOND)
+/* The rolled-back frames of the masking run at 8 and 16 kHz. */
+#define MASK_ROLLBACKS		1u
+
+static double frame_power_get(const int16_t *x, unsigned n)
+{
+	double sum = 0.0;
+	unsigned i;
+
+	for (i = 0; i < n; i++)
+		sum += (double)x[i] * x[i];
+	return sum / n;
+}
+
+/*
+ * The cost of the rollback output on a path change (frame_undo): after the
+ * training of rollback_output_test the hybrid turns MASK_STEP_DB louder. The
+ * first rolled-back frame carries the echo of its start coefficients and stands
+ * MASK_OVER_DB or less over the loudest next held frame.
+ */
+static void rollback_mask_test(unsigned rate)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct echo_path path;
+	struct udsp_ec *lead = udsp_ec_nlms.create_rate(48, rate);
+	struct udsp_ec *twin = udsp_ec_nlms.create_rate(48, rate);
+	uint32_t state = 0x2468acefu;
+	double power[MASK_NEXT_FRAMES + 1u] = { 0.0 };
+	double loudest = 0.0;
+	double over_db;
+	unsigned rollbacks = 0;
+	unsigned held = 0;
+	int after = -1;
+	bool double_talk;
+	unsigned f;
+
+	path_flat_init(&path, rate, 8, ROLLBACK_ERL_DB);
+	rollback_line_train(lead, twin, &path, &state);
+	udsp_ec_nlms.destroy(twin);
+	udsp_ec_nlms_info_get(lead, &info);
+	double_talk = info.double_talk;
+	path_erl_set(&path, ROLLBACK_ERL_DB - MASK_STEP_DB);
+	for (f = 0; f < MASK_RUN_FRAMES; f++) {
+		int16_t ref[UDSP_FRAME_MAX];
+		int16_t echo[UDSP_FRAME_MAX];
+		bool active;
+		bool rollback;
+
+		noise_fill(ref, path.frame, ROLLBACK_FAR_DBM0, &state);
+		path_run(&path, ref, echo);
+		udsp_ec_nlms.run(lead, echo, ref);
+		udsp_ec_nlms_frame_get(lead, &reading);
+		udsp_ec_nlms_info_get(lead, &info);
+		active = reading.ref_power >= reading.ref_bar;
+		rollback = active && reading.dt_fired && !double_talk &&
+			   !reading.probing;
+		rollbacks += rollback;
+		if (after < 0 && rollback) {
+			after = 0;
+			power[0] = frame_power_get(echo, path.frame);
+		} else if (after >= 0 && after < (int)MASK_NEXT_FRAMES) {
+			power[++after] = frame_power_get(echo, path.frame);
+			held += info.double_talk;
+		}
+		double_talk = info.double_talk;
+	}
+	udsp_ec_nlms.destroy(lead);
+	for (f = 1; after == (int)MASK_NEXT_FRAMES && f <= MASK_NEXT_FRAMES;
+	     f++) {
+		if (power[f] > loudest)
+			loudest = power[f];
+	}
+	over_db = after == (int)MASK_NEXT_FRAMES ?
+		  10.0 * log10((power[0] + 1.0) / (loudest + 1.0)) : 200.0;
+
+	case_rate(rate, "lec rolled-back frame of a path change stands under "
+		  "the held frames after it");
+	printf("# hybrid %.0f dB louder: %u rolled-back frames in 3 s; the "
+	       "first stands %.2f dB against the loudest of the next %u, %u "
+	       "of them held\n", MASK_STEP_DB, rollbacks, over_db,
+	       MASK_NEXT_FRAMES, held);
+	CHECK_UINT(rollbacks, MASK_ROLLBACKS);
+	CHECK_UINT(held, MASK_NEXT_FRAMES);
+	CHECK(over_db <= MASK_OVER_DB);
+}
+
+/*
+ * The first run of trial_talker_test: a flat 12 dB hybrid converges at -20 dBm0
+ * and steps to 3 dB, and the latch starts a trial on a held frame. The twin
+ * freezes after it, and on trial frame 10 a talker 16 dB over the far end
+ * joins.
  */
 static void trial_talker_step_check(void)
 {
@@ -10881,12 +11457,10 @@ static void trial_talker_step_check(void)
 }
 
 /*
- * The second run of trial_talker_test. The snapshot line at -20 dBm0 comes
- * to a due latch, and the twin freezes. The latch starts a trial on the next
- * frame, after the hangover ran out, so the snapshot holds no double talk.
- * The talker 3 dB over the echo talks on, and on trial frame 10 a white
- * talker 16 dB over the far end replaces it. The output of that frame must
- * equal the output of the twin, sample for sample.
+ * The second run: the latch starts a trial after the hangover ran out, so the
+ * snapshot holds no double talk. On trial frame 10 a talker 16 dB over the far
+ * end replaces the talker 3 dB over the echo. That frame's output equals the
+ * frozen twin's, sample for sample.
  */
 static void trial_talker_snap_check(void)
 {
@@ -10924,13 +11498,10 @@ static void trial_talker_snap_check(void)
 }
 
 /*
- * A talker 16 dB over the far end on frame 10 of a running trial. The frame
- * must read the talker, read probing, read the end talker and count one held
- * frame. The frame after it must read no trial, and the line must count no
- * new trial and no reset. The coefficient energy must equal that of a twin
- * frozen on the frame the trial started. A second run starts the trial after
- * the hangover ran out, so the snapshot holds no double talk. The output of
- * the frame that ends the trial must equal the output of the frozen twin.
+ * A talker 16 dB over the far end on frame 10 of a running trial: the frame
+ * reads the talker, probing and the end talker, with one held frame. The next
+ * reads no trial, with no new trial or reset. The energy and, in a second run,
+ * the output equal those of a twin frozen on the start frame.
  */
 static void trial_talker_test(void)
 {
@@ -10944,14 +11515,10 @@ static void trial_talker_test(void)
 #define RETURN_QUIET_DB		8.0
 
 /*
- * The latch comes due on a talker frame: the snapshot line at -20 dBm0 comes
- * to a due latch over a far-end pause. The far end returns 8 dB quieter, with
- * a white talker 16 dB over it. The talker clears the latch run before the
- * arms read it, so the line must start no trial then or in the next 100
- * frames. A build that clears the run after the arms read it starts a trial
- * on the return frame. The guard window must follow the silent frames of the
- * pause. A guard window that keeps the louder far end reads the talker only
- * 8 dB over it, and the latch starts a trial.
+ * The latch comes due on a talker frame: after a pause, the far end returns 8
+ * dB quieter under a talker 16 dB over it. The talker clears the latch run
+ * before the arms read it, so no trial starts in the next 100 frames. The guard
+ * window follows the silent pause frames, not the louder far end before.
  */
 static void latch_return_test(void)
 {
@@ -11042,15 +11609,10 @@ static bool tail_talker_get(struct udsp_ec *ec, unsigned frame,
 }
 
 /*
- * A late echo is not a talker: a flat 6 dB hybrid puts its delay 1 ms short
- * of the default tail. Far-end words at -20 dBm0 stop into a noise at
- * -48 dBm0 that keeps the window active, and the near end is silent. The echo
- * of each word end outlasts the window of the frame, and the frame before
- * covers it: every frame must read no talker. The guard window must start
- * empty after a reset and must follow the reference feed. The line resets
- * inside a word, and later feeds 8 noise frames after a word. Each time, the
- * next frame carries a white talker 16 dB over the noise, and it must read
- * the talker.
+ * A late echo is not a talker: a flat 6 dB hybrid 1 ms short of the tail and
+ * far words that stop into noise. Every frame reads no talker, because the
+ * frame before covers the word end's echo. After a reset and after a feed, a
+ * white talker 16 dB over the noise still reads as a talker.
  */
 static void talker_tail_test(unsigned rate)
 {
@@ -11124,12 +11686,10 @@ static float cap_bar_max_get(float gain)
 }
 
 /*
- * The frames of one line of the far-floor cases: those whose bar stands over
- * the cap, those whose cap is not the formula of the gain before the frame,
- * those whose bar is not the fixed bar and those whose gain rose. restores
- * counts the trials whose end frame, a rejection or a talker end, left
- * another gain than the frame started with. On such a frame the cap must
- * still read the gain before the frame.
+ * The frames of one far-floor line that break a rule. Such a frame has a bar
+ * over the cap or a cap off the gain formula. A bar that is not fixed or a gain
+ * that rose also breaks a rule. restores counts the trials whose end frame left
+ * another gain; there the cap still reads the gain before the frame.
  */
 struct cap_stat {
 	unsigned frames;
@@ -11183,7 +11743,7 @@ static struct udsp_ec_nlms_info fan_cap_frame_run(struct fan_line *line,
 						  struct cap_stat *cap)
 {
 	struct udsp_ec_nlms_info info;
-	float gain;
+	float gain = 0.0f;
 
 	udsp_ec_nlms_info_get(line->ec, &info);
 	gain = info.echo_gain;
@@ -11192,15 +11752,9 @@ static struct udsp_ec_nlms_info fan_cap_frame_run(struct fan_line *line,
 	return info;
 }
 
-/*
- * Far words in phrases of 1.2 s in each cycle of 1.8 s, so a pause of 600 ms
- * follows each phrase. A line that decays the latch run on the frames of a
- * pause loses more of the run in the pause than a phrase adds to it. The
- * native word source completes the run of far_floor_latch_test 12.2 to 12.4 s
- * after the step, too near the bound of 12 s that the case needs. The longer
- * pauses are the harder test of the rule, and a build without the rule runs
- * no trial in 20 s on them.
- */
+/* Far words in phrases of 1.2 s in cycles of 1.8 s. A line that decays the
+ * latch run in a pause loses more there than a phrase adds. The pauses are
+ * therefore the harder test of the background rule. */
 #define PHRASE_FRAMES		120u
 #define PHRASE_CYCLE_FRAMES	180u
 
@@ -11233,14 +11787,9 @@ static struct udsp_ec_nlms_info phrase_frame_run(struct fan_line *line,
 	return info;
 }
 
-/*
- * The line of far_floor_talker_test, the fan line with a flat 30 dB hybrid.
- * The hybrid holds the learned gain at its floor, so the cap of the bar
- * stands at -38 dBm0. After 2 s of silence a fan at -45 dBm0 runs for 60 s,
- * with far words in its first 5 s. A dense talker at -42 dBm0 speaks from
- * 15 s to 55 s. Its word peaks stand 9.5 dB over the fan, under the talker
- * guard of dsp/lec.c.
- */
+/* The line of far_floor_talker_test: the fan line with a flat FLOOR_ERL_DB
+ * hybrid, whose cap stands at -38 dBm0, and a fan at -45 dBm0. A dense talker
+ * under the talker guard talks from FLOOR_TALK_FROM to FLOOR_TALK_TO. */
 #define FLOOR_FAN_DBM0		-45.0
 #define FLOOR_ERL_DB		30.0
 #define FLOOR_TALK_DBM0		-42.0
@@ -11252,17 +11801,10 @@ static struct udsp_ec_nlms_info phrase_frame_run(struct fan_line *line,
 #define FLOOR_QUIET_SHARE	0.90
 
 /*
- * One leg of far_floor_talker_test. from and to hold the state at the start
- * and at the end of the talk, and end the state at the end of the line. The
- * counts cover the fan frames after 15 s. With words set, far words in the
- * phrases of phrase_frame_run go on through the talk. A talker under the guard
- * who talks over far words then forms double-talk verdicts on the far-word
- * frames, and the latch run holds through the background pauses. That leg can
- * therefore still latch, and its trials are reported with no bar. This build
- * runs 1 latch trial at 8 kHz and 2 at 16 kHz, each rejected, with 688 and 742
- * exposure frames. The build that decays the run on background frames runs no
- * trial, with 656 and 693 exposure frames. Both pass the near speech within
- * 0.01 dB with no reset.
+ * One leg of far_floor_talker_test: from and to hold the state at the start and
+ * end of the talk, and end at the end of the line. The counts cover the fan
+ * frames after 15 s. With words set, far words go on through the talk, so that
+ * leg can still latch, and its trials are reported with no bar.
  */
 struct floor_talk {
 	struct udsp_ec_nlms_info from;
@@ -11319,14 +11861,10 @@ static void floor_talk_run(unsigned rate, bool words, struct floor_talk *t)
 }
 
 /*
- * A dense near talker under a stationary far end that the far-end floor
- * reads as quiet. While the talker speaks the line must run no trial and no
- * reset. 90 percent or more of the fan frames after 15 s must read a quiet
- * window, and each must read a background. The floor must end within 1.5 dB
- * of -72 dBm0, and the near speech must pass within 2 dB with no exposure
- * frame. A canceller without the far-end floor runs 6 trials at each rate
- * and reads no quiet window. A second leg keeps far words through the talk,
- * and it must run no reset and pass the speech within 2 dB.
+ * A dense near talker under a stationary far end that the far-end floor reads
+ * as quiet. No trial or reset runs during the talk, and 90 percent or more of
+ * the fan frames read a quiet window and a background. The floor ends near -72
+ * dBm0, and near speech passes within 2 dB with no exposure frame.
  */
 static void far_floor_talker_test(unsigned rate)
 {
@@ -11494,13 +12032,10 @@ static void ident_print(const char *what, unsigned rate,
 }
 
 /*
- * The identity of the far-end floor. Twins take the same frames of a
- * ringback line, the first with the switch on and the second with it off.
- * The far ends, 30 s each, pause to silence. They are the word source at
- * -20 dBm0 and the ringback line at both rates, and the speech-shaped and DTX
- * far ends at 8 kHz. Every output frame and the introspection must be equal,
- * and the bar of the first must read the fixed bar on every frame. A fan at
- * -45 dBm0, the negative control, must give different outputs.
+ * The identity of the far-end floor: twins with the switch on and off take far
+ * ends that pause to silence. These are the word source, the ringback, and the
+ * speech-shaped and DTX far ends at 8 kHz. Outputs and introspection match, and
+ * the bar reads the fixed bar; a fan at -45 dBm0 must make them differ.
  */
 static void far_floor_identity_test(void)
 {
@@ -11613,14 +12148,11 @@ static void bar_step_run(struct fan_line *line, double fan_dbm0,
 }
 
 /*
- * A flat 30 dB hybrid at 8 kHz takes 5 s of far words. The fan then steps
- * through silence, -52 dBm0, -46 dBm0, white noise at -20 dBm0 and silence.
- * After silence the bar must read the fixed bar for 300 frames, and from frame
- * 350 on the level times the margin within 3 dB. After the step to -46 dBm0
- * it must keep the value of -52 dBm0 for 300 frames, then follow. The white
- * noise must read the cap, and the bar must read the fixed bar on the second
- * silent frame, not on the first. From frame 350 on, only the fan at -46 dBm0,
- * over the fixed bar, must read a background.
+ * A flat 30 dB hybrid after far words, then a fan stepping through silence, -52
+ * and -46 dBm0, loud white noise and silence. The bar holds the fixed bar for
+ * 300 frames, then the level times the margin within 3 dB. It keeps a level for
+ * 300 frames after a step and reads the cap on the loud noise. Only the fan
+ * over the fixed bar reads a background.
  */
 static void far_floor_bar_test(void)
 {
@@ -11743,13 +12275,10 @@ static void cap_trial_run(struct cap_stat *st)
 }
 
 /*
- * The cap of the activity bar follows the learned gain of the frame. A fan
- * at -48 dBm0 on a 6 dB hybrid must keep the fixed bar on every frame. On
- * every frame of that line and of the line of stale_quiet_test, the bar must
- * stand at or under the cap. The cap must equal the larger of 2500 and 82.4
- * over the bound of the gain that the introspection read after the frame
- * before. The second line must hold a rising gain and a rejected trial that
- * restores another gain.
+ * The cap of the activity bar follows the learned gain of the frame: a fan on a
+ * 6 dB hybrid keeps the fixed bar. On that line and the line of
+ * stale_quiet_test the bar stands at or under the cap. The cap is the larger of
+ * 2500 and 82.4 over the bound of the gain read after the frame before.
  */
 static void far_floor_cap_test(void)
 {
@@ -11778,11 +12307,9 @@ static void far_floor_cap_test(void)
 
 /*
  * The far-end floor takes the frames of the reference feed and survives the
- * reset. Twins train on the same far words for 3 s on a flat 24 dB hybrid.
- * The first then takes 400 frames of a fan at -45 dBm0 through run(), the
- * second through udsp_ec_nlms_ref_feed. Their floors must be equal and over
- * 396.8. The reset of the first must keep its floor. The case compares no
- * bar, because the learned gain moves on the frames of run() only.
+ * reset. Twins take a fan through run() and through udsp_ec_nlms_ref_feed,
+ * their floors match over 396.8, and the reset keeps the floor. No bar is
+ * compared, because the learned gain moves on run() frames only.
  */
 static void far_floor_feed_test(void)
 {
@@ -11914,13 +12441,10 @@ static void floor_trial_run(unsigned talker_at, struct floor_trial *t)
 }
 
 /*
- * A hybrid step under a fan at -35 dBm0 over a raised bar starts a latch
- * trial. The fan drops to -45 dBm0 on trial frame 20. Every trial frame must
- * read the fixed bar, and the trial must end within 100 frames of its start.
- * A trial that kept the raised bar would wait on the quieter fan. In a second
- * run a talker 16 dB over the fan ends the trial on trial frame 40, and that
- * frame reads the raised bar. A third run puts the talker on trial frame 80,
- * and the cap of that frame must read the gain before the frame.
+ * A hybrid step under a fan over a raised bar starts a latch trial, and the fan
+ * drops on trial frame 20. Every trial frame reads the fixed bar, and the trial
+ * ends within 100 frames. A talker that ends the trial reads the raised bar on
+ * its frame, and the cap there reads the gain before the frame.
  */
 static void far_floor_trial_test(void)
 {
@@ -11973,14 +12497,10 @@ static void far_floor_trial_test(void)
 #define LOUDER_PAUSE_FRAMES	8u
 
 /*
- * The louder path of far_floor_latch_test. start and end are the frames after
- * the step that start and end the first trial, with its arm, its end and
- * whether the start frame was active. pause counts the pause frames from
- * frame 350 to the start of the trial, and background those of them that
- * read a background. The ERLE figures cover the far-word frames of the 5 s
- * before the step and of the 5 s after the trial. They read 8.21 and
- * 27.23 dB at 8 kHz, and 7.83 and 24.72 dB at 16 kHz. cap holds the cap
- * check of every frame of the line.
+ * The louder path of far_floor_latch_test: the frames that start and end the
+ * first trial, its arm and end, and whether the start frame is active. Then the
+ * pause and background frames before it, and the cap check of every frame.
+ * Last, the filter ERLE of the far words before the step and after the trial.
  */
 struct louder_stat {
 	unsigned start;
@@ -12071,13 +12591,10 @@ static void louder_run(unsigned rate, unsigned limit, struct louder_stat *st)
 }
 
 /*
- * The hybrid steps from 30 to 18 dB under a far-end background at -45 dBm0
- * and phrases of far words. A latch trial must start within 12 s of the step
- * on an active frame, and the line must keep it. The pause frames before the
- * trial must read a background. After the trial the filter ERLE on the far
- * words must reach that of the 5 s before the step, less 3 dB. The check is
- * one-sided, because those 5 s hold the cold start of the filter. A canceller
- * that decays the run in a pause runs no trial in 20 s at either rate.
+ * The hybrid steps from 30 to 18 dB under a background and phrases of far
+ * words. A latch trial starts within 12 s on an active frame and stands, and
+ * the pause frames before it read a background. The filter ERLE after it
+ * reaches that of the 5 s before the step, less 3 dB.
  */
 static void far_floor_latch_test(unsigned rate)
 {
@@ -12107,14 +12624,9 @@ static void far_floor_latch_test(unsigned rate)
 
 #define WORDS_ERL_DB		27.0
 #define WORDS_FAN_DBM0		-45.0
-/*
- * A far word every 45 frames, 450 ms. The restart comes before the shortest
- * pause of the word source, so every far word is the first word of the
- * source, 18 frames long. The window of 5 frames at 8 kHz holds the last
- * word frame until frame 21 of the cycle, and the window of 7 frames at
- * 16 kHz until frame 23 (words_pause_from_get). From the next frame on, the
- * window holds the fan alone, or nothing on a line with the fan off.
- */
+/* A far word every 45 frames, each the first word of the source, WORDS_LENGTH
+ * frames long. The window holds its last frame until frame 21 of the cycle at 8
+ * kHz and 23 at 16 kHz (words_pause_from_get), then the fan alone. */
 #define WORDS_CYCLE		45u
 #define WORDS_LENGTH		18u
 #define WORDS_TRAIN_FRAMES	(5u * FRAMES_PER_SECOND)
@@ -12134,43 +12646,18 @@ static void far_floor_latch_test(unsigned rate)
 #define WORDS_BURST_LEAD	5u
 #define WORDS_UNDER_DB		6.0
 #define WORDS_NEAR_FRAMES	6u
-/*
- * The near word through the processor, on a build that zeroes the engage run
- * on every quiet frame and runs this case. The word on the first frame of the
- * far word reads -0.0226 dB there. The word from the second frame, under the
- * echo, reads -0.53 dB there, the figure of the filter alone.
- */
+/* The near word through the processor on a build that zeroes the engage run on
+ * every quiet frame. It reads on the first far frame, and from the second frame
+ * it is the figure of the filter alone. */
 #define WORDS_NEAR_ZEROED_DB	-0.0226
 #define WORDS_LATE_ZEROED_DB	-0.53
 
 /*
- * One run of far_floor_words_test, or of the cases of a line with the fan
- * off. rate is the line rate, and fan says whether the fan runs. far_dbm0 is
- * the level of the far words after the training. A burst_word n puts the
- * near burst in the pause before word n. A near_word n puts the near word of
- * near_frames frames at near_dbm0 on word n, from frame near_from of the
- * word. A negative near_from starts the near word in the pause before word
- * n. 0 runs neither.
- *
- * latency holds, per word, the first frame of the word that reads nlp_active,
- * or WORDS_CYCLE when none does. quiet, quiet_acted and acted cover every
- * frame. lead counts the frames from the start of the burst to the word, and
- * lead_background those of them that read a background. The other counts
- * cover the frames after the training:
- * - loud and loud_idle: the frames whose far words cross the fixed bar, and
- *   those of them that read inactive, on the line with the processor off;
- * - pause and pause_background: the frames from words_pause_from_get on, and
- *   those of them that read a background, on that line;
- * - far_frames, far_acted and far_out: the frames of the far words, those
- *   that read nlp_active, and the output energy over them, on the line with
- *   the processor on.
- *
- * near is the energy of the near word, and near_on and near_off its products
- * with the output of each line. near_acted counts the frames of the near word
- * that read nlp_active, and near_later those of them after its first frame.
- * near_pause counts the frames of the near word before the far word, and
- * near_pause_lo and near_pause_hi hold the range of their microphone over the
- * floor that the detector read, in dB, on the line with the processor on.
+ * One run of far_floor_words_test or of the fan-off cases: the line, the far
+ * words, a near burst before word burst_word and a near word on near_word, from
+ * frame near_from. latency holds the first acting frame of each word, and the
+ * counts cover the frames and the near word on each line. alt_over_db and
+ * alt_pattern set the levels of the near frames before the far word.
  */
 struct words_run {
 	unsigned rate;
@@ -12203,6 +12690,12 @@ struct words_run {
 	double near_on;
 	double near_off;
 	double erle;
+	double overlap;
+	double overlap_on;
+	double overlap_off;
+	double alt_over_db;
+	double alt_under_db;
+	const char *alt_pattern;
 };
 
 /*
@@ -12378,18 +12871,56 @@ static void words_pause_note(const struct words_lines *l, struct words_run *r)
 static void words_near_note(const struct words_lines *l, struct words_run *r,
 			    const int16_t *near, unsigned index, bool acted)
 {
+	bool overlap = (long)index >= -(long)r->near_from;
 	unsigned i;
 
 	for (i = 0; i < l->on.frame; i++) {
-		r->near += (double)near[i] * near[i];
-		r->near_on += (double)l->on.out[i] * near[i];
-		r->near_off += (double)l->off.out[i] * near[i];
+		double energy = (double)near[i] * near[i];
+		double on = (double)l->on.out[i] * near[i];
+		double off = (double)l->off.out[i] * near[i];
+
+		r->near += energy;
+		r->near_on += on;
+		r->near_off += off;
+		if (!overlap)
+			continue;
+		r->overlap += energy;
+		r->overlap_on += on;
+		r->overlap_off += off;
 	}
 	r->near_acted += acted;
 	if (index)
 		r->near_later += acted;
 	if ((long)index < -(long)r->near_from)
 		words_pause_note(l, r);
+}
+
+/* Scales a frame of the near word before the far word, with index counted
+ * from 0. The microphone, the floor plus the word, then stands alt_over_db or
+ * alt_under_db over the floor of the previous frame. That floor is the
+ * reading of the line with the processor on. */
+static void words_alt_scale(const struct words_lines *l,
+			    const struct words_run *r, int16_t *near,
+			    unsigned index)
+{
+	struct udsp_ec_nlms_frame reading;
+	unsigned lead = (unsigned)-r->near_from;
+	double db = (lead - 1u - index) % 2u ? r->alt_under_db :
+					       r->alt_over_db;
+	double power = udsp_ec_nlms_frame_power_get(near, l->on.frame);
+	double gain;
+	unsigned i;
+
+	if (r->alt_pattern)
+		db = r->alt_pattern[index] == 'o' ? r->alt_over_db :
+						    r->alt_under_db;
+	udsp_ec_nlms_frame_get(l->on.ec, &reading);
+	if (!(reading.noise_power > 0.0f) || !(power > 0.0))
+		return;
+	gain = sqrt((double)reading.noise_power *
+		    (pow(10.0, db / 10.0) - 1.0) / power);
+	for (i = 0; i < l->on.frame; i++)
+		near[i] = sample_clamp(gain * near[i]);
 }
 
 /* The run checks two figures of the line with the processor on: the six
@@ -12412,6 +12943,9 @@ static void words_run(struct words_run *r)
 			l.on.far.level_dbm0 = r->far_dbm0;
 			l.off.measure = true;
 		}
+		if (plane && r->alt_over_db > 0.0 && index >= 0 &&
+		    index < -(long)r->near_from)
+			words_alt_scale(&l, r, near, (unsigned)index);
 		(void)words_frame_run(&l.off, l.fan, f, plane);
 		info = words_frame_run(&l.on, l.fan, f, plane);
 		words_on_note(&l, r, f, &info);
@@ -12469,14 +13003,9 @@ static void words_far_print(const char *what, const struct words_run *r)
 					      (r->rate / 100u)));
 }
 
-/*
- * Softer far words after the training, printed with no bound. The raised bar
- * holds part of the word frames at -44 dBm0 inactive. The build that zeroes
- * the engage run on every quiet frame acts on 2, 278 and 495 of the 805 far
- * frames at -44, -38 and -32 dBm0, with an output of -71.69, -72.14 and
- * -72.27 dBm0. The processor must not act on a quiet frame of these runs
- * either.
- */
+/* Softer far words after the training, printed with no bound: the raised bar
+ * holds some word frames inactive, and the processor must not act on a quiet
+ * frame. */
 static void words_levels_run(void)
 {
 	static const double levels[3] = { -44.0, -38.0, -32.0 };
@@ -12496,14 +13025,11 @@ static void words_levels_run(void)
 }
 
 /*
- * Twin lines, with the processor off and on, take a fan at -45 dBm0 on a
- * 27 dB hybrid and far words at -20 dBm0. After 5 s, the first must hold the
- * words active with the filter ERLE of fan_step_test. On the second, each
- * word must engage the processor within 2 frames, and the processor must not
- * act on a quiet frame. A near burst at -30 dBm0 that ends 5 frames before a
- * word must hold that word to its 8th frame. A near word from the second frame
- * of a far word stands 6 dB under its echo. The processor replaces its first
- * frame and must act on no later frame of the word.
+ * Twin lines with the processor off and on: a fan on a 27 dB hybrid, far words
+ * at -20 dBm0. The first holds the words active. On the second each word
+ * engages within 2 frames, and no quiet frame acts. A near burst before a word
+ * holds it to its 8th frame. A near word 6 dB under the echo loses only
+ * its first frame.
  */
 static void far_floor_words_test(void)
 {
@@ -12584,13 +13110,10 @@ static void far_floor_words_test(void)
 #define TOGGLE_ZEROED_ENGAGES	0u
 
 /*
- * The processor of far_floor_toggle_test. all_acted and stray cover every
- * frame of the line: the frames that read nlp_active, and those of them whose
- * verdict is not pass. The other counts cover the frames after the settling:
- * the frames, the engage events (nlp_active from 0 to 1), the acting frames
- * and the gap frames, and the gap frames that read quiet with a background.
- * act_out and gap_out hold the output energy of the acting and the gap
- * frames. last is nlp_active of the frame before.
+ * The processor of far_floor_toggle_test: acting frames and those that act
+ * without pass over the whole line. After the settle it counts the frames,
+ * engage events, acting and gap frames, and quiet gap frames with a background.
+ * It also sums the output energy of acting and gap frames.
  */
 struct toggle_stat {
 	unsigned all_acted;
@@ -12635,14 +13158,10 @@ static void toggle_note(struct toggle_stat *st, const struct fan_line *line,
 }
 
 /*
- * The fan line of far_floor_words_test, with the processor on, trains on its
- * far words for 9 s. A loud far frame then comes every 6 frames, so the window
- * at 8 kHz holds 5 active frames and one background frame per period. The
- * background frame releases the processor, and the next pass frame engages it
- * again. The case records the engage events, the acting frames and the output
- * of the gap frames against the acting frames. There must be at least one
- * engage event and at most one per period. The processor must act on pass
- * frames only, and the six counts must add up to frames.
+ * A loud far frame every 6 frames after training, so the 8 kHz window holds 5
+ * active frames and one background frame per period. The background frame
+ * releases the processor, and the next pass frame engages it, once per period,
+ * on pass frames only.
  */
 static void far_floor_toggle_test(void)
 {
@@ -12699,14 +13218,9 @@ static void words_quiet_set(struct words_run *r, unsigned rate)
 	r->fan = false;
 }
 
-/*
- * Far words that pause to silence (words_quiet_set). Each word after the
- * training must engage the processor on its first frame, because the pause
- * before it keeps a complete run. A near burst at -30 dBm0 that ends 5 frames
- * before a word zeroes the run, so that word must engage on its 8th frame. The
- * processor must not act on a quiet frame. A rule that keeps the run through
- * the burst fails here, and so does a rule that zeroes it in such a pause.
- */
+/* Far words that pause to silence: each word engages on its first frame, as the
+ * pause keeps a complete run. A near burst ending 5 frames before a word zeroes
+ * it, so that word engages on its 8th frame. No quiet frame acts. */
 static void pause_burst_test(unsigned rate)
 {
 	struct words_run run;
@@ -12740,17 +13254,9 @@ static void pause_burst_test(unsigned rate)
 
 #define PAUSE_LEAD_UNDER_DB	3.0
 #define PAUSE_LEAD_FRAMES	4u
-/*
- * The mid word. PAUSE_MID_OVER_DB is the nominal level of its source over the
- * floor level, not the level that the bars see. The microphone carries the
- * unvoiced onset of the word, 8 dB under its body on a 7 dB envelope, plus
- * the floor, and the tracked floor reads under the floor level. With a silent
- * reference, the bars of a quiet frame stand about 4.5 and 6.0 dB over the
- * tracked floor under the two floor headrooms of dsp/lec.c. The four onset
- * frames of a word spread over about 1.4 dB at the microphone, so the word
- * starts one frame before the far word. That frame stands between the bars at
- * both rates, 0.4 dB or more from each, and the leg prints its level.
- */
+/* The mid word: PAUSE_MID_OVER_DB is its source over the floor level. Its onset
+ * frame before the far word stands between the bars of the two headrooms at
+ * both rates, which the leg prints. */
 #define PAUSE_MID_OVER_DB	4.5
 #define PAUSE_MID_FRAMES	1u
 
@@ -12806,15 +13312,10 @@ static void words_lead_print(const char *what, const struct words_run *r,
 }
 
 /*
- * Each leg prints a near word through the processor and through the filter
- * alone, with no bound. On pause_burst_test's line, the late leg runs the
- * near word of far_floor_words_test, 6 dB under the echo from the second far
- * frame. The lead and mid legs start a near word 4 frames and 1 frame before
- * the far word. They print the level of its pause frames over the floor. The
- * background leg runs the late word on the fan line, which
- * far_floor_words_test checks at 8 kHz alone. With the run kept over a
- * background only, no complete run survives a pause to silence, and the
- * first three legs read the filter figure.
+ * Each leg prints a near word through the processor and the filter alone, with
+ * no bound. The legs are the late word of far_floor_words_test and the late
+ * word on the fan line. Two more legs start a word 4 frames and 1 frame before
+ * the far word, with their pause levels.
  */
 static void pause_expose_test(unsigned rate)
 {
@@ -12939,11 +13440,9 @@ static unsigned state_return_run(struct state_line *s, bool room,
 }
 
 /*
- * A line with no measured floor gives a quiet frame a floor term of 0. The
- * echo-likeness bar of that frame is then the estimate times the margin, and
- * the estimate over a silent far end is 0. Room noise therefore stands over
- * the bar and zeroes the run on the first quiet frame, and the far return
- * engages on its 8th frame. Digital silence, the common case under the bar,
+ * A line with no measured floor gives a quiet frame a floor term of 0. Room
+ * noise then stands over the echo-likeness bar and zeroes the run on the first
+ * quiet frame. The far return then engages on its 8th frame; digital silence
  * keeps the run (state_silence_test).
  */
 static void state_room_test(unsigned rate)
@@ -12978,26 +13477,17 @@ static void state_silence_test(unsigned rate)
 	udsp_ec_nlms.destroy(s.ec);
 }
 
-/*
- * The bounds of the return frame of state_early_test. That frame is the
- * engage frame, so nlp_apply cross-fades it from the residual to the comfort
- * noise. The two are uncorrelated, and each keeps about a third of its power
- * over the frame. With both at the floor, the frame reads about 1.8 dB under
- * the floor, inside EARLY_FLOOR_TOL_DB. The regression gain of the output on
- * the room noise is the mean weight of the residual in the fade, about -6 dB.
- * A frame that passes the residual reads 0 dB, over EARLY_GAIN_MAX_DB.
- */
+/* The return frame of state_early_test fades into comfort noise LEC_CN_RAISE_DB
+ * over the floor. It stands within EARLY_FLOOR_TOL_DB of the floor, at a gain
+ * under EARLY_GAIN_MAX_DB; a passed residual reads 0. */
 #define EARLY_FLOOR_TOL_DB	3.0
 #define EARLY_GAIN_MAX_DB	-3.0
 
 /*
  * The first pass frame of a far return can come before its echo reaches the
- * microphone, as on this 20 ms hybrid. A first pause measures the floor, and
- * the far end engages the processor again. After a second pause the
- * processor acts on the first frame of the return, and comfort noise must
- * replace the room noise there. That frame must stand within 3 dB of the
- * floor and not over the microphone. Its regression gain on the room noise
- * must stay under -3 dB.
+ * microphone, as on this 20 ms hybrid. After a second pause the processor acts
+ * on it. Comfort noise replaces the room noise within 3 dB of the floor, not
+ * over the microphone, with a gain under -3 dB.
  */
 static void state_early_test(unsigned rate)
 {
@@ -13044,12 +13534,10 @@ static void state_early_test(unsigned rate)
 }
 
 /*
- * A far return after LEC_GEIGEL_TRUST_PAUSE_FRAMES quiet-window frames
- * restarts a trust count that never held (quiet_run_update). The fixture
- * trains on 150 frames, under the 200 of the count, so the trust never held.
- * A pause of digital silence keeps the run, and the restart on the return
- * frame leaves the run alone. The return therefore acts on its first frame,
- * and its reading shows the count started over.
+ * A far return after LEC_GEIGEL_TRUST_PAUSE_FRAMES quiet frames restarts a
+ * trust count that never held (quiet_run_update). After 150 training frames a
+ * silent pause keeps the run, the return acts on its first frame, and its
+ * reading shows the count started over.
  */
 static void state_trust_test(unsigned rate)
 {
@@ -13073,19 +13561,14 @@ static void state_trust_test(unsigned rate)
 	udsp_ec_nlms.destroy(s.ec);
 }
 
-/*
- * A tone of whole periods in a frame has the same mean square on every frame,
- * within the rounding to 16 bits, so its level against the floor is set to a
- * few hundredths of a dB. White noise varies by about 0.6 dB from frame to
- * frame at 8 kHz. 1000 Hz holds 10 periods in a frame at both
- * rates. With a silent reference, the bar of a quiet frame stands about
- * 4.5 dB over the tracked floor under LEC_GEIGEL_FLOOR_HEADROOM and about
- * 6.0 dB over it under LEC_GEIGEL_PAUSE_HEADROOM. At both rates the tone of
- * HEADROOM_KEEP_DB stands 0.6 dB or more from each bar, and the tone of
- * HEADROOM_ZERO_DB about 1 dB over the second bar.
- */
+/* A 1000 Hz tone holds whole periods in a frame, so its level against the floor
+ * is set to hundredths of a dB. The tone of HEADROOM_KEEP_DB stands between the
+ * bars of the two headrooms, HEADROOM_ZERO_DB over both. */
 #define STATE_TONE_HZ		1000.0
 #define STATE_TONE_AT		4u
+/* Three quiet frames in a row over the echo-likeness bar zero the engage
+ * run; two keep it (quiet_miss_test). */
+#define STATE_TONE_FRAMES	3u
 #define HEADROOM_KEEP_DB	5.3
 #define HEADROOM_ZERO_DB	7.0
 
@@ -13109,31 +13592,31 @@ static void state_tone_run(struct state_line *s, double over_db)
 }
 
 /*
- * A pause with room noise and one tone frame in its middle, then a far return
- * with room noise (state_far_run). reading takes the reading of the tone
- * frame. A single frame cannot move the floor: a reading more than
- * LEC_NOISE_RISE_DB over it joins a rise run of LEC_NOISE_RISE_FRAMES.
+ * A pause with room noise and STATE_TONE_FRAMES tone frames in a row in its
+ * middle, then a far return with room noise (state_far_run). reading takes
+ * the reading of the last tone frame. The tone frames cannot move the floor:
+ * a reading more than LEC_NOISE_RISE_DB over it joins a rise run of
+ * LEC_NOISE_RISE_FRAMES.
  */
 static unsigned state_tone_return_run(struct state_line *s, double over_db,
 				      struct udsp_ec_nlms_frame *reading)
 {
 	unsigned tail = window_frames_get(s->ec) - 1u;
+	unsigned f;
 
 	state_pause_run(s, true, tail, tail + STATE_TONE_AT);
-	state_tone_run(s, over_db);
+	for (f = 0; f < STATE_TONE_FRAMES; f++)
+		state_tone_run(s, over_db);
 	udsp_ec_nlms_frame_get(s->ec, reading);
 	state_pause_run(s, true, 0u, STATE_TONE_AT);
 	return state_far_run(s, true);
 }
 
 /*
- * The two floor headrooms of the echo-likeness test, on the state line, after
- * a first pause that measures the floor. In each later pause, a tone frame
- * stands at a set level over the tracked floor. A tone 5.3 dB over it stands
- * between the bars of the two headrooms and keeps the run. The far return
- * then acts on its first frame. A tone 7 dB over it stands over both bars, so
- * the return acts on its 8th frame. A pause headroom equal to the active one
- * fails here.
+ * The two floor headrooms of the echo-likeness test: three tone frames in a
+ * pause, 5.3 dB over the tracked floor, stand between the bars and keep the
+ * run. At 7 dB they stand over both and zero it. The far return resumes the run
+ * (LEC_NLP_RESUME_DB), so each return acts on its first frame.
  */
 static void pause_headroom_test(unsigned rate)
 {
@@ -13149,7 +13632,8 @@ static void pause_headroom_test(unsigned rate)
 	kept = state_tone_return_run(&s, HEADROOM_KEEP_DB, &keep);
 	zeroed = state_tone_return_run(&s, HEADROOM_ZERO_DB, &zero);
 	case_rate(rate, "lec nlp keeps the engage run through a floor "
-		  "excursion in a pause and zeroes it over the pause headroom");
+		  "excursion in a pause and resumes it after one over the "
+		  "pause headroom");
 	printf("# the return after the pause that measures the floor acts from "
 	       "its frame %u; a tone %.2f dB over the floor: the next return "
 	       "acts from its frame %u; a tone %.2f dB over the floor: the "
@@ -13162,19 +13646,15 @@ static void pause_headroom_test(unsigned rate)
 	CHECK(keep.estimate_power == 0.0f);
 	CHECK(zero.estimate_power == 0.0f);
 	CHECK_UINT(kept, 0);
-	CHECK_UINT(zeroed, WORDS_ENGAGE_FRAME);
+	CHECK_UINT(zeroed, 0);
 	udsp_ec_nlms.destroy(s.ec);
 }
 
 /*
- * The active headroom of the echo-likeness test, on the state line, after a
- * first pause that measures the floor. The far end stops for 2 frames, so the
- * window stays active. On the second of them the 8 ms hybrid returns no echo,
- * and the estimate stands 30 dB under the floor. A tone 5.3 dB over the
- * tracked floor then stands between the bars of the two headrooms. It must
- * read unlike and cut the complete run to LEC_NLP_DECAY_FRAMES, so the far
- * return acts on its 4th frame. A test that takes the pause headroom on an
- * active window fails here.
+ * The active headroom: on the second of 2 stopped far frames the window stays
+ * active with no echo. A tone 5.3 dB over the floor reads unlike and cuts the
+ * run, so the return acts on its 4th frame. A test that takes the pause
+ * headroom on an active window fails.
  */
 static void active_headroom_test(unsigned rate)
 {
@@ -13211,22 +13691,11 @@ static void active_headroom_test(unsigned rate)
 }
 
 /*
- * A ringback line with a form of its own, for the lockout cases. Frame f
- * counts from the creation of the instance, 1 on the first run() call, like
- * the frame index of lec_replay:
- * - the ringback runs on frames 1 to ring_frames, with the two tones of the
- *   ring line. From frame noise_from (0 for none), white noise stands
- *   noise_db under each tone. Digital silence replaces it on cut_frames
- *   frames from frame cut_from;
- * - the far words of the word source at words_dbm0 start on frame answer,
- *   from word index first_word. word_fill takes the color of a word from its
- *   index;
- * - a white far-end background at background_dbm0 runs from frame
- *   background_from (0 for none);
- * - the hybrid is flat at erl_db and 8 ms, or the captured path field;
- * - the near-end floor at floor_dbm0 starts on frame floor_from;
- * - a dense talker at talk_dbm0 speaks on frames talk_from up to talk_to;
- * - nlp sets the processor.
+ * A ringback line for the lockout cases, frame f counted from the instance's
+ * creation as lec_replay counts it. It carries the ringback with optional noise
+ * and a cut, far words from frame answer and a far background. A flat or
+ * captured hybrid, a near floor, a dense talker and the processor switch
+ * complete it.
  */
 struct ring_spec {
 	unsigned rate;
@@ -13357,31 +13826,10 @@ static const struct field_path *field_path_get(const char *name)
 }
 
 /*
- * The forms of the lockout cases, with the levels of the lab captures that
- * each form names. The tones are those of the ring line, at -20 dBm0 each.
- * The hybrid returns them 28 dB down. The measured figures come from a
- * canceller without the trust count. A pair of figures gives 8 kHz, then
- * 16 kHz.
- * - INSIDE, the levels of C5: one burst of 300 frames, with white noise
- *   14 dB under each tone from frame 101. The near floor starts on frame
- *   301, and the first word comes on frame 633. The tracked ERLE ends the
- *   ringback at 18.30 dB (8 kHz). The coefficient energy then stands 9.16 dB
- *   under the learned gain at its floor. At 16 kHz no noise level gives both
- *   figures on the flat hybrid. The form there takes the AN7581 path with the
- *   noise 25 dB under each tone (26.69 dB and 8.89 dB). The energy rule then
- *   holds from the first tones.
- * - REFUSED, the levels of C13: 200 frames of tones, 20 silent frames and
- *   210 frames of tones. The floor stands 32.3 and 32.2 dB under the tone
- *   echo from frame 1, and words at -28 dBm0 start on frame 688. The ringback
- *   ends with the rule refused: the energy stands 11.10 and 13.14 dB under the
- *   gain, with an ERLE of 32.36 and 32.17 dB. The rule turns held on frame
- *   690, with an ERLE of 21.26 and 21.37 dB. Words at -24 dBm0 take the ERLE
- *   under 18 dB first.
- * - BACKGROUND, the form of call T6: 200 frames of tones and 40 silent
- *   frames. A background at -45 dBm0 then runs to the end, with words from
- *   frame 291 and a dense talker from frame 341 to 840. The floor stands 31.3
- *   and 31.5 dB under the tone echo, and 3.3 and 3.5 dB under the echo of the
- *   background. The rule turns held on frame 244 and 245.
+ * The forms of the lockout cases, with the levels of the line captures they
+ * name. INSIDE has one burst with noise 14 dB under each tone and a floor from
+ * frame 301. REFUSED has two bursts that end with the energy rule refused.
+ * BACKGROUND has a background after the tones with words and a dense talker.
  */
 static void ring_spec_set(struct ring_spec *s, enum ring_form form,
 			  unsigned rate)
@@ -13427,21 +13875,9 @@ static void ring_spec_set(struct ring_spec *s, enum ring_form form,
 }
 
 /*
- * The census of lec_replay (the header comment of test/bench/lec_replay.c),
- * over the frames RING_CENSUS_FROM up to RING_CENSUS_TO, seconds 3 to 29.
- * Its definitions:
- * - a far frame: the largest ref_power of the frame and of the six frames
- *   before it stands at or over -40 dBFS;
- * - a leak frame: a far frame whose output stands over -65 dBFS;
- * - a near frame: mic_power stands at or over 16 times the guard window times
- *   the bound factor, min(0.25, 2 x echo_gain) after the frame. The guard
- *   window is the larger window_power of the frame and of the frame before;
- * - a lockout second: 10 or more far frames, the processor verdict dt on 30
- *   or more of its frames, and a loss under 8 dB. The loss is the microphone
- *   over the output, summed over the far frames of the second.
- * dBFS is 10 log10 of a power over 32768 squared. The echo loss of a second is
- * the power of the echo plane over the power of the leak, on the same far
- * frames. The leak is the output less the near speech and the floor.
+ * The census of lec_replay (lec_replay.c) from frame RING_CENSUS_FROM: a far
+ * frame has a window frame at or over RING_CENSUS_FAR_DBFS. A leak frame is a
+ * far frame whose output less near and floor stands over RING_CENSUS_LEAK_DBFS.
  */
 #define RING_CENSUS_FROM	300u
 #define RING_CENSUS_TO		3000u
@@ -13449,6 +13885,8 @@ static void ring_spec_set(struct ring_spec *s, enum ring_form form,
 #define RING_CENSUS_FAR_DBFS	-40.0
 #define RING_CENSUS_LEAK_DBFS	-65.0
 #define RING_CENSUS_NEAR_RATIO	16.0
+/* A lockout second: 10 far frames, dt on RING_CENSUS_LOCKOUT_DT frames and a
+ * loss under RING_CENSUS_LOCKOUT_DB. */
 #define RING_CENSUS_SECOND_FAR	10u
 #define RING_CENSUS_LOCKOUT_DT	30u
 #define RING_CENSUS_LOCKOUT_DB	8.0
@@ -13696,14 +14134,11 @@ static void inside_run(struct inside_run *r)
 }
 
 /*
- * A tone-trained filter inside the energy rule: the INSIDE form of
- * ring_spec_set at 8 kHz, with the processor off. After the ringback the
- * tracked ERLE must reach 18 dB, with the coefficient energy 7 to 10 dB under
- * the learned gain at its floor. The first word must meet no trust, and the
- * first 2 s must hold double talk on 20 percent or less, with no trial. The
- * last 8 s of 20 s of words must regain the trust. They must hold 20 percent
- * or less, with a filter ERLE of 15 dB. Without the trust count, the line
- * holds all 77 active frames of the first 2 s.
+ * A tone-trained filter inside the energy rule (INSIDE at 8 kHz, processor
+ * off): the ringback reaches 18 dB of ERLE with energy 7 to 10 dB under the
+ * gain. The first word meets no trust, and the first 2 s hold 20 percent or
+ * less without a trial. The last 8 s regain the trust at a filter ERLE of 15
+ * dB.
  */
 static void ring_inside_test(void)
 {
@@ -13751,24 +14186,10 @@ static void ring_inside_test(void)
 #define LOCKOUT_SHORT_GAP	100u
 
 /*
- * The census of the legs of ring_lockout_test on a canceller without the
- * trust count, frames 300 to 2999: the far out_sum and out_max. For the
- * BACKGROUND form, the figures are those of the far frames that are not near
- * frames. leak_max is the largest power of the echo leak on those frames.
- * Each figure reads back as the double that canceller measures, so it passes
- * its own bars.
- *
- * The same canceller reads these leak frames and lockout seconds:
- * - INSIDE at 8 kHz: 212 leak frames, 5 lockout seconds;
- * - REFUSED: 83 and 90 leak frames, 6 lockout seconds at each rate;
- * - BACKGROUND: 328 and 331 leak frames, 11 lockout seconds at each rate.
- *
- * The out_max bar of the BACKGROUND form reads leak_max. Reason: a far frame
- * under the near mark can carry near speech. The out_max of the output then
- * measures the phase of the near speech against the leak, not the canceller.
- * At 8 kHz the canceller with the trust count reads an output out_max of
- * 436861.25 against 414770.188 on frame 449, where the leak reads 649 against
- * 11788.
+ * The census of the legs of ring_lockout_test on a canceller without the trust
+ * count, the bars of each leg. For BACKGROUND the figures cover the far frames
+ * that are not near frames, and out_max reads the echo leak. A near talker
+ * under the near mark makes the output's peak a phase of the speech.
  */
 struct lockout_head {
 	unsigned rate;
@@ -13805,12 +14226,10 @@ static const struct lockout_head *lockout_head_get(unsigned rate,
 }
 
 /*
- * One leg of ring_lockout_test, frames 1 to 2999. end holds the state after
- * frame 2999. first_trust is the first frame after the ringback that reads
- * trusted. restart is the first frame after the ringback whose trust count
- * reads 0 or 1 after a larger value. complete is the first frame after it
- * whose count reads TRUST_FRAMES. early counts the frames from restart
- * through complete that read trusted.
+ * One leg of ring_lockout_test, frames 1 to 2999: end holds the state after the
+ * last frame, and first_trust the first trusted frame after the ringback.
+ * restart is its first count reset, complete the frame that reads TRUST_FRAMES
+ * after it, and early the trusted frames between.
  */
 struct lockout_leg {
 	struct ring_census c;
@@ -13884,14 +14303,10 @@ static void lockout_speech_check(const struct near_stat *sp)
 }
 
 /*
- * The bars of a leg over frames 300 to 2999:
- * - 100 leak frames or fewer, and one lockout second or fewer;
- * - the out_sum and the out_max at or under those of a canceller without the
- *   trust count (lockout_heads);
- * - no reset and no trial.
- * A BACKGROUND leg reads the far frames that are not near frames and the echo
- * loss, because its talker stands in the output. Its out_max bar reads the
- * echo leak, and the out_max of the output is printed with no bar.
+ * The bars of a leg over frames 300 to 2999: 100 leak frames and one lockout
+ * second or fewer, and no reset and no trial. out_sum and out_max stand no
+ * higher than a canceller without the trust count. A BACKGROUND leg reads the
+ * echo loss and the echo leak, and prints the output out_max with no bar.
  */
 static void lockout_leg_check(const char *what, const struct ring_spec *s,
 			      enum ring_form form, const struct lockout_leg *g)
@@ -13941,14 +14356,11 @@ static void lockout_leg_print(const char *what, const struct lockout_leg *g)
 }
 
 /*
- * The INSIDE or the REFUSED leg, then the same leg with a dense talker at
- * -25 dBm0. The talker starts 5 s after the first word and speaks for 10 s.
- * A leg on a field path has no bar: the INSIDE form at 16 kHz. There the
- * filter holds the energy rule through 200 or more clear ringback frames, so
- * the count completes inside the ringback. The trust survives the answer gap,
- * and no restart comes before the first word. The census there is the same
- * with and without the trust count: 802 leak frames, 24 lockout seconds and
- * the first trusted frame 301.
+ * The INSIDE or REFUSED leg, then the same leg with a dense talker at -25 dBm0.
+ * The talker starts 5 s after the first word and talks for 10 s. The INSIDE
+ * leg at 16 kHz runs on a field path with no bar. Its filter holds the energy
+ * rule through the ringback, so the count completes there and survives the
+ * answer gap.
  */
 static void lockout_words_leg(unsigned rate, enum ring_form form,
 			      const char *what, struct lockout_leg *g)
@@ -14009,13 +14421,10 @@ static void lockout_short_leg(unsigned rate, struct lockout_leg *g)
 }
 
 /*
- * The lockout after the ringback ends without a trial, on the three forms of
- * ring_spec_set, each run for 30 s with the processor on. Each leg must keep
- * the bars of lockout_leg_check. The INSIDE leg at 16 kHz runs on the field
- * path and is printed with no bar (lockout_words_leg). The INSIDE and REFUSED
- * legs run again with a near talker, whose speech must pass within 2 dB with
- * no exposure frame. The INSIDE form with a gap of 1 s is printed with no
- * bar. A canceller without the trust count fails each leg that has a bar.
+ * The lockout after a ringback that ends without a trial, on the three forms
+ * for 30 s with the processor on. Each leg with a bar keeps the bars of
+ * lockout_leg_check, and a near talker's speech passes within 2 dB with no
+ * exposure frame. A canceller without the trust count fails each.
  */
 static void ring_lockout_test(unsigned rate)
 {
@@ -14489,13 +14898,10 @@ static void restart_bg_frame_run(struct ring_line *line, uint32_t *bg_state,
 }
 
 /*
- * Part 9: a restart and a trial on the same frame, before the first trust. A
- * talker between the bars drives the latch run to the latch on the last
- * frames of a far phrase, where no arm runs. A far background under the
- * raised bar then holds the run through a pause of 2.6 s. The far return
- * restarts the count, and the latch starts a trial on that frame. A talker
- * 16 dB over the far end ends the trial on its tenth frame. The count must
- * then read 0, because the trial keeps no count from before the pause.
+ * Part 9: a restart and a trial on one frame before the first trust. The latch
+ * comes due at the end of a far phrase, and a background holds the run through
+ * a 2.6 s pause. The return restarts the count and starts a trial, which a
+ * talker ends; the count reads 0, as the trial keeps no count from before it.
  */
 static void trust_return_trial_part(unsigned rate)
 {
@@ -14563,12 +14969,10 @@ static void trust_return_trial_part(unsigned rate)
 #define RESTART_DROP_FRAMES	40u
 
 /*
- * Part 10: a refused trial in which the energy rule turns. On the converged
- * ring line, a talker between the bars drives the latch to a trial. On the
- * start frame the hybrid falls by 30 dB and the talker stops. The trial
- * shrinks the filter, and the rule refuses on its last frame. A talker 16 dB
- * over the far end then ends the trial. The refusal gives back the filter,
- * the gain and the rule of the start frame, so the count must not restart.
+ * Part 10: a refused trial in which the energy rule turns. On the start frame
+ * the hybrid falls 30 dB, and the trial shrinks the filter. The rule refuses on
+ * its last frame before a talker ends it. The refusal gives back the filter,
+ * gain and rule of the start frame, so the count does not restart.
  */
 static void trust_rule_part(unsigned rate)
 {
@@ -14611,14 +15015,10 @@ static void trust_rule_part(unsigned rate)
 }
 
 /*
- * The trust count of dsp/lec.c on the ring line, in ten parts. A frame must
- * count when its own reference is active and it ends without double talk,
- * also under a freeze. A pause of 200 quiet-window frames before the first
- * trust must restart the count, and one of 199 must not. A pause after the
- * trust held, the reset and the turn of the energy rule are checked too. A
- * refused trial must keep the smaller of its start count and the count of the
- * frame, also on the frame of a restart. It must also give back the energy
- * rule and the held trust of its start frame.
+ * The trust count on the ring line, in ten parts. A clear active frame counts,
+ * also under a freeze, and a pause of 200 quiet frames before the first trust
+ * restarts it; one of 199 does not. A later pause, the reset and the rule's
+ * turn act as stated, and a refused trial keeps the smaller count and its rule.
  */
 static void trust_restart_test(unsigned rate)
 {
@@ -14771,12 +15171,10 @@ static void window_run(unsigned rate, struct window_talk *w)
 }
 
 /*
- * A near talker at the echo level while the trust count is open. The line of
- * the snapshot cases trains for 1.5 s, under the count, and pauses for 200
- * quiet-window frames. A white talker at the level of the echo joins the
- * return for 150 frames. The trust must stay withheld from the return through
- * the frame that completes the count. Without the count, the line holds every
- * talker frame (WINDOW_HEAD_ADAPTED).
+ * A talker at echo level while the trust count is open: after 1.5 s of training
+ * and a 200-frame pause, a white talker joins the return for 150 frames. The
+ * trust stays withheld until the count completes. Without the count, the line
+ * holds every talker frame.
  */
 static void trust_window_talker_test(unsigned rate)
 {
@@ -14803,13 +15201,9 @@ static void trust_window_talker_test(unsigned rate)
 	CHECK_UINT(w.early, 0);
 }
 
-/*
- * The form of trust_turn_test. A white talker in a far pause is stationary,
- * so the tracked floor rises to it. The bar then covers that talker at the
- * return, and the trust lapses there with or without the trust count. A word
- * talker leaves the floor. With far words of 3 s, a canceller without the
- * trust count loses the trust at 8 kHz from the sixth return on.
- */
+/* The form of trust_turn_test: a word talker, which leaves the floor, where a
+ * stationary talker in a pause raises the floor and covers itself at the
+ * return. */
 #define TURN_CYCLES		10u
 #define TURN_CYCLE_FRAMES	700u
 #define TURN_FAR_FRAMES		400u
@@ -14947,13 +15341,10 @@ static void turn_run(unsigned rate, double over_db, struct turn_result *r)
 }
 
 /*
- * After 3 s of white noise, ten cycles of far words for 4 s and a far pause
- * of 3 s follow. A word talker overlaps each far return by 1.5 s, at the echo
- * level and 6 dB over it. On a canceller without the trust count, the trust
- * holds on most talker frames of the returns. Those frames must adapt no more
- * often than on that canceller (turn_heads). The ERLE on the far words alone
- * must stay within 1 dB of that canceller. After the count first passes 200,
- * it must never read 0 or 1.
+ * Ten cycles of far words for 4 s and a far pause of 3 s, with a word talker
+ * overlapping each return by 1.5 s. Talker frames adapt no more often than on a
+ * canceller without the trust count (turn_heads), and the ERLE stays within 1
+ * dB of it. After the count first passes 200 it never reads 0 or 1.
  */
 static void trust_turn_test(unsigned rate)
 {
@@ -14983,12 +15374,9 @@ static void trust_turn_test(unsigned rate)
 	}
 }
 
-/*
- * The reference loss of udsp_ec_nlms_ref_loss_set (dsp/lec.h). The cases
- * below run the loss of 18 half-dB, the 9 dB of the default SLIC receive
- * gain of uvoice. REF_LOSS_SEED is the learned gain that an instance starts
- * from under that loss: LEC_GEIGEL_GAIN_MIN of dsp/lec.c, 9 dB higher.
- */
+/* The loss of 18 half-dB (REF_LOSS_DB), the default SLIC receive gain of
+ * uvoice; REF_LOSS_SEED is the learned gain an instance starts from under it,
+ * LEC_GEIGEL_GAIN_MIN raised by that loss. */
 #define REF_LOSS_HALF_DB	18u
 #define REF_LOSS_DB		9.0
 #define REF_LOSS_SEED		(0.25 * pow(10.0, REF_LOSS_DB / 10.0))
@@ -15044,7 +15432,8 @@ static void ref_loss_setter_test(unsigned rate)
 			4u * FRAMES_PER_SECOND, 1u);
 	udsp_ec_nlms_info_get(ec, &info);
 	CHECK(info.ref_floor > 0.0f);
-	/* The far-end floor stands in the old scale, so it starts over too. */
+	/* The far-end floor stands in the scale before the change, so it starts
+	 * over. */
 	udsp_ec_nlms_ref_loss_set(ec, 12u);
 	udsp_ec_nlms_info_get(ec, &info);
 	CHECK_UINT(udsp_ec_nlms_ref_loss_get(ec), 12);
@@ -15070,11 +15459,10 @@ static void ref_loss_setter_test(unsigned rate)
 }
 
 /*
- * The combined-loss arm of nlp_gate_get with the loss alone moved: the probe
- * of nlp_combined_loss_test on the 12 dB hybrid, at 0 and at 18. The ERLE
- * stays between the 6 dB floor and the 18 dB fast path, so the combined arm
- * decides. The combined loss reads under the gate at 0, and the 9 dB of the
- * loss take it over the gate.
+ * The combined-loss arm with the loss alone moved: the probe of
+ * nlp_combined_loss_test on the 12 dB hybrid at 0 and at 18. The ERLE stays
+ * between the floor and the fast path. The combined loss stands under the gate
+ * at 0, and the 9 dB of the loss take it over.
  */
 static void ref_loss_gate_test(unsigned rate)
 {
@@ -15103,11 +15491,9 @@ static void ref_loss_gate_test(unsigned rate)
 	CHECK(!lossy.nlp_doubletalk);
 }
 
-/* The balance shape of path_weak_init at 20 dB under the word source, with a
- * near-end floor and no talker. On that line the processor acts on most
- * window-active frames and the ERLE gate refuses some, so both shares carry
- * a figure. The loss stands ahead of the reference alone, so the microphone
- * is the same at every loss. */
+/* The balance shape of path_weak_init 20 dB under the word source, with a near
+ * floor and no talker. The processor acts on most active frames, the ERLE gate
+ * refuses some, and the microphone is the same at every loss. */
 static void ref_loss_words_run(unsigned rate, unsigned half_db,
 			       struct udsp_ec_nlms_info *info)
 {
@@ -15155,12 +15541,10 @@ static double ref_loss_share_get(const struct udsp_ec_nlms_info *info,
 }
 
 /*
- * A reference 9 dB lower over an echo path 9 dB stronger, with the loss of
- * 18, against the line at 0. The path reads the line, and the canceller reads
- * the line less the loss, so the microphone of the two arms is the same. The
- * first case adapts one second on the composite hybrid of convergence_test
- * and reads the ERLE of the last 20 frames. The second runs the word source
- * over the weak hybrid and compares the verdict shares and the resets.
+ * A reference 9 dB lower over a path 9 dB stronger, with the loss of 18, runs
+ * against the line at 0. Both arms see the same microphone. One second on
+ * the composite hybrid compares the ERLE of the last 20 frames. The word source
+ * on the weak hybrid compares the verdict shares and the resets.
  */
 static void ref_loss_equiv_test(unsigned rate)
 {
@@ -15349,6 +15733,12638 @@ static void ref_loss_bound_test(void)
 	CHECK(header_loss_open(UDSP_EC_NLMS_REF_LOSS_MAX + 1u) == -EINVAL);
 }
 
+/* The frames from a change to the first frame that the coherence run counts, on
+ * a white far end. The first louder frame fires the detector, and the share of
+ * a path 6 dB louder falls under its bar by the sixth held frame. */
+#define COHERE_ONSET_FRAMES	10u
+#define COHERE_STEP_DB		10.0
+#define COHERE_AFTER_FRAMES	(4u * FRAMES_PER_SECOND)
+#define COHERE_KEPT_FRAMES	(2u * FRAMES_PER_SECOND)
+/* The ERLE blocks of the coherence cases, 100 ms, so a deadline reads the
+ * output to a tenth of a second. */
+#define COHERE_BLOCK_FRAMES	10u
+/* The louder leg of cohere_shape_test runs past the latch and its trial. */
+#define COHERE_LATCH_FRAMES	(8u * FRAMES_PER_SECOND)
+
+/*
+ * The readings of the path-change and coherence escapes, rebuilt from the
+ * frames a case passes in and gets back, with the smoothing of dsp/lec.c. The
+ * estimate is the microphone less the output, within half an LSB. The sums
+ * start over at a trial edge as runs_clear does: after a start or a completed
+ * end, before a talker end.
+ */
+struct cohere_view {
+	double mic;
+	double res;
+	double cross;
+	double res_power;
+	double est_power;
+	bool restart;
+};
+
+static void cohere_view_restart(struct cohere_view *v)
+{
+	v->cross = 0.0;
+	v->res_power = 0.0;
+	v->est_power = 0.0;
+}
+
+static void cohere_view_add(struct cohere_view *v, const int16_t *mic,
+			    const int16_t *out, unsigned frame,
+			    const struct udsp_ec_nlms_frame *reading)
+{
+	double mic_e = 0.0;
+	double res_e = 0.0;
+	double est_e = 0.0;
+	double cross = 0.0;
+	unsigned i;
+
+	for (i = 0; i < frame; i++) {
+		double est = (double)mic[i] - out[i];
+
+		mic_e += (double)mic[i] * mic[i];
+		res_e += (double)out[i] * out[i];
+		est_e += est * est;
+		cross += (double)out[i] * est;
+	}
+	v->mic += (mic_e / frame - v->mic) * COHERE_ALPHA;
+	v->res += (res_e / frame - v->res) * COHERE_ALPHA;
+	if (v->restart ||
+	    reading->trial_end == UDSP_EC_NLMS_TRIAL_END_TALKER)
+		cohere_view_restart(v);
+	if (reading->ref_power >= reading->ref_bar) {
+		v->cross += (cross / frame - v->cross) * COHERE_ALPHA;
+		v->res_power += (res_e / frame - v->res_power) * COHERE_ALPHA;
+		v->est_power += (est_e / frame - v->est_power) * COHERE_ALPHA;
+	}
+	v->restart = reading->trial_arm != UDSP_EC_NLMS_TRIAL_ARM_NONE ||
+		     (reading->trial_end != UDSP_EC_NLMS_TRIAL_END_NONE &&
+		      reading->trial_end != UDSP_EC_NLMS_TRIAL_END_TALKER);
+}
+
+static double cohere_view_ratio_get(const struct cohere_view *v)
+{
+	return v->mic > 0.0 ? v->res / v->mic : NAN;
+}
+
+static double cohere_view_ncc_get(const struct cohere_view *v)
+{
+	if (!(v->res_power >= 1.0) || !(v->est_power >= 1.0))
+		return NAN;
+	return v->cross / sqrt(v->res_power * v->est_power);
+}
+
+/* The estimate energy over the microphone energy, the residual plus the
+ * estimate. */
+static double cohere_view_share_get(const struct cohere_view *v)
+{
+	double mic = v->res_power + v->est_power + 2.0 * v->cross;
+
+	return mic > 0.0 ? v->est_power / mic : NAN;
+}
+
+/*
+ * The change line of the coherence cases, the line of change_run: a white far
+ * end at -10 dBm0, a floor at -70 dBm0 and the processor off. The late 28 ms
+ * hybrid at 12 dB replaces a flat hybrid converged for 4 s. Its louder echo is
+ * one that the estimate before the change does not predict.
+ */
+struct cohere_line {
+	struct udsp_ec *ec;
+	struct echo_path path;
+	struct cohere_view view;
+	struct ring_planes *planes;
+	uint32_t state[3];
+	unsigned long phase;
+	unsigned rate;
+	unsigned frame;
+	bool css;
+	bool quiet;
+};
+
+static void cohere_frame_run(struct cohere_line *l, const int16_t *near,
+			     double *echo_energy, double *out_energy,
+			     struct udsp_ec_nlms_frame *reading,
+			     struct udsp_ec_nlms_info *info);
+
+/*
+ * The convergence frames feed the view, so it carries the history of the
+ * canceller into the change. tail_ms 0 takes the default tail; css runs the
+ * composite source; seed moves the far source; planes takes the planes of each
+ * frame; quiet silences the far end.
+ */
+static void cohere_line_begin(struct cohere_line *l, unsigned rate,
+			      const struct echo_path *path, unsigned tail_ms,
+			      bool css, uint32_t seed)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	double echo_energy = 0.0;
+	double res_energy = 0.0;
+	unsigned f;
+
+	memset(l, 0, sizeof(*l));
+	l->rate = rate;
+	l->frame = rate / 100u;
+	l->css = css;
+	l->state[0] = 0x13572468u ^ seed;
+	l->state[1] = 0xfeedfaceu;
+	l->state[2] = 0x2468acefu;
+	l->ec = udsp_ec_nlms.create_rate(tail_ms, rate);
+	udsp_ec_nlms.nlp(l->ec, false);
+	l->path = *path;
+	for (f = 0; f < CHANGE_CONVERGE_FRAMES; f++)
+		cohere_frame_run(l, NULL, &echo_energy, &res_energy, &reading,
+				 &info);
+}
+
+/* The flat 8 ms hybrid at from_erl_db. */
+static void cohere_line_start(struct cohere_line *l, unsigned rate,
+			      double from_erl_db, unsigned tail_ms, bool css)
+{
+	struct echo_path path;
+
+	path_flat_init(&path, rate, 8, from_erl_db);
+	cohere_line_begin(l, rate, &path, tail_ms, css, 0u);
+}
+
+static void cohere_line_init(struct cohere_line *l, unsigned rate,
+			     double from_erl_db)
+{
+	cohere_line_start(l, rate, from_erl_db, 48, false);
+}
+
+/* The hybrid changes to the late one at to_erl_db, the far-end history
+ * carried. */
+static void cohere_line_change(struct cohere_line *l, double to_erl_db)
+{
+	struct echo_path late;
+
+	path_late_init(&late, l->rate, to_erl_db);
+	path_history_carry(&late, &l->path);
+	l->path = late;
+}
+
+/* One frame of the change line, with near on top when it is given. echo and
+ * out take the echo and the output energies of the frame. */
+static void cohere_frame_run(struct cohere_line *l, const int16_t *near,
+			     double *echo_energy, double *out_energy,
+			     struct udsp_ec_nlms_frame *reading,
+			     struct udsp_ec_nlms_info *info)
+{
+	int16_t ref[UDSP_FRAME_MAX];
+	int16_t echo[UDSP_FRAME_MAX];
+	int16_t hiss[UDSP_FRAME_MAX];
+	int16_t talk[UDSP_FRAME_MAX];
+	int16_t mic[UDSP_FRAME_MAX];
+	int16_t out[UDSP_FRAME_MAX];
+	unsigned i;
+
+	if (l->css)
+		css_fill(ref, l->frame, CHANGE_FAR_DBM0, &l->state[0],
+			 &l->phase, l->rate);
+	else
+		noise_fill(ref, l->frame, CHANGE_FAR_DBM0, &l->state[0]);
+	if (l->quiet)
+		memset(ref, 0, l->frame * sizeof(*ref));
+	path_run(&l->path, ref, echo);
+	noise_fill(hiss, l->frame, CHANGE_FLOOR_DBM0, &l->state[2]);
+	for (i = 0; i < l->frame; i++) {
+		talk[i] = near ? near[i] : 0;
+		mic[i] = sample_clamp((double)echo[i] + hiss[i] + talk[i]);
+	}
+	memcpy(out, mic, l->frame * sizeof(*mic));
+	udsp_ec_nlms.run(l->ec, out, ref);
+	udsp_ec_nlms_frame_get(l->ec, reading);
+	udsp_ec_nlms_info_get(l->ec, info);
+	cohere_view_add(&l->view, mic, out, l->frame, reading);
+	if (l->planes) {
+		struct ring_planes *p = l->planes;
+
+		memcpy(p->ref, ref, l->frame * sizeof(*ref));
+		memcpy(p->near, talk, l->frame * sizeof(*talk));
+		memcpy(p->echo, echo, l->frame * sizeof(*echo));
+		memcpy(p->hiss, hiss, l->frame * sizeof(*hiss));
+		memcpy(p->mic, mic, l->frame * sizeof(*mic));
+		memcpy(p->out, out, l->frame * sizeof(*out));
+	}
+	for (i = 0; i < l->frame; i++) {
+		*echo_energy += (double)echo[i] * echo[i];
+		*out_energy += (double)out[i] * out[i];
+	}
+}
+
+/*
+ * The figures of one louder change: the frames to the first trial and its arm,
+ * the rebuilt readings before it, and the first settled block at 20 dB. Then
+ * its end and kind, and the held frames and low blocks after a keep. Last, the
+ * coherence trials, the active frames to the trial, and the largest voiced
+ * reading.
+ */
+struct cohere_result {
+	unsigned start;
+	unsigned onset;
+	unsigned arm;
+	unsigned cohere;
+	double ratio;
+	double ncc;
+	unsigned settled;
+	unsigned end;
+	unsigned end_kind;
+	unsigned held;
+	unsigned low;
+	unsigned trials;
+	unsigned resets;
+	float gain_before;
+	float gain_after;
+	double burst_ncc;
+};
+
+/*
+ * The runs of the path-change and coherence escapes, rebuilt from the view by
+ * the rules of path_change_get and cohere_get. path_due and cohere_due hold the
+ * first frame each run reaches its length. longest holds the longest coherence
+ * run, and alone the run on the reading without the share.
+ */
+struct cohere_runs {
+	unsigned path;
+	unsigned cohere;
+	unsigned path_due;
+	unsigned cohere_due;
+	unsigned longest;
+	unsigned alone;
+	unsigned alone_longest;
+};
+
+static void cohere_runs_add(struct cohere_runs *r, const struct cohere_view *v,
+			    const struct udsp_ec_nlms_frame *reading,
+			    bool held_before, unsigned f)
+{
+	double ncc = cohere_view_ncc_get(v);
+
+	if (reading->probing &&
+	    reading->trial_arm == UDSP_EC_NLMS_TRIAL_ARM_NONE) {
+		r->path = 0;
+		r->cohere = 0;
+		r->alone = 0;
+		return;
+	}
+	if (reading->ref_power < reading->ref_bar)
+		return;
+	if (!held_before) {
+		r->path = 0;
+		r->cohere = 0;
+		r->alone = 0;
+		return;
+	}
+	if (cohere_view_ratio_get(v) >= COHERE_PATH_RATIO)
+		r->path++;
+	else
+		r->path = 0;
+	if (reading->talker) {
+		r->cohere = 0;
+		r->alone = 0;
+	} else if (!isnan(ncc)) {
+		r->cohere = ncc <= COHERE_BAR &&
+			    cohere_view_share_get(v) <= COHERE_SHARE_MAX ?
+			    r->cohere + 1u : 0u;
+		r->alone = ncc <= COHERE_BAR ? r->alone + 1u : 0u;
+	}
+	if (r->cohere > r->longest)
+		r->longest = r->cohere;
+	if (r->alone > r->alone_longest)
+		r->alone_longest = r->alone;
+	if (!r->path_due && r->path >= 20u)
+		r->path_due = f;
+	if (!r->cohere_due && r->cohere >= COHERE_FRAMES)
+		r->cohere_due = f;
+	if (reading->trial_arm != UDSP_EC_NLMS_TRIAL_ARM_NONE ||
+	    reading->trial_end != UDSP_EC_NLMS_TRIAL_END_NONE) {
+		r->path = 0;
+		r->cohere = 0;
+		r->alone = 0;
+	}
+}
+
+/* The echo energy under which a block of the change line reads no ERLE: a
+ * pause of the composite source, after its echo dies away. */
+#define COHERE_BLOCK_ECHO_DBM0	-40.0
+
+/*
+ * The change line. The flat hybrid step_db over the late one converges, and
+ * to replaces it. When to is NULL, the late hybrid at 12 dB replaces it. css
+ * runs the composite source at the default tail, and otherwise white noise at
+ * the 48 ms tail.
+ */
+static void cohere_change_path_run(unsigned rate, double step_db, bool css,
+				   const struct echo_path *to,
+				   struct cohere_result *r)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct cohere_runs runs;
+	struct cohere_line l;
+	double echo_energy = 0.0;
+	double out_energy = 0.0;
+	double block_floor;
+	uint32_t probes;
+	bool held;
+	unsigned f;
+
+	memset(r, 0, sizeof(*r));
+	memset(&runs, 0, sizeof(runs));
+	r->ratio = NAN;
+	r->ncc = NAN;
+	r->burst_ncc = -2.0;
+	cohere_line_start(&l, rate, CHANGE_ERL_DB + step_db, css ? 0u : 48u,
+			  css);
+	block_floor = (double)COHERE_BLOCK_FRAMES * l.frame *
+		      pow(dbm0_rms_get(COHERE_BLOCK_ECHO_DBM0), 2.0);
+	udsp_ec_nlms_info_get(l.ec, &info);
+	probes = info.probes;
+	held = info.double_talk;
+	if (to) {
+		struct echo_path next = *to;
+
+		path_history_carry(&next, &l.path);
+		l.path = next;
+	} else {
+		cohere_line_change(&l, CHANGE_ERL_DB);
+	}
+	for (f = 1; f <= COHERE_AFTER_FRAMES; f++) {
+		double before_ratio = cohere_view_ratio_get(&l.view);
+		double before_ncc = cohere_view_ncc_get(&l.view);
+		bool voiced = css && l.phase % (l.rate / 2u) < l.rate / 20u;
+
+		cohere_frame_run(&l, NULL, &echo_energy, &out_energy, &reading,
+				 &info);
+		cohere_runs_add(&runs, &l.view, &reading, held, f);
+		held = info.double_talk;
+		if (!r->start && voiced && runs.cohere &&
+		    reading.trial_arm == UDSP_EC_NLMS_TRIAL_ARM_NONE &&
+		    cohere_view_ncc_get(&l.view) > r->burst_ncc)
+			r->burst_ncc = cohere_view_ncc_get(&l.view);
+		if (!r->start && reading.ref_power >= reading.ref_bar)
+			r->onset++;
+		if (!r->start && info.probes != probes) {
+			r->start = f;
+			r->arm = reading.trial_arm;
+			r->ratio = before_ratio;
+			r->ncc = before_ncc;
+			r->gain_before = info.echo_gain;
+		}
+		if (r->start && !r->end &&
+		    reading.trial_end != UDSP_EC_NLMS_TRIAL_END_NONE) {
+			r->end = f;
+			r->end_kind = reading.trial_end;
+			r->gain_after = info.echo_gain;
+		} else if (r->end_kind == UDSP_EC_NLMS_TRIAL_END_KEPT &&
+			   f <= r->end + COHERE_KEPT_FRAMES) {
+			r->held += info.double_talk;
+		}
+		if (f % COHERE_BLOCK_FRAMES)
+			continue;
+		if (echo_energy < block_floor) {
+			echo_energy = out_energy = 0.0;
+			continue;
+		}
+		if (!r->settled && out_energy > 0.0 &&
+		    10.0 * log10(echo_energy / out_energy) >= CHANGE_BAR_DB)
+			r->settled = f;
+		if (r->end_kind == UDSP_EC_NLMS_TRIAL_END_KEPT &&
+		    f > r->end + COHERE_BLOCK_FRAMES &&
+		    f <= r->end + COHERE_KEPT_FRAMES && out_energy > 0.0 &&
+		    10.0 * log10(echo_energy / out_energy) < CHANGE_BAR_DB)
+			r->low++;
+		echo_energy = out_energy = 0.0;
+	}
+	r->trials = info.probes - probes;
+	r->resets = info.diverge_resets;
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+static void cohere_change_run(unsigned rate, double step_db, bool css,
+			      struct cohere_result *r)
+{
+	cohere_change_path_run(rate, step_db, css, NULL, r);
+}
+
+static void cohere_change_print(unsigned rate, double step_db, bool css,
+				const struct cohere_result *r)
+{
+	printf("# %u Hz, %s, %.0f dB louder: trial of arm %s on frame %u, "
+	       "active frame %u; live residual over microphone %.3f, "
+	       "coherence %.3f before it; %.0f dB of ERLE on frame %u; ended "
+	       "%s on frame %u; after the keep %u double-talk frames and %u "
+	       "blocks under %.0f dB in %u ms; gain %.4f before the trial, "
+	       "%.4f after it; %u trials, %u resets\n", rate,
+	       css ? "composite source" : "white noise", step_db,
+	       lecr_trial_arm_name(r->arm), r->start, r->onset, r->ratio,
+	       r->ncc, CHANGE_BAR_DB, r->settled,
+	       lecr_trial_end_name(r->end_kind), r->end, r->held, r->low,
+	       CHANGE_BAR_DB, 10u * COHERE_KEPT_FRAMES,
+	       (double)r->gain_before, (double)r->gain_after, r->trials,
+	       r->resets);
+}
+
+/* The deadline of the white-noise legs, 1.1 s: the share falls under its bar on
+ * the sixth held frame, and the run of 32 counts from there. The deadline also
+ * passes a trial on the plain step. */
+#define COHERE_SETTLED_FRAMES	110u
+/* The bounds of the composite-source legs from the change: the run of 32 plus
+ * an onset that the level swings stretch, and 3 s to 20 dB. The trial counts
+ * active frames, and the source spends its pauses. */
+#define COHERE_CSS_ONSET_FRAMES	(COHERE_FRAMES + 32u)
+#define COHERE_CSS_SETTLED_FRAMES	(3u * FRAMES_PER_SECOND)
+
+/* The checks of a change that the coherence escape answers. The ratio check
+ * of cohere_change_test is the caller's. */
+static void cohere_change_check(const struct cohere_result *r, bool css)
+{
+	CHECK_UINT(r->arm, UDSP_EC_NLMS_TRIAL_ARM_COHERE);
+	CHECK(r->start > 0u);
+	CHECK(r->ratio > 1.0);
+	CHECK(r->ncc <= COHERE_BAR);
+	CHECK(r->settled > 0u);
+	CHECK_UINT(r->end_kind, UDSP_EC_NLMS_TRIAL_END_KEPT);
+	CHECK_UINT(r->held, 0);
+	CHECK_UINT(r->trials, 1);
+	CHECK_UINT(r->resets, 0);
+	if (css) {
+		CHECK(r->onset <= COHERE_CSS_ONSET_FRAMES);
+		CHECK(r->settled <= COHERE_CSS_SETTLED_FRAMES);
+		return;
+	}
+	CHECK(r->start <= COHERE_FRAMES + COHERE_ONSET_FRAMES);
+	CHECK(r->settled <= COHERE_SETTLED_FRAMES);
+	CHECK_UINT(r->low, 0);
+}
+
+/*
+ * A louder echo that the estimate before the change does not predict reads a
+ * live ratio of about 1.10. On white noise its trial starts within 32 active
+ * frames plus an onset. It reaches 20 dB within 1.1 s and stands with no hold
+ * for 2 s. On the composite source it starts within 64 active frames and
+ * settles within 3 s.
+ */
+static void cohere_change_test(unsigned rate)
+{
+	struct cohere_result r;
+	struct cohere_result c;
+
+	cohere_change_run(rate, COHERE_STEP_DB, false, &r);
+	cohere_change_run(rate, COHERE_STEP_DB, true, &c);
+	case_rate(rate, "lec coherence escape answers a louder echo the old "
+		  "path does not predict");
+	cohere_change_print(rate, COHERE_STEP_DB, false, &r);
+	cohere_change_print(rate, COHERE_STEP_DB, true, &c);
+	cohere_change_check(&r, false);
+	CHECK(r.ratio < COHERE_PATH_RATIO);
+	cohere_change_check(&c, true);
+}
+
+/*
+ * The coherence escape on changes 6 dB and 12 dB louder. At 6 dB the live ratio
+ * stands at the edge of the path-change bar, but a path-change run of 20 does
+ * not complete first. The coherence trial starts on both steps within the
+ * bounds of cohere_change_test.
+ */
+static void cohere_step_test(unsigned rate)
+{
+	static const double steps[] = { 6.0, 12.0 };
+	unsigned i;
+	unsigned k;
+
+	case_rate(rate, "lec coherence escape answers a louder echo 6 and "
+		  "12 dB louder");
+	for (k = 0; k < 2u; k++)
+		for (i = 0; i < sizeof(steps) / sizeof(steps[0]); i++) {
+			struct cohere_result r;
+
+			cohere_change_run(rate, steps[i], k == 1u, &r);
+			cohere_change_print(rate, steps[i], k == 1u, &r);
+			cohere_change_check(&r, k == 1u);
+		}
+}
+
+/*
+ * The same hybrid with a new gain or polarity. The residual is then a copy of
+ * the estimate. The coherence reads +1 for a louder echo, and -1 for a
+ * quieter one or a flip. held counts the frames after the change that end in
+ * double talk. The other fields follow struct cohere_result.
+ */
+static void cohere_shape_run(unsigned rate, double gain,
+			     struct cohere_result *r)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct cohere_line l;
+	double echo_energy = 0.0;
+	double out_energy = 0.0;
+	uint32_t probes;
+	unsigned k;
+	unsigned f;
+
+	memset(r, 0, sizeof(*r));
+	cohere_line_init(&l, rate, CHANGE_ERL_DB);
+	udsp_ec_nlms_info_get(l.ec, &info);
+	probes = info.probes;
+	for (k = 0; k < l.path.taps; k++)
+		l.path.h[k] = (float)(l.path.h[k] * gain);
+	for (f = 1; f <= COHERE_LATCH_FRAMES; f++) {
+		cohere_frame_run(&l, NULL, &echo_energy, &out_energy, &reading,
+				 &info);
+		r->held += info.double_talk;
+		r->cohere += reading.trial_arm == UDSP_EC_NLMS_TRIAL_ARM_COHERE;
+		if (!r->start && info.probes != probes) {
+			r->start = f;
+			r->arm = reading.trial_arm;
+		}
+		if (f % COHERE_BLOCK_FRAMES)
+			continue;
+		if (!r->settled && out_energy > 0.0 &&
+		    10.0 * log10(echo_energy / out_energy) >= CHANGE_BAR_DB)
+			r->settled = f;
+		echo_energy = out_energy = 0.0;
+	}
+	r->trials = info.probes - probes;
+	r->resets = info.diverge_resets;
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/*
+ * A hybrid of unchanged shape, 6 dB quieter or flipped: the detector holds
+ * neither, no coherence trial starts, and plain adaptation reaches 20 dB within
+ * 1 s. A step 6 dB louder reads +1 and starts none either; the latch ends that
+ * hold within 8 s.
+ */
+static void cohere_shape_test(unsigned rate)
+{
+	static const struct {
+		double gain;
+		const char *what;
+	} legs[] = {
+		{ 0.5, "6 dB quieter" },
+		{ -1.0, "flipped" },
+		{ 2.0, "6 dB louder" },
+	};
+	unsigned i;
+
+	case_rate(rate, "lec coherence escape leaves a hybrid of the same "
+		  "shape to adaptation");
+	for (i = 0; i < sizeof(legs) / sizeof(legs[0]); i++) {
+		struct cohere_result r;
+
+		cohere_shape_run(rate, legs[i].gain, &r);
+		printf("# %u Hz, %s: %u double-talk frames in %u ms, %u "
+		       "coherence trials, first trial %s on frame %u, %.0f dB "
+		       "of ERLE on frame %u; %u trials, %u resets\n", rate,
+		       legs[i].what, r.held, 10u * COHERE_LATCH_FRAMES,
+		       r.cohere,
+		       r.start ? lecr_trial_arm_name(r.arm) : "none", r.start,
+		       CHANGE_BAR_DB, r.settled, r.trials, r.resets);
+		CHECK_UINT(r.cohere, 0);
+		CHECK_UINT(r.resets, 0);
+		CHECK(r.settled > 0u);
+		if (legs[i].gain > 1.0) {
+			CHECK_UINT(r.arm, UDSP_EC_NLMS_TRIAL_ARM_LATCH);
+			continue;
+		}
+		CHECK_UINT(r.held, 0);
+		CHECK_UINT(r.trials, 0);
+		CHECK(r.settled <= FRAMES_PER_SECOND);
+	}
+}
+
+#define TIE_QUIETER_DB		2.0
+#define TIE_FROM_DB		3.0
+#define TIE_STEP_DB		0.1
+#define TIE_STEPS		21u
+
+/* The first trial after a change to the late hybrid, TIE_QUIETER_DB under the
+ * flat one. A white talker talk_db over the echo before the change speaks from
+ * the change on. runs takes the frames on which the rebuilt runs come due. */
+static void cohere_tie_run(unsigned rate, double talk_db, unsigned *arm,
+			   unsigned *start, struct cohere_runs *runs)
+{
+	uint32_t near_state = 0xfeedfaceu;
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct cohere_line l;
+	double echo_energy = 0.0;
+	double out_energy = 0.0;
+	uint32_t probes;
+	bool held;
+	unsigned f;
+
+	memset(runs, 0, sizeof(*runs));
+	*arm = UDSP_EC_NLMS_TRIAL_ARM_NONE;
+	*start = 0;
+	cohere_line_init(&l, rate, CHANGE_ERL_DB);
+	udsp_ec_nlms_info_get(l.ec, &info);
+	probes = info.probes;
+	held = info.double_talk;
+	cohere_line_change(&l, CHANGE_ERL_DB + TIE_QUIETER_DB);
+	for (f = 1; f <= 2u * FRAMES_PER_SECOND && !*start; f++) {
+		int16_t near[UDSP_FRAME_MAX];
+
+		noise_fill(near, l.frame, CHANGE_ECHO_DBM0 + talk_db,
+			   &near_state);
+		cohere_frame_run(&l, near, &echo_energy, &out_energy, &reading,
+				 &info);
+		cohere_runs_add(runs, &l.view, &reading, held, f);
+		held = info.double_talk;
+		if (info.probes == probes)
+			continue;
+		*arm = reading.trial_arm;
+		*start = f;
+	}
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/*
+ * Precedence of the arms: a late hybrid 2 dB quieter under a white talker swept
+ * from 3 to 5 dB over the echo before the change. The path-change run comes due
+ * later as the talker grows. On a tie the path-change escape starts the trial,
+ * otherwise the arm due first; each rate ties once at least.
+ */
+static void cohere_precedence_test(unsigned rate)
+{
+	unsigned ties = 0;
+	unsigned i;
+
+	case_rate(rate, "lec starts the path-change trial when both escapes "
+		  "are due on one frame");
+	for (i = 0; i < TIE_STEPS; i++) {
+		double step = TIE_FROM_DB + TIE_STEP_DB * i;
+		struct cohere_runs runs;
+		unsigned arm;
+		unsigned start;
+		bool tie;
+
+		cohere_tie_run(rate, step, &arm, &start, &runs);
+		tie = start && runs.path_due == start &&
+		      runs.cohere_due == start;
+		printf("# %u Hz, talker %+.1f dB: trial %s on frame %u; path "
+		       "run due on frame %u, coherence run on frame %u%s\n",
+		       rate, step, start ? lecr_trial_arm_name(arm) : "none",
+		       start,
+		       runs.path_due, runs.cohere_due, tie ? ", a tie" : "");
+		if (!start)
+			continue;
+		if (tie) {
+			ties++;
+			CHECK_UINT(arm, UDSP_EC_NLMS_TRIAL_ARM_PATH);
+		} else if (runs.path_due == start) {
+			CHECK_UINT(arm, UDSP_EC_NLMS_TRIAL_ARM_PATH);
+		} else {
+			CHECK_UINT(runs.cohere_due, start);
+			CHECK_UINT(arm, UDSP_EC_NLMS_TRIAL_ARM_COHERE);
+		}
+	}
+	CHECK(ties > 0u);
+}
+
+/* The refusal line: the flat hybrid steps 6 dB quieter under a white talker 3
+ * dB over the echo before the change. The talker refuses the coherence trial,
+ * short of the 3 dB cut, and a twin frozen on it holds its snapshot. */
+#define REFUSE_GAIN		0.5
+#define REFUSE_TALK_DBM0	CARRY_LOUD_DBM0
+#define REFUSE_FRAMES		(30u * FRAMES_PER_SECOND)
+/* The bound in REFUSE_FRAMES: the 5 trials of the latch arm alone under a
+ * talker who never pauses. One trial of each of the REFUSE_ESCAPES escapes
+ * comes before the carry holds them. */
+#define REFUSE_LATCH_TRIALS	5u
+#define REFUSE_ESCAPES		3u
+
+struct refuse_result {
+	unsigned arms[MARK_TRIALS_MAX];
+	unsigned starts[MARK_TRIALS_MAX];
+	unsigned trials;
+	unsigned cohere;
+	unsigned first_end;
+	unsigned gap_min;
+	unsigned resets;
+	unsigned differ;
+	float lead_energy;
+	float twin_energy;
+};
+
+/* stop ends the run on the frame the first trial ends, for the twin
+ * compare; otherwise the run takes REFUSE_FRAMES frames. */
+static void refuse_run(unsigned rate, bool stop, struct refuse_result *r)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct udsp_ec_nlms_info twin_info;
+	struct cohere_line lead;
+	struct cohere_line twin;
+	uint32_t near_state = 0xfeedfaceu;
+	double echo_energy = 0.0;
+	double out_energy = 0.0;
+	uint32_t probes;
+	unsigned last = 0;
+	unsigned frozen = 0;
+	unsigned k;
+	unsigned f;
+
+	memset(r, 0, sizeof(*r));
+	cohere_line_init(&lead, rate, CHANGE_ERL_DB);
+	cohere_line_init(&twin, rate, CHANGE_ERL_DB);
+	udsp_ec_nlms_info_get(lead.ec, &info);
+	probes = info.probes;
+	for (k = 0; k < lead.path.taps; k++) {
+		lead.path.h[k] = (float)(lead.path.h[k] * REFUSE_GAIN);
+		twin.path.h[k] = (float)(twin.path.h[k] * REFUSE_GAIN);
+	}
+	for (f = 1; f <= REFUSE_FRAMES; f++) {
+		int16_t near[UDSP_FRAME_MAX];
+
+		noise_fill(near, lead.frame, REFUSE_TALK_DBM0, &near_state);
+		cohere_frame_run(&lead, near, &echo_energy, &out_energy,
+				 &reading, &info);
+		cohere_frame_run(&twin, near, &echo_energy, &out_energy,
+				 &reading, &twin_info);
+		udsp_ec_nlms_frame_get(lead.ec, &reading);
+		if (r->trials == 1u && !r->first_end &&
+		    reading.trial_end != UDSP_EC_NLMS_TRIAL_END_NONE) {
+			r->first_end = reading.trial_end;
+			if (stop)
+				break;
+		}
+		if (info.probes == probes)
+			continue;
+		probes = info.probes;
+		if (r->trials < MARK_TRIALS_MAX) {
+			r->arms[r->trials] = reading.trial_arm;
+			r->starts[r->trials] = f;
+		}
+		if (r->trials && (!r->gap_min || f - last < r->gap_min))
+			r->gap_min = f - last;
+		r->cohere += reading.trial_arm == UDSP_EC_NLMS_TRIAL_ARM_COHERE;
+		last = f;
+		if (!r->trials++) {
+			udsp_ec_nlms.freeze(twin.ec, true);
+			frozen = f;
+		}
+	}
+	r->resets = info.diverge_resets;
+	/* Both filters frozen, the far end alone: two frozen filters give one
+	 * output only when they hold the same coefficients. */
+	udsp_ec_nlms.freeze(lead.ec, true);
+	for (f = 0; f < TWIN_COMPARE_FRAMES && frozen; f++) {
+		int16_t ref[UDSP_FRAME_MAX];
+		int16_t echo[UDSP_FRAME_MAX];
+		int16_t lead_out[UDSP_FRAME_MAX];
+		int16_t twin_out[UDSP_FRAME_MAX];
+
+		noise_fill(ref, lead.frame, CHANGE_FAR_DBM0, &lead.state[0]);
+		path_run(&lead.path, ref, echo);
+		memcpy(lead_out, echo, lead.frame * sizeof(*echo));
+		memcpy(twin_out, echo, lead.frame * sizeof(*echo));
+		udsp_ec_nlms.run(lead.ec, lead_out, ref);
+		udsp_ec_nlms.run(twin.ec, twin_out, ref);
+		r->differ += memcmp(lead_out, twin_out,
+				    lead.frame * sizeof(*echo)) != 0;
+	}
+	udsp_ec_nlms_info_get(lead.ec, &info);
+	udsp_ec_nlms_info_get(twin.ec, &twin_info);
+	r->lead_energy = info.coef_energy;
+	r->twin_energy = twin_info.coef_energy;
+	udsp_ec_nlms.destroy(lead.ec);
+	udsp_ec_nlms.destroy(twin.ec);
+}
+
+static void refuse_print(unsigned rate, const struct refuse_result *r)
+{
+	unsigned i;
+
+	printf("# %u Hz: %u trials in 30 s, arms", rate, r->trials);
+	for (i = 0; i < r->trials && i < MARK_TRIALS_MAX; i++)
+		printf(" %s@%u", lecr_trial_arm_name(r->arms[i]), r->starts[i]);
+	printf("; first ends %s; shortest gap %u frames; filter %.9f against "
+	       "the twin's %.9f, %u of %u frames differ; %u resets\n",
+	       lecr_trial_end_name(r->first_end), r->gap_min,
+	       (double)r->lead_energy, (double)r->twin_energy, r->differ,
+	       TWIN_COMPARE_FRAMES, r->resets);
+}
+
+/*
+ * A refused coherence trial restores its snapshot and stands its escape down: a
+ * twin frozen on its start and the lead give equal output after the refusal.
+ * Over 30 s more of talker the escape starts no second trial, as the latch and
+ * stale-run trials inside it carry its stand-down.
+ */
+static void cohere_refuse_test(unsigned rate)
+{
+	struct refuse_result first;
+	struct refuse_result r;
+
+	refuse_run(rate, true, &first);
+	refuse_run(rate, false, &r);
+	case_rate(rate, "lec coherence escape stands down after a trial a "
+		  "talker refused");
+	refuse_print(rate, &first);
+	refuse_print(rate, &r);
+	CHECK_UINT(first.trials, 1);
+	CHECK_UINT(first.arms[0], UDSP_EC_NLMS_TRIAL_ARM_COHERE);
+	CHECK_UINT(first.first_end, UDSP_EC_NLMS_TRIAL_END_REJECTED);
+	CHECK(first.lead_energy == first.twin_energy);
+	CHECK_UINT(first.differ, 0);
+	CHECK(r.trials >= 2u);
+	CHECK_UINT(r.arms[0], UDSP_EC_NLMS_TRIAL_ARM_COHERE);
+	CHECK_UINT(r.cohere, 1);
+	CHECK_UINT(r.resets, 0);
+}
+
+/*
+ * Trials of a refusal line in 30 s: one per escape at most before the carry
+ * holds them all, then one per latch cycle. That gives 5 trials of the latch
+ * arm plus 3 at most while the latch comes due in each cycle. cohere_cycle_test
+ * covers a line where it does not.
+ */
+static void cohere_bound_test(unsigned rate)
+{
+	struct refuse_result r;
+	unsigned per_arm[UDSP_EC_NLMS_TRIAL_ARM_COHERE + 1u];
+	unsigned i;
+
+	memset(per_arm, 0, sizeof(per_arm));
+	refuse_run(rate, false, &r);
+	for (i = 0; i < r.trials && i < MARK_TRIALS_MAX; i++)
+		if (r.arms[i] <= UDSP_EC_NLMS_TRIAL_ARM_COHERE)
+			per_arm[r.arms[i]]++;
+	case_rate(rate, "lec bounds the trials of three escapes and the latch "
+		  "in 30 s");
+	printf("# %u Hz: %u trials, latch %u, path %u, stale %u, coherence "
+	       "%u; bound %u, the latch arm alone %u\n", rate, r.trials,
+	       per_arm[UDSP_EC_NLMS_TRIAL_ARM_LATCH],
+	       per_arm[UDSP_EC_NLMS_TRIAL_ARM_PATH],
+	       per_arm[UDSP_EC_NLMS_TRIAL_ARM_STALE],
+	       per_arm[UDSP_EC_NLMS_TRIAL_ARM_COHERE],
+	       REFUSE_LATCH_TRIALS + REFUSE_ESCAPES, REFUSE_LATCH_TRIALS);
+	CHECK(r.trials <= REFUSE_LATCH_TRIALS + REFUSE_ESCAPES);
+	CHECK(per_arm[UDSP_EC_NLMS_TRIAL_ARM_PATH] <= 1u);
+	CHECK(per_arm[UDSP_EC_NLMS_TRIAL_ARM_STALE] <= 1u);
+	CHECK(per_arm[UDSP_EC_NLMS_TRIAL_ARM_COHERE] <= 1u);
+	CHECK_UINT(r.resets, 0);
+}
+
+/* The share line: the flat hybrid steps 3 dB quieter under a white talker at
+ * the level of the echo before the change. The reading stands under the bar
+ * while the estimate holds over half of the microphone energy. */
+#define SHARE_GAIN		0.7
+#define SHARE_TALK_DBM0		CHANGE_ECHO_DBM0
+
+/*
+ * Estimate share in the coherence escape. On a share line the detector holds
+ * every frame, and its reading alone runs past a run of 32. Its share stands
+ * over 0.5, so the escape must start no trial, and each hold stays with the
+ * latch. A talker refuses any trial of a hybrid that turns quieter under it,
+ * so the share spares its line that trial.
+ */
+static void cohere_share_test(unsigned rate)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct cohere_runs runs;
+	struct cohere_line l;
+	uint32_t near_state = 0xfeedfaceu;
+	double echo_energy = 0.0;
+	double out_energy = 0.0;
+	unsigned cohere = 0;
+	unsigned latch = 0;
+	bool held;
+	unsigned k;
+	unsigned f;
+
+	memset(&runs, 0, sizeof(runs));
+	cohere_line_init(&l, rate, CHANGE_ERL_DB);
+	for (k = 0; k < l.path.taps; k++)
+		l.path.h[k] = (float)(l.path.h[k] * SHARE_GAIN);
+	udsp_ec_nlms_info_get(l.ec, &info);
+	held = info.double_talk;
+	for (f = 1; f <= REFUSE_FRAMES; f++) {
+		int16_t near[UDSP_FRAME_MAX];
+
+		noise_fill(near, l.frame, SHARE_TALK_DBM0, &near_state);
+		cohere_frame_run(&l, near, &echo_energy, &out_energy, &reading,
+				 &info);
+		cohere_runs_add(&runs, &l.view, &reading, held, f);
+		held = info.double_talk;
+		cohere += reading.trial_arm == UDSP_EC_NLMS_TRIAL_ARM_COHERE;
+		latch += reading.trial_arm == UDSP_EC_NLMS_TRIAL_ARM_LATCH;
+	}
+	case_rate(rate, "lec coherence escape leaves a quieter hybrid under a "
+		  "talker to the latch");
+	printf("# %u Hz: %u held frames of %u; longest run on the reading "
+	       "alone %u, with the share %u; %u coherence trials, %u latch "
+	       "trials, %u trials in all\n", rate, info.hold_frames,
+	       REFUSE_FRAMES, runs.alone_longest, runs.longest, cohere, latch,
+	       info.probes);
+	CHECK(runs.alone_longest >= COHERE_FRAMES);
+	CHECK(runs.longest < COHERE_FRAMES);
+	CHECK_UINT(cohere, 0);
+	CHECK(latch > 0u);
+	CHECK_UINT(info.diverge_resets, 0);
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/* The partial line: a path 8.5 dB louder that the first path predicts on voiced
+ * bursts, not on noise. It is twice the first under PARTIAL_CUT_HZ plus a
+ * dispersive and a late hybrid (Annex D m6, m7). */
+#define PARTIAL_GAIN		2.0
+#define PARTIAL_CUT_HZ		450.0
+#define PARTIAL_DISP_ERL_DB	14.0
+#define PARTIAL_LATE_ERL_DB	24.0
+/* Under this bar the latch, not the coherence escape, answers the partial
+ * line. */
+#define PARTIAL_OLD_BAR		-0.15
+
+static void partial_path_add(struct echo_path *p, const struct echo_path *q)
+{
+	unsigned k;
+
+	for (k = 0; k < q->taps; k++)
+		p->h[k] += q->h[k];
+	if (q->taps > p->taps)
+		p->taps = q->taps;
+}
+
+static void partial_path_init(struct echo_path *p, const struct echo_path *old,
+			      unsigned rate)
+{
+	int half = (int)path_samples_get(1.0, rate);
+	struct echo_path disp;
+	struct echo_path late;
+	unsigned k;
+	int j;
+
+	path_geometry_set(p, rate);
+	for (k = 0; k < old->taps; k++) {
+		if (old->h[k] == 0.0f)
+			continue;
+		for (j = -half; j <= half; j++) {
+			double w = 0.5 + 0.5 * cos(M_PI * j / (half + 1));
+			double s = j ? sin(2.0 * M_PI * PARTIAL_CUT_HZ * j /
+					   rate) / (M_PI * j) :
+				   2.0 * PARTIAL_CUT_HZ / rate;
+
+			if ((int)k + j >= 0)
+				p->h[(int)k + j] += (float)(PARTIAL_GAIN *
+							    old->h[k] * s * w);
+		}
+		if (k + (unsigned)half + 1u > p->taps)
+			p->taps = k + (unsigned)half + 1u;
+	}
+	path_dispersive_init(&disp, rate, PARTIAL_DISP_ERL_DB);
+	path_late_init(&late, rate, PARTIAL_LATE_ERL_DB);
+	partial_path_add(p, &disp);
+	partial_path_add(p, &late);
+}
+
+static double partial_gain_db_get(const struct echo_path *p,
+				  const struct echo_path *q)
+{
+	double ep = 0.0;
+	double eq = 0.0;
+	unsigned k;
+
+	for (k = 0; k < LEC_PATH_TAPS_MAX; k++) {
+		ep += (double)p->h[k] * p->h[k];
+		eq += (double)q->h[k] * q->h[k];
+	}
+	return 10.0 * log10(ep / eq);
+}
+
+/*
+ * On a partial line the smoothed reading climbs back toward 0 on each voiced
+ * burst, so a run of 32 must survive a burst. The trial starts within 64 active
+ * frames, stands with no hold and reaches 20 dB within 3 s. Its burst readings
+ * stand over -0.15, where the latch would answer.
+ */
+static void cohere_partial_test(unsigned rate)
+{
+	struct cohere_result r;
+	struct echo_path old;
+	struct echo_path to;
+
+	path_flat_init(&old, rate, 8, CHANGE_ERL_DB + COHERE_STEP_DB);
+	partial_path_init(&to, &old, rate);
+	cohere_change_path_run(rate, COHERE_STEP_DB, true, &to, &r);
+	case_rate(rate, "lec coherence escape answers a new path the old one "
+		  "partly predicts");
+	printf("# %u Hz, new path %.1f dB over the old: trial of arm %s on "
+	       "frame %u, active frame %u; reading %.3f before it, %.3f at "
+	       "most on the voiced bursts of the run; %.0f dB of ERLE on frame "
+	       "%u; ended %s on frame %u; %u double-talk frames after the "
+	       "keep; %u trials, %u resets\n", rate,
+	       partial_gain_db_get(&to, &old), lecr_trial_arm_name(r.arm),
+	       r.start, r.onset, r.ncc, r.burst_ncc, CHANGE_BAR_DB, r.settled,
+	       lecr_trial_end_name(r.end_kind), r.end, r.held, r.trials,
+	       r.resets);
+	CHECK_UINT(r.arm, UDSP_EC_NLMS_TRIAL_ARM_COHERE);
+	CHECK(r.start > 0u);
+	CHECK(r.onset <= COHERE_CSS_ONSET_FRAMES);
+	CHECK_UINT(r.end_kind, UDSP_EC_NLMS_TRIAL_END_KEPT);
+	CHECK_UINT(r.held, 0);
+	CHECK(r.settled > 0u);
+	CHECK(r.settled <= COHERE_CSS_SETTLED_FRAMES);
+	CHECK_UINT(r.trials, 1);
+	CHECK_UINT(r.resets, 0);
+	CHECK(r.burst_ncc > PARTIAL_OLD_BAR);
+	CHECK(r.burst_ncc <= COHERE_BAR);
+}
+
+/* The reseed line: the change line on the composite source at a 31 ms tail,
+ * with a late hybrid to 40 ms. The kept filter then stands under the trust line
+ * and under-reads the microphone on some frames. */
+#define GAIN_RESEED_TAIL_MS	31u
+#define GAIN_RESEED_AFTER_FRAMES	(10u * FRAMES_PER_SECOND)
+#define GAIN_RESEED_FRAMES	(4u * FRAMES_PER_SECOND)
+
+/* kept, held and trials count the keep, the held frames and the trials after
+ * it. */
+struct reseed_result {
+	unsigned arm;
+	unsigned kept;
+	unsigned held;
+	unsigned trials;
+	float erle_db;
+	float gain_before;
+	float gain_after;
+};
+
+static void reseed_run(unsigned rate, struct reseed_result *r)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct cohere_line l;
+	double echo_energy = 0.0;
+	double out_energy = 0.0;
+	uint32_t probes;
+	unsigned f;
+
+	memset(r, 0, sizeof(*r));
+	cohere_line_start(&l, rate, CHANGE_ERL_DB + COHERE_STEP_DB,
+			  GAIN_RESEED_TAIL_MS, true);
+	udsp_ec_nlms_info_get(l.ec, &info);
+	probes = info.probes;
+	cohere_line_change(&l, CHANGE_ERL_DB);
+	for (f = 1; f <= GAIN_RESEED_AFTER_FRAMES; f++) {
+		cohere_frame_run(&l, NULL, &echo_energy, &out_energy, &reading,
+				 &info);
+		if (!r->arm && info.probes != probes) {
+			r->arm = reading.trial_arm;
+			probes = info.probes;
+			r->gain_before = info.echo_gain;
+			continue;
+		}
+		if (r->arm && !r->kept &&
+		    reading.trial_end == UDSP_EC_NLMS_TRIAL_END_KEPT) {
+			r->kept = f;
+			r->erle_db = info.erle_db;
+			r->gain_after = info.echo_gain;
+			probes = info.probes;
+			continue;
+		}
+		if (!r->kept || f > r->kept + GAIN_RESEED_FRAMES)
+			continue;
+		r->held += info.double_talk;
+		r->trials += info.probes != probes;
+		probes = info.probes;
+	}
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/*
+ * After a kept escape trial, the learned gain takes its echo evidence
+ * (echo_gain_reseed): the coherence trial stands under the trust line. The 4 s
+ * after the keep hold no double-talk frame and start no trial. The gain of the
+ * quieter path would leave the classic bound under the echo.
+ */
+static void cohere_reseed_test(unsigned rate)
+{
+	struct reseed_result r;
+
+	reseed_run(rate, &r);
+	case_rate(rate, "lec reseeds the learned gain after a kept trial");
+	printf("# %u Hz: trial %s, kept on frame %u at %.2f dB of ERLE; gain "
+	       "%.4f before, %.4f after; %u double-talk frames and %u trials "
+	       "in the %u ms after the keep\n", rate,
+	       lecr_trial_arm_name(r.arm), r.kept, (double)r.erle_db,
+	       (double)r.gain_before, (double)r.gain_after, r.held, r.trials,
+	       10u * GAIN_RESEED_FRAMES);
+	CHECK_UINT(r.arm, UDSP_EC_NLMS_TRIAL_ARM_COHERE);
+	CHECK(r.kept > 0u);
+	CHECK(r.erle_db < RING_TRUST_DB);
+	CHECK(r.gain_after > r.gain_before);
+	CHECK_UINT(r.held, 0);
+	CHECK_UINT(r.trials, 0);
+}
+
+/*
+ * The exposure rows of cohere_expose_test on the ringback line of the expose
+ * cases, with the processor off and on. Each runs 3 s of white noise, then
+ * EXPOSE_ROW_FRAMES of each row; near levels are in dB over TALKER_ECHO_DBM0.
+ */
+#define EXPOSE_ROW_FRAMES	(20u * FRAMES_PER_SECOND)
+#define EXPOSE_TONE_HZ		1000.0
+/* A copy of the far end delayed past the default tails, 64 ms at 16 kHz. */
+#define EXPOSE_PAST_MS		80u
+/* The coupling of the far end into the near microphone: 2 ms, inside the
+ * tail and 6 ms ahead of the hybrid. */
+#define EXPOSE_COUPLED_MS	2u
+/* The echo delay of the ringback line. At that delay a copy turned over
+ * stands at 3 or 12 times the echo. The microphone then holds 2 or 11 times
+ * the echo, with its sign turned. */
+#define EXPOSE_ECHO_MS		8u
+#define EXPOSE_INVERT_LOW_DB	9.54
+#define EXPOSE_INVERT_HIGH_DB	21.58
+#define EXPOSE_HIST		(2u * UDSP_SAMPLE_RATE_WB / 10u)
+
+enum expose_src {
+	EXPOSE_WHITE,
+	EXPOSE_WORDS,
+	EXPOSE_CSS,
+	EXPOSE_TONE,
+	EXPOSE_COPY,
+};
+
+/*
+ * One row: far source, near source and level, the delay of a copy, the phase of
+ * a near tone in quarter cycles, and invert. An independent row starts no
+ * trial. A coherent row carries what the reference carries, so its trials
+ * cancel it with the echo, at least by cut_db, keeping at most kept trials.
+ */
+struct expose_row {
+	const char *what;
+	enum expose_src far;
+	enum expose_src near;
+	double near_db;
+	unsigned delay_ms;
+	unsigned tone_phase;
+	bool independent;
+	bool invert;
+	double cut_db;
+	unsigned kept;
+};
+
+/* LEC_GEIGEL_HANGOVER_SHORT of dsp/lec.c. */
+#define EXPOSE_HOLD_SHORT_FRAMES	4u
+
+/* The trials of one instance of a row by arm, with the exposure figures of
+ * its trial frames. hold_pass counts the first pass frames after a short
+ * hold of the detector inside a trial. hold_acted counts those of them on
+ * which the processor acts (expose_hold_step). */
+struct expose_count {
+	unsigned arms[UDSP_EC_NLMS_TRIAL_ARM_COHERE + 1u];
+	unsigned kept;
+	unsigned cohere_gap_min;
+	unsigned cohere_at;
+	unsigned active;
+	unsigned hold_pass;
+	unsigned hold_acted;
+	bool hold_fired;
+	bool hold_short;
+	bool hold_running;
+	struct expose_stat st;
+};
+
+struct expose_src_state {
+	struct word_source words;
+	uint32_t state;
+	unsigned long phase;
+};
+
+static void expose_src_fill(struct expose_src_state *s, enum expose_src kind,
+			    double level_dbm0, int16_t *dst, unsigned frame,
+			    unsigned rate)
+{
+	switch (kind) {
+	case EXPOSE_WORDS:
+		word_fill(&s->words, dst, frame);
+		return;
+	case EXPOSE_CSS:
+		css_fill(dst, frame, level_dbm0, &s->state, &s->phase, rate);
+		return;
+	case EXPOSE_TONE:
+		tone_fill(dst, frame, level_dbm0, EXPOSE_TONE_HZ, &s->phase,
+			  rate);
+		return;
+	default:
+		noise_fill(dst, frame, level_dbm0, &s->state);
+		return;
+	}
+}
+
+static void expose_count_step(struct expose_count *c,
+			      const struct udsp_ec_nlms_frame *reading,
+			      const int16_t *ref, unsigned frame)
+{
+	if (frame_loud(ref, frame))
+		c->active++;
+	if (reading->trial_arm <= UDSP_EC_NLMS_TRIAL_ARM_COHERE)
+		c->arms[reading->trial_arm]++;
+	if (reading->trial_end == UDSP_EC_NLMS_TRIAL_END_KEPT)
+		c->kept++;
+	if (reading->trial_arm != UDSP_EC_NLMS_TRIAL_ARM_COHERE)
+		return;
+	if (c->arms[UDSP_EC_NLMS_TRIAL_ARM_COHERE] > 1u &&
+	    (!c->cohere_gap_min ||
+	     c->active - c->cohere_at < c->cohere_gap_min))
+		c->cohere_gap_min = c->active - c->cohere_at;
+	c->cohere_at = c->active;
+}
+
+/* Counts the first pass frame after a short hold of the detector inside a
+ * trial. hold_left reads the hangover that the verdict of the frame before
+ * set. */
+static void expose_hold_step(struct expose_count *c,
+			     const struct udsp_ec_nlms_frame *reading,
+			     const struct udsp_ec_nlms_info *info)
+{
+	if (c->hold_fired)
+		c->hold_short = reading->hold_left == EXPOSE_HOLD_SHORT_FRAMES;
+	c->hold_fired = reading->dt_fired;
+	if (reading->dt_fired) {
+		c->hold_running = true;
+		return;
+	}
+	if (!c->hold_running || reading->nlp_verdict == LECR_VERDICT_DT)
+		return;
+	c->hold_running = false;
+	if (c->hold_short && reading->probing &&
+	    reading->nlp_verdict == LECR_VERDICT_PASS) {
+		c->hold_pass++;
+		c->hold_acted += info->nlp_active;
+	}
+}
+
+static void expose_row_run(const struct expose_row *row, unsigned rate,
+			   struct expose_count *off, struct expose_count *on)
+{
+	static int16_t hist[EXPOSE_HIST];
+	struct ring_line lines[2];
+	struct expose_src_state far;
+	struct expose_src_state near;
+	unsigned frame = rate / 100u;
+	unsigned delay = row->delay_ms * rate / 1000u;
+	double gain = pow(10.0, (row->near_db - RING_ERL_DB) / 20.0);
+	unsigned pos = 0;
+	unsigned i;
+	unsigned f;
+
+	memset(off, 0, sizeof(*off));
+	memset(on, 0, sizeof(*on));
+	memset(hist, 0, sizeof(hist));
+	memset(&far, 0, sizeof(far));
+	memset(&near, 0, sizeof(near));
+	far.state = 0x0badc0deu;
+	near.state = 0x31415926u;
+	near.phase = row->near == EXPOSE_CSS ? rate / 4u :
+		     (unsigned long)lrint(row->tone_phase * (double)rate /
+					  (4.0 * EXPOSE_TONE_HZ));
+	word_source_init(&far.words, rate, RING_WORDS_DBM0, 0x13572468u);
+	word_source_init(&near.words, rate, TALKER_ECHO_DBM0 + row->near_db,
+			 0x0badcafeu);
+	for (i = 0; i < 2u; i++) {
+		ring_line_init(&lines[i], rate);
+		udsp_ec_nlms.nlp(lines[i].ec, i == 1u);
+		ring_white_run(&lines[i], TALKER_CONVERGE_FRAMES);
+	}
+	for (f = 0; f < EXPOSE_ROW_FRAMES; f++) {
+		int16_t ref[UDSP_FRAME_MAX];
+		int16_t talk[UDSP_FRAME_MAX];
+
+		expose_src_fill(&far, row->far, RING_WORDS_DBM0, ref, frame,
+				rate);
+		if (row->near == EXPOSE_COPY) {
+			for (i = 0; i < frame; i++) {
+				hist[pos % EXPOSE_HIST] = ref[i];
+				talk[i] = sample_clamp((row->invert ? -gain :
+							gain) *
+					hist[(pos + EXPOSE_HIST - delay) %
+					     EXPOSE_HIST]);
+				pos++;
+			}
+		} else {
+			expose_src_fill(&near, row->near,
+					TALKER_ECHO_DBM0 + row->near_db, talk,
+					frame, rate);
+		}
+		for (i = 0; i < 2u; i++) {
+			struct expose_count *c = i ? on : off;
+			struct udsp_ec_nlms_frame reading;
+			struct udsp_ec_nlms_info info;
+
+			expose_frame_run(&lines[i], ref, talk, &c->st);
+			udsp_ec_nlms_frame_get(lines[i].ec, &reading);
+			udsp_ec_nlms_info_get(lines[i].ec, &info);
+			expose_count_step(c, &reading, ref, frame);
+			expose_hold_step(c, &reading, &info);
+		}
+	}
+	for (i = 0; i < 2u; i++)
+		udsp_ec_nlms.destroy(lines[i].ec);
+}
+
+static void expose_row_print(const struct expose_row *row, unsigned rate,
+			     const struct expose_count *c, bool nlp)
+{
+	printf("# %u Hz, %s, processor %s: trials latch %u, path %u, stale "
+	       "%u, coherence %u; %u kept; shortest gap between coherence "
+	       "trials %u active frames; ", rate, row->what, nlp ? "on" : "off",
+	       c->arms[UDSP_EC_NLMS_TRIAL_ARM_LATCH],
+	       c->arms[UDSP_EC_NLMS_TRIAL_ARM_PATH],
+	       c->arms[UDSP_EC_NLMS_TRIAL_ARM_STALE],
+	       c->arms[UDSP_EC_NLMS_TRIAL_ARM_COHERE], c->kept,
+	       c->cohere_gap_min);
+	if (c->st.trials)
+		printf("in the trials: near %.2f dB through, output %.2f dB "
+		       "against the microphone, echo %.2f dB under its level\n",
+		       expose_near_db_get(&c->st),
+		       expose_db_get(c->st.out, c->st.mic),
+		       expose_db_get(c->st.echo, c->st.leak));
+	else
+		printf("no trial frames\n");
+}
+
+/* The benign sweep: the composite source over the composite hybrid at 12 dB
+ * with a word talker over the echo, EXPOSE_SWEEP_SEEDS seeds of 30 s. Returns
+ * the coherence trials; longest takes the longest rebuilt run. */
+#define EXPOSE_SWEEP_SEEDS	8u
+#define EXPOSE_SWEEP_FRAMES	(30u * FRAMES_PER_SECOND)
+#define EXPOSE_SWEEP_MARGIN	10u
+
+static unsigned expose_sweep_run(unsigned rate, double over_db, uint32_t seed,
+				 unsigned *longest)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct word_source talker;
+	struct cohere_runs runs;
+	struct echo_path path;
+	struct cohere_line l;
+	double echo_energy = 0.0;
+	double out_energy = 0.0;
+	unsigned cohere = 0;
+	bool held;
+	unsigned f;
+
+	memset(&runs, 0, sizeof(runs));
+	path_composite_init(&path, rate, CHANGE_ERL_DB);
+	cohere_line_begin(&l, rate, &path, 0u, true, seed);
+	word_source_init(&talker, rate, CHANGE_ECHO_DBM0 + over_db,
+			 0x0badcafeu + seed * 0x9e3779b9u);
+	udsp_ec_nlms_info_get(l.ec, &info);
+	held = info.double_talk;
+	for (f = 1; f <= EXPOSE_SWEEP_FRAMES; f++) {
+		int16_t near[UDSP_FRAME_MAX];
+
+		word_fill(&talker, near, l.frame);
+		cohere_frame_run(&l, near, &echo_energy, &out_energy, &reading,
+				 &info);
+		cohere_runs_add(&runs, &l.view, &reading, held, f);
+		held = info.double_talk;
+		cohere += reading.trial_arm == UDSP_EC_NLMS_TRIAL_ARM_COHERE;
+	}
+	*longest = runs.longest;
+	udsp_ec_nlms.destroy(l.ec);
+	return cohere;
+}
+
+/* The checks of a coherent row with trial frames: the output at most
+ * TALK_BURST_DB over the microphone, the cancellation bound and the keeps. */
+static void expose_row_check(const struct expose_row *row,
+			     const struct expose_count *c)
+{
+	CHECK(!c->cohere_gap_min || c->cohere_gap_min >= EXPOSE_ANY_CADENCE);
+	CHECK(c->kept <= row->kept);
+	if (!c->st.trials)
+		return;
+	CHECK(expose_db_get(c->st.out, c->st.mic) <= TALK_BURST_DB);
+	CHECK(expose_db_get(c->st.out, c->st.mic) <= -row->cut_db);
+}
+
+/*
+ * Exposure of the coherence escape: independent rows and copies past the tail
+ * start no trial. Coherent rows keep their cancellation bound and keeps, with
+ * output at most 3 dB over the microphone. On the benign sweep no trial starts,
+ * and the longest run stands 10 frames or more under 32.
+ */
+static void cohere_expose_test(unsigned rate)
+{
+	static const struct expose_row rows[] = {
+		{ "css over css -4 dB", EXPOSE_CSS, EXPOSE_CSS, -4.0, 0, 0,
+		  true, false, 0.0, 0 },
+		{ "css over css 0 dB", EXPOSE_CSS, EXPOSE_CSS, 0.0, 0, 0,
+		  true, false, 0.0, 0 },
+		{ "css over css +6 dB", EXPOSE_CSS, EXPOSE_CSS, 6.0, 0, 0,
+		  true, false, 0.0, 0 },
+		{ "css over css +12 dB", EXPOSE_CSS, EXPOSE_CSS, 12.0, 0, 0,
+		  true, false, 0.0, 0 },
+		{ "words over words -4 dB", EXPOSE_WORDS, EXPOSE_WORDS, -4.0,
+		  0, 0, true, false, 0.0, 0 },
+		{ "words over words 0 dB", EXPOSE_WORDS, EXPOSE_WORDS, 0.0,
+		  0, 0, true, false, 0.0, 0 },
+		{ "words over words +6 dB", EXPOSE_WORDS, EXPOSE_WORDS, 6.0,
+		  0, 0, true, false, 0.0, 0 },
+		{ "words over words +12 dB", EXPOSE_WORDS, EXPOSE_WORDS, 12.0,
+		  0, 0, true, false, 0.0, 0 },
+		{ "white over white -4 dB", EXPOSE_WHITE, EXPOSE_WHITE, -4.0,
+		  0, 0, true, false, 0.0, 0 },
+		{ "white over white 0 dB", EXPOSE_WHITE, EXPOSE_WHITE, 0.0,
+		  0, 0, true, false, 0.0, 0 },
+		{ "white over white +6 dB", EXPOSE_WHITE, EXPOSE_WHITE, 6.0,
+		  0, 0, true, false, 0.0, 0 },
+		{ "white over white +12 dB", EXPOSE_WHITE, EXPOSE_WHITE, 12.0,
+		  0, 0, true, false, 0.0, 0 },
+		{ "words copy past the tail 0 dB", EXPOSE_WORDS, EXPOSE_COPY,
+		  0.0, EXPOSE_PAST_MS, 0, true, false, 0.0, 0 },
+		{ "white copy past the tail +6 dB", EXPOSE_WHITE, EXPOSE_COPY,
+		  6.0, EXPOSE_PAST_MS, 0, true, false, 0.0, 0 },
+		{ "tone over tone in phase +6 dB", EXPOSE_TONE, EXPOSE_TONE,
+		  6.0, 0, 0, false, false, 20.0, 1 },
+		{ "tone over tone a quarter cycle +6 dB", EXPOSE_TONE,
+		  EXPOSE_TONE, 6.0, 0, 1, false, false, 18.0, 1 },
+		{ "tone over tone half a cycle +6 dB", EXPOSE_TONE, EXPOSE_TONE,
+		  6.0, 0, 2, false, false, 12.0, 1 },
+		{ "css coupled -20 dB", EXPOSE_CSS, EXPOSE_COPY, -20.0,
+		  EXPOSE_COUPLED_MS, 0, false, false, 0.0, 0 },
+		{ "css coupled -10 dB", EXPOSE_CSS, EXPOSE_COPY, -10.0,
+		  EXPOSE_COUPLED_MS, 0, false, false, 0.0, 0 },
+		{ "css coupled 0 dB", EXPOSE_CSS, EXPOSE_COPY, 0.0,
+		  EXPOSE_COUPLED_MS, 0, false, false, 0.0, 0 },
+		{ "white coupled 0 dB", EXPOSE_WHITE, EXPOSE_COPY, 0.0,
+		  EXPOSE_COUPLED_MS, 0, false, false, 10.0, 1 },
+		{ "white copy at the echo delay turned over, 3 times the echo",
+		  EXPOSE_WHITE, EXPOSE_COPY, EXPOSE_INVERT_LOW_DB,
+		  EXPOSE_ECHO_MS, 0, false, true, 4.0, 1 },
+		{ "white copy at the echo delay turned over, 12 times the echo",
+		  EXPOSE_WHITE, EXPOSE_COPY, EXPOSE_INVERT_HIGH_DB,
+		  EXPOSE_ECHO_MS, 0, false, true, 6.0, 1 },
+	};
+	unsigned i;
+	unsigned k;
+
+	case_rate(rate, "lec coherence escape starts no trial for an "
+		  "independent near signal");
+	for (i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+		struct expose_count off;
+		struct expose_count on;
+
+		expose_row_run(&rows[i], rate, &off, &on);
+		expose_row_print(&rows[i], rate, &off, false);
+		expose_row_print(&rows[i], rate, &on, true);
+		if (rows[i].independent) {
+			CHECK_UINT(off.arms[UDSP_EC_NLMS_TRIAL_ARM_COHERE], 0);
+			CHECK_UINT(on.arms[UDSP_EC_NLMS_TRIAL_ARM_COHERE], 0);
+			continue;
+		}
+		expose_row_check(&rows[i], &off);
+		expose_row_check(&rows[i], &on);
+	}
+	for (k = 0; k < 3u; k++) {
+		double over = 4.0 + 4.0 * k;
+		unsigned worst = 0;
+		unsigned cohere = 0;
+		uint32_t s;
+
+		for (s = 0; s < EXPOSE_SWEEP_SEEDS; s++) {
+			unsigned longest;
+
+			cohere += expose_sweep_run(rate, over, s, &longest);
+			if (longest > worst)
+				worst = longest;
+		}
+		printf("# %u Hz, composite source under words %+.0f dB over "
+		       "the composite hybrid at 12 dB, %u seeds of 30 s: %u "
+		       "coherence trials, longest run %u active frames "
+		       "against the run of %u\n", rate, over,
+		       EXPOSE_SWEEP_SEEDS, cohere, worst, COHERE_FRAMES);
+		CHECK_UINT(cohere, 0);
+		CHECK(worst + EXPOSE_SWEEP_MARGIN <= COHERE_FRAMES);
+	}
+}
+
+/*
+ * A talker end of a coherence trial: on trial frame 10 a white talker 16 dB
+ * over the far end joins for one frame. That frame reads a talker, a running
+ * trial and a talker end, counts one held frame and leaves the twin's filter.
+ * The escape it stands down starts no trial for LEC_TRIAL_STANDDOWN_FRAMES.
+ */
+static void cohere_talker_test(unsigned rate)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info before;
+	struct udsp_ec_nlms_info info;
+	struct udsp_ec_nlms_info twin_info;
+	struct cohere_line lead;
+	struct cohere_line twin;
+	uint32_t near_state = 0xfeedfaceu;
+	double echo_energy = 0.0;
+	double out_energy = 0.0;
+	unsigned arm = UDSP_EC_NLMS_TRIAL_ARM_NONE;
+	unsigned started = 0;
+	unsigned cohere = 0;
+	unsigned f;
+
+	cohere_line_init(&lead, rate, CHANGE_ERL_DB + COHERE_STEP_DB);
+	cohere_line_init(&twin, rate, CHANGE_ERL_DB + COHERE_STEP_DB);
+	cohere_line_change(&lead, CHANGE_ERL_DB);
+	cohere_line_change(&twin, CHANGE_ERL_DB);
+	for (f = 1; f <= COHERE_AFTER_FRAMES && !started; f++) {
+		cohere_frame_run(&lead, NULL, &echo_energy, &out_energy,
+				 &reading, &info);
+		cohere_frame_run(&twin, NULL, &echo_energy, &out_energy,
+				 &reading, &twin_info);
+		if (!info.probes)
+			continue;
+		started = f;
+		udsp_ec_nlms_frame_get(lead.ec, &reading);
+		arm = reading.trial_arm;
+	}
+	udsp_ec_nlms.freeze(twin.ec, true);
+	for (f = 1; f < TALKER_TRIAL_FRAME; f++)
+		cohere_frame_run(&lead, NULL, &echo_energy, &out_energy,
+				 &reading, &info);
+	before = info;
+	{
+		int16_t near[UDSP_FRAME_MAX];
+
+		noise_fill(near, lead.frame, CHANGE_FAR_DBM0 + TALKER_OVER_DB,
+			   &near_state);
+		cohere_frame_run(&lead, near, &echo_energy, &out_energy,
+				 &reading, &info);
+	}
+	udsp_ec_nlms_info_get(twin.ec, &twin_info);
+	case_rate(rate, "lec ends a coherence trial on the first frame of a "
+		  "near talker");
+	printf("# %u Hz: trial of arm %s on frame %u after the change; talker "
+	       "frame: talker %u, probing %u, end %s, held %u; filter %.9f "
+	       "against the twin's %.9f\n", rate, lecr_trial_arm_name(arm),
+	       started, reading.talker,
+	       reading.probing, lecr_trial_end_name(reading.trial_end),
+	       info.hold_frames - before.hold_frames,
+	       (double)info.coef_energy, (double)twin_info.coef_energy);
+	CHECK(started > 0u);
+	CHECK_UINT(arm, UDSP_EC_NLMS_TRIAL_ARM_COHERE);
+	CHECK(reading.talker);
+	CHECK(reading.probing);
+	CHECK_UINT(reading.trial_end, UDSP_EC_NLMS_TRIAL_END_TALKER);
+	CHECK_UINT(info.hold_frames - before.hold_frames, 1);
+	CHECK(info.coef_energy == twin_info.coef_energy);
+	for (f = 0; f < EXPOSE_ANY_CADENCE - 10u; f++) {
+		cohere_frame_run(&lead, NULL, &echo_energy, &out_energy,
+				 &reading, &info);
+		cohere += reading.trial_arm == UDSP_EC_NLMS_TRIAL_ARM_COHERE;
+	}
+	printf("# %u Hz: %u coherence trials in the %u frames after the "
+	       "talker end, %u trials in all\n", rate, cohere,
+	       EXPOSE_ANY_CADENCE - 10u, info.probes);
+	CHECK_UINT(cohere, 0);
+	CHECK_UINT(info.diverge_resets, 0);
+	udsp_ec_nlms.destroy(lead.ec);
+	udsp_ec_nlms.destroy(twin.ec);
+}
+
+/* The frame of the change line on which a far-end pause starts, inside the
+ * run of the coherence escape. The two pause lengths end inside the long
+ * hangover of LEC_GEIGEL_HANGOVER and past it. */
+#define PAUSE_RUN_AT		15u
+#define PAUSE_SHORT_FRAMES	10u
+#define PAUSE_LONG_FRAMES	40u
+
+/* The first trial on the change line 10 dB louder with a far-end pause of
+ * pause frames from frame PAUSE_RUN_AT on. */
+static unsigned cohere_pause_run(unsigned rate, unsigned pause,
+				 unsigned *arm)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct cohere_line l;
+	double echo_energy = 0.0;
+	double out_energy = 0.0;
+	unsigned start = 0;
+	unsigned f;
+
+	cohere_line_init(&l, rate, CHANGE_ERL_DB + COHERE_STEP_DB);
+	cohere_line_change(&l, CHANGE_ERL_DB);
+	for (f = 1; f <= COHERE_AFTER_FRAMES && !start; f++) {
+		if (f >= PAUSE_RUN_AT && f < PAUSE_RUN_AT + pause) {
+			int16_t ref[UDSP_FRAME_MAX];
+			int16_t echo[UDSP_FRAME_MAX];
+			int16_t hiss[UDSP_FRAME_MAX];
+			unsigned i;
+
+			memset(ref, 0, sizeof(ref));
+			path_run(&l.path, ref, echo);
+			noise_fill(hiss, l.frame, CHANGE_FLOOR_DBM0,
+				   &l.state[2]);
+			for (i = 0; i < l.frame; i++)
+				hiss[i] = sample_clamp((double)hiss[i] +
+						       echo[i]);
+			udsp_ec_nlms.run(l.ec, hiss, ref);
+			udsp_ec_nlms_info_get(l.ec, &info);
+		} else {
+			cohere_frame_run(&l, NULL, &echo_energy, &out_energy,
+					 &reading, &info);
+		}
+		if (!info.probes)
+			continue;
+		udsp_ec_nlms_frame_get(l.ec, &reading);
+		start = f;
+		*arm = reading.trial_arm;
+	}
+	udsp_ec_nlms.destroy(l.ec);
+	return start;
+}
+
+/*
+ * A far pause during a coherence run: a pause of 10 frames ends inside the long
+ * hangover. Its frames neither arm nor disarm the run, and the trial starts one
+ * pause later. A pause of 40 frames ends the hold, so the run starts over. The
+ * trial then comes within a run plus an onset of the return.
+ */
+static void cohere_pause_test(unsigned rate)
+{
+	unsigned arm_none = 0;
+	unsigned arm_short = 0;
+	unsigned arm_long = 0;
+	unsigned none = cohere_pause_run(rate, 0u, &arm_none);
+	unsigned brief = cohere_pause_run(rate, PAUSE_SHORT_FRAMES, &arm_short);
+	unsigned lasting = cohere_pause_run(rate, PAUSE_LONG_FRAMES, &arm_long);
+	unsigned back = PAUSE_RUN_AT + PAUSE_LONG_FRAMES;
+
+	case_rate(rate, "lec coherence run waits through a far-end pause");
+	printf("# %u Hz: trial on frame %u (%s) with no pause, %u (%s) with a "
+	       "pause of %u frames, %u (%s) with a pause of %u frames\n", rate,
+	       none, lecr_trial_arm_name(arm_none), brief,
+	       lecr_trial_arm_name(arm_short), PAUSE_SHORT_FRAMES, lasting,
+	       lecr_trial_arm_name(arm_long), PAUSE_LONG_FRAMES);
+	CHECK_UINT(arm_none, UDSP_EC_NLMS_TRIAL_ARM_COHERE);
+	CHECK_UINT(arm_short, UDSP_EC_NLMS_TRIAL_ARM_COHERE);
+	CHECK_UINT(arm_long, UDSP_EC_NLMS_TRIAL_ARM_COHERE);
+	CHECK_UINT(brief, none + PAUSE_SHORT_FRAMES);
+	CHECK(lasting >= back + COHERE_FRAMES);
+	CHECK(lasting <= back + COHERE_FRAMES + COHERE_ONSET_FRAMES);
+}
+
+/*
+ * The coherence trials of one line, with their exposure figures: the trials,
+ * the keeps and the end of the last one. st takes the frames and energies of
+ * their frames (struct expose_stat), the start frame and the end frame
+ * included. held takes the same energies over the held frames before the
+ * first trial.
+ */
+struct cohere_trials {
+	struct expose_stat st;
+	struct expose_stat held;
+	unsigned trials;
+	unsigned kept;
+	unsigned end;
+	unsigned frames;
+	bool open;
+};
+
+static void cohere_trials_step(struct cohere_trials *c,
+			       const struct udsp_ec_nlms_frame *reading,
+			       const struct ring_planes *p, unsigned frame)
+{
+	if (reading->trial_arm == UDSP_EC_NLMS_TRIAL_ARM_COHERE) {
+		c->trials++;
+		c->open = true;
+	}
+	if (c->open) {
+		expose_energy_add(&c->st, p->near, p, frame);
+		c->frames++;
+	} else if (!c->trials && reading->ref_power >= reading->ref_bar &&
+		   reading->dt_fired) {
+		expose_energy_add(&c->held, p->near, p, frame);
+	}
+	if (!c->open || reading->trial_end == UDSP_EC_NLMS_TRIAL_END_NONE)
+		return;
+	c->open = false;
+	c->end = reading->trial_end;
+	c->kept += reading->trial_end == UDSP_EC_NLMS_TRIAL_END_KEPT;
+}
+
+static void cohere_trials_print(unsigned rate, const char *what,
+				const struct cohere_trials *c)
+{
+	printf("# %u Hz, %s: %u coherence trials, %u kept, the last ended "
+	       "%s after %u frames in all; in the trials: near %.2f dB "
+	       "through, output %.2f dB against the microphone, echo %.2f dB "
+	       "under its level\n", rate, what, c->trials, c->kept,
+	       lecr_trial_end_name(c->end), c->frames,
+	       expose_near_db_get(&c->st),
+	       expose_db_get(c->st.out, c->st.mic),
+	       expose_db_get(c->st.echo, c->st.leak));
+}
+
+/* The refusal line for REFUSE_FRAMES, its coherence trials into c. */
+static void near_trial_refuse_run(unsigned rate, struct cohere_trials *c)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct ring_planes planes;
+	struct cohere_line l;
+	uint32_t near_state = 0xfeedfaceu;
+	double echo_energy = 0.0;
+	double out_energy = 0.0;
+	unsigned k;
+	unsigned f;
+
+	memset(c, 0, sizeof(*c));
+	cohere_line_init(&l, rate, CHANGE_ERL_DB);
+	l.planes = &planes;
+	for (k = 0; k < l.path.taps; k++)
+		l.path.h[k] = (float)(l.path.h[k] * REFUSE_GAIN);
+	for (f = 1; f <= REFUSE_FRAMES; f++) {
+		int16_t near[UDSP_FRAME_MAX];
+
+		noise_fill(near, l.frame, REFUSE_TALK_DBM0, &near_state);
+		cohere_frame_run(&l, near, &echo_energy, &out_energy, &reading,
+				 &info);
+		cohere_trials_step(c, &reading, &planes, l.frame);
+	}
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/* The talker of the sweep over a change: after convergence on the composite
+ * source, the late hybrid 10 dB louder, under a word talker over_db over the
+ * old echo. */
+#define NEAR_WORDS_FRAMES	(10u * FRAMES_PER_SECOND)
+
+static void near_trial_words_run(unsigned rate, double over_db,
+				 struct cohere_trials *c)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct word_source talker;
+	struct ring_planes planes;
+	struct echo_path path;
+	struct cohere_line l;
+	double echo_energy = 0.0;
+	double out_energy = 0.0;
+	unsigned f;
+
+	memset(c, 0, sizeof(*c));
+	path_composite_init(&path, rate, CHANGE_ERL_DB);
+	cohere_line_begin(&l, rate, &path, 0u, true, 0u);
+	l.planes = &planes;
+	word_source_init(&talker, rate, CHANGE_ECHO_DBM0 + over_db,
+			 0x0badcafeu);
+	cohere_line_change(&l, CHANGE_ERL_DB - COHERE_STEP_DB);
+	for (f = 1; f <= NEAR_WORDS_FRAMES; f++) {
+		int16_t near[UDSP_FRAME_MAX];
+
+		word_fill(&talker, near, l.frame);
+		cohere_frame_run(&l, near, &echo_energy, &out_energy, &reading,
+				 &info);
+		cohere_trials_step(c, &reading, &planes, l.frame);
+	}
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/*
+ * Near speech through coherence trials: on every trial frame it passes within 2
+ * dB, the output at most 3 dB over the microphone. A refusal line's trial ends
+ * refused. Under words 6 dB under a changed echo 10 dB louder, a trial stays
+ * kept with the echo 3 dB down; at 2 dB under it, the talker refuses each.
+ */
+static void cohere_near_trial_test(unsigned rate)
+{
+	struct cohere_trials refuse;
+	struct cohere_trials words;
+	struct cohere_trials louder;
+
+	near_trial_refuse_run(rate, &refuse);
+	near_trial_words_run(rate, 4.0, &words);
+	near_trial_words_run(rate, 8.0, &louder);
+	case_rate(rate, "lec coherence trials pass the near speech of a "
+		  "talker");
+	cohere_trials_print(rate, "refusal line", &refuse);
+	cohere_trials_print(rate, "words +4 dB over a change", &words);
+	cohere_trials_print(rate, "words +8 dB over a change", &louder);
+	printf("# %u Hz, refusal line: held frames before the trial: echo "
+	       "%.2f dB under its level\n", rate,
+	       expose_db_get(refuse.held.echo, refuse.held.leak));
+	CHECK(refuse.trials >= 1u);
+	CHECK_UINT(refuse.kept, 0);
+	CHECK(fabs(expose_near_db_get(&refuse.st)) <= EXPOSE_NEAR_DB);
+	CHECK(expose_db_get(refuse.st.out, refuse.st.mic) <= TALK_BURST_DB);
+	CHECK(expose_db_get(refuse.st.echo, refuse.st.leak) >=
+	      expose_db_get(refuse.held.echo, refuse.held.leak) - 1.0);
+	CHECK(words.trials >= 1u);
+	CHECK_UINT(words.kept, words.trials);
+	CHECK(fabs(expose_near_db_get(&words.st)) <= EXPOSE_NEAR_DB);
+	CHECK(expose_db_get(words.st.out, words.st.mic) <= TALK_BURST_DB);
+	if (words.kept)
+		CHECK(expose_db_get(words.st.echo, words.st.leak) >=
+		      EXPOSE_LEAK_DB);
+	CHECK(louder.trials >= 1u);
+	CHECK_UINT(louder.kept, 0);
+	CHECK(fabs(expose_near_db_get(&louder.st)) <= EXPOSE_NEAR_DB);
+	CHECK(expose_db_get(louder.st.out, louder.st.mic) <= TALK_BURST_DB);
+}
+
+/* The intermittent line: the refusal line whose talker and far end pause
+ * together. The pause frames hold no double talk and no reference, so they pay
+ * the latch run down without adapting. */
+#define STANDDOWN_CYCLE_FRAMES	400u
+#define STANDDOWN_PAUSE_FRAMES	100u
+
+struct standdown_cycle {
+	unsigned arms[UDSP_EC_NLMS_TRIAL_ARM_COHERE + 1u];
+	unsigned at[UDSP_EC_NLMS_TRIAL_ARM_COHERE + 1u];
+	unsigned gap_min[UDSP_EC_NLMS_TRIAL_ARM_COHERE + 1u];
+	unsigned trials;
+	unsigned active;
+	unsigned resets;
+};
+
+static void standdown_cycle_run(unsigned rate, struct standdown_cycle *r)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct cohere_line l;
+	uint32_t near_state = 0xfeedfaceu;
+	double echo_energy = 0.0;
+	double out_energy = 0.0;
+	unsigned k;
+	unsigned f;
+
+	memset(r, 0, sizeof(*r));
+	cohere_line_init(&l, rate, CHANGE_ERL_DB);
+	for (k = 0; k < l.path.taps; k++)
+		l.path.h[k] = (float)(l.path.h[k] * REFUSE_GAIN);
+	for (f = 0; f < REFUSE_FRAMES; f++) {
+		int16_t near[UDSP_FRAME_MAX];
+		unsigned arm;
+
+		l.quiet = f % STANDDOWN_CYCLE_FRAMES >=
+			  STANDDOWN_CYCLE_FRAMES - STANDDOWN_PAUSE_FRAMES;
+		noise_fill(near, l.frame, REFUSE_TALK_DBM0, &near_state);
+		if (l.quiet)
+			memset(near, 0, l.frame * sizeof(*near));
+		cohere_frame_run(&l, near, &echo_energy, &out_energy, &reading,
+				 &info);
+		if (reading.ref_power >= reading.ref_bar)
+			r->active++;
+		arm = reading.trial_arm;
+		if (arm == UDSP_EC_NLMS_TRIAL_ARM_NONE ||
+		    arm > UDSP_EC_NLMS_TRIAL_ARM_COHERE)
+			continue;
+		r->trials++;
+		if (r->arms[arm] &&
+		    (!r->gap_min[arm] || r->active - r->at[arm] <
+		     r->gap_min[arm]))
+			r->gap_min[arm] = r->active - r->at[arm];
+		r->arms[arm]++;
+		r->at[arm] = r->active;
+	}
+	r->resets = info.diverge_resets;
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/*
+ * A bound per stand-down cycle: pauses keep the latch from coming due, so no
+ * latch trial carries a stand-down. Each escape starts one trial at most per
+ * cycle of 700 active frames. The coherence escape comes back, two trials or
+ * more in 30 s, past the bound of cohere_bound_test.
+ */
+static void cohere_cycle_test(unsigned rate)
+{
+	struct standdown_cycle r;
+	unsigned arm;
+
+	standdown_cycle_run(rate, &r);
+	case_rate(rate, "lec coherence escape starts one trial per stand-down "
+		  "cycle under an intermittent talker");
+	printf("# %u Hz: %u trials over %u active frames: latch %u, path %u, "
+	       "stale %u, coherence %u; shortest gaps between two trials of "
+	       "one arm: latch %u, path %u, stale %u, coherence %u; %u "
+	       "resets\n", rate, r.trials, r.active,
+	       r.arms[UDSP_EC_NLMS_TRIAL_ARM_LATCH],
+	       r.arms[UDSP_EC_NLMS_TRIAL_ARM_PATH],
+	       r.arms[UDSP_EC_NLMS_TRIAL_ARM_STALE],
+	       r.arms[UDSP_EC_NLMS_TRIAL_ARM_COHERE],
+	       r.gap_min[UDSP_EC_NLMS_TRIAL_ARM_LATCH],
+	       r.gap_min[UDSP_EC_NLMS_TRIAL_ARM_PATH],
+	       r.gap_min[UDSP_EC_NLMS_TRIAL_ARM_STALE],
+	       r.gap_min[UDSP_EC_NLMS_TRIAL_ARM_COHERE], r.resets);
+	CHECK(r.arms[UDSP_EC_NLMS_TRIAL_ARM_COHERE] >= 2u);
+	for (arm = UDSP_EC_NLMS_TRIAL_ARM_PATH;
+	     arm <= UDSP_EC_NLMS_TRIAL_ARM_COHERE; arm++)
+		CHECK(!r.gap_min[arm] || r.gap_min[arm] >= EXPOSE_CADENCE);
+	CHECK(r.arms[UDSP_EC_NLMS_TRIAL_ARM_COHERE] <=
+	      r.active / EXPOSE_CADENCE + 1u);
+	CHECK_UINT(r.resets, 0);
+}
+
+/* The divergence line of divergence_peak_test: the flat hybrid at 12 dB grows
+ * louder in 0.5 dB steps until the watchdog zeroes the filter. A white talker
+ * DIVERGE_TALK_DB over the echo then joins. */
+#define DIVERGE_TALK_DB		3.0
+#define DIVERGE_TALK_FRAMES	(3u * FRAMES_PER_SECOND)
+
+/*
+ * Coherence sums at a divergence reset. A watchdog reset throws its filter
+ * away, so sums that read a diverged filter describe a filter that this line
+ * does not have. They start over with their run. A talker holds the detector
+ * after that reset, and the escape must start no trial in its 3 s of speech.
+ */
+static void cohere_diverge_test(void)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info before;
+	struct udsp_ec_nlms_info info;
+	struct echo_path path;
+	struct udsp_ec *ec = udsp_ec_nlms.create(16);
+	uint32_t state = 0x0c0ffee2u;
+	uint32_t near_state = 0xfeedfaceu;
+	double erl_db = 12.0;
+	unsigned dwell = 0;
+	unsigned cohere = 0;
+	unsigned held = 0;
+	unsigned f;
+
+	udsp_ec_nlms.nlp(ec, false);
+	path_flat_init(&path, UDSP_SAMPLE_RATE, 8, erl_db);
+	(void)erle_run(ec, &path, &state, -10.0, FRAMES_PER_SECOND, 1);
+	udsp_ec_nlms_info_get(ec, &before);
+	for (f = 0; f < 10u * FRAMES_PER_SECOND; f++) {
+		(void)erle_run(ec, &path, &state, -10.0, 1u, 1u);
+		udsp_ec_nlms_info_get(ec, &info);
+		if (info.diverge_resets != before.diverge_resets)
+			break;
+		if (++dwell < RAMP_DWELL_FRAMES ||
+		    info.erle_db < RAMP_SETTLED_DB)
+			continue;
+		erl_db -= RAMP_STEP_DB;
+		path_erl_set(&path, erl_db);
+		dwell = 0;
+	}
+	before = info;
+	for (f = 0; f < DIVERGE_TALK_FRAMES; f++) {
+		int16_t ref[UDSP_FRAME_MAX];
+		int16_t echo[UDSP_FRAME_MAX];
+		int16_t near[UDSP_FRAME_MAX];
+		unsigned i;
+
+		noise_fill(ref, path.frame, -10.0, &state);
+		path_run(&path, ref, echo);
+		noise_fill(near, path.frame, -10.0 - erl_db + DIVERGE_TALK_DB,
+			   &near_state);
+		for (i = 0; i < path.frame; i++)
+			echo[i] = sample_clamp((double)echo[i] + near[i]);
+		udsp_ec_nlms.run(ec, echo, ref);
+		udsp_ec_nlms_frame_get(ec, &reading);
+		udsp_ec_nlms_info_get(ec, &info);
+		cohere += reading.trial_arm == UDSP_EC_NLMS_TRIAL_ARM_COHERE;
+		held += info.double_talk;
+	}
+
+	CASE("lec coherence escape starts no trial from the sums of a "
+	     "diverged filter");
+	printf("# reset at ERL %.1f dB, %u resets; in %u frames of the "
+	       "talker: %u double-talk frames, %u coherence trials, %u "
+	       "trials\n", erl_db, before.diverge_resets, DIVERGE_TALK_FRAMES,
+	       held, cohere, info.probes - before.probes);
+	CHECK(before.diverge_resets > 0u);
+	CHECK(held > 0u);
+	CHECK_UINT(cohere, 0);
+	udsp_ec_nlms.destroy(ec);
+}
+
+/* The gain line of cohere_gain_test: the ringback line converged on white
+ * noise, then a far tone with a near tone at its frequency. White noise then
+ * runs under a white talker GAIN_TALK_DB over the echo for GAIN_TALK_FRAMES. */
+#define GAIN_TONE_FRAMES	(20u * FRAMES_PER_SECOND)
+#define GAIN_TALK_DB		6.0
+#define GAIN_TALK_FRAMES	(3u * FRAMES_PER_SECOND)
+/* Three bounds: LEC_GAIN_RESEED_COEF_RATIO of dsp/lec.c with the rounding of a
+ * float product. GAIN_RISE_TRIAL is the rise of LEC_GEIGEL_GAIN_RISE over a
+ * second of a trial, GAIN_TALK_SPREAD the spread of a reseed under a talker. */
+#define GAIN_RESEED_COEF_RATIO	5.0001
+#define GAIN_RISE_TRIAL		1.585f
+#define GAIN_TALK_SPREAD	1.259f
+
+struct gain_result {
+	unsigned arm;
+	unsigned kept;
+	unsigned held;
+	float gain_before;
+	float gain_after;
+	float coef_energy;
+	struct expose_stat st;
+};
+
+/*
+ * A near tone tone_db over the echo, quarters of a cycle from it, until the
+ * first trial ends kept. In phase at 6 dB the latch starts that trial. Half a
+ * cycle off, at 6 and 14 dB, the path-change escape does. The estimate that it
+ * learns stands 1 and 16 times the converged filter's echo. At 14 dB the
+ * reseed's cap holds the trust's energy rule.
+ */
+static void gain_run(unsigned rate, unsigned quarters, double tone_db,
+		     struct gain_result *r)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct ring_planes p;
+	struct ring_line line;
+	unsigned long far_phase = 0;
+	unsigned long near_phase = (unsigned long)lrint(quarters *
+		(double)rate / (4.0 * EXPOSE_TONE_HZ));
+	uint32_t talk_state = 0x31415926u;
+	float gain = 0.0f;
+	unsigned f;
+
+	memset(r, 0, sizeof(*r));
+	ring_line_init(&line, rate);
+	ring_white_run(&line, TALKER_CONVERGE_FRAMES);
+	for (f = 1; f <= GAIN_TONE_FRAMES && !r->kept; f++) {
+		int16_t ref[UDSP_FRAME_MAX];
+		int16_t near[UDSP_FRAME_MAX];
+
+		udsp_ec_nlms_info_get(line.ec, &info);
+		gain = info.echo_gain;
+		tone_fill(ref, line.frame, RING_WORDS_DBM0, EXPOSE_TONE_HZ,
+			  &far_phase, rate);
+		tone_fill(near, line.frame, TALKER_ECHO_DBM0 + tone_db,
+			  EXPOSE_TONE_HZ, &near_phase, rate);
+		ring_planes_run(&line, ref, near, NULL, &p);
+		udsp_ec_nlms_frame_get(line.ec, &reading);
+		udsp_ec_nlms_info_get(line.ec, &info);
+		if (reading.trial_arm != UDSP_EC_NLMS_TRIAL_ARM_NONE) {
+			r->arm = reading.trial_arm;
+			r->gain_before = gain;
+		}
+		if (reading.trial_end != UDSP_EC_NLMS_TRIAL_END_KEPT)
+			continue;
+		r->kept = f;
+		r->gain_after = info.echo_gain;
+		r->coef_energy = info.coef_energy;
+	}
+	for (f = 0; f < GAIN_TALK_FRAMES && r->kept; f++) {
+		int16_t ref[UDSP_FRAME_MAX];
+		int16_t near[UDSP_FRAME_MAX];
+
+		noise_fill(ref, line.frame, RING_WORDS_DBM0, &line.far_state);
+		noise_fill(near, line.frame, TALKER_ECHO_DBM0 + GAIN_TALK_DB,
+			   &talk_state);
+		ring_planes_run(&line, ref, near, NULL, &p);
+		udsp_ec_nlms_info_get(line.ec, &info);
+		r->held += info.double_talk;
+		expose_energy_add(&r->st, near, &p, line.frame);
+	}
+	udsp_ec_nlms.destroy(line.ec);
+}
+
+/* The change line 10 dB louder on white noise, with a white talker
+ * GAIN_CHANGE_TALK_DB under the changed echo when talker is set. It returns the
+ * learned gain where the first trial ends kept, else 0, and its arm. */
+#define GAIN_CHANGE_TALK_DB	-3.0
+
+static float gain_change_run(unsigned rate, bool talker, unsigned *arm)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct cohere_line l;
+	uint32_t near_state = 0x31415926u;
+	double echo_energy = 0.0;
+	double out_energy = 0.0;
+	float gain = 0.0f;
+	unsigned f;
+
+	*arm = UDSP_EC_NLMS_TRIAL_ARM_NONE;
+	cohere_line_init(&l, rate, CHANGE_ERL_DB + COHERE_STEP_DB);
+	cohere_line_change(&l, CHANGE_ERL_DB);
+	for (f = 1; f <= COHERE_AFTER_FRAMES && !gain; f++) {
+		int16_t near[UDSP_FRAME_MAX];
+
+		noise_fill(near, l.frame,
+			   CHANGE_ECHO_DBM0 + GAIN_CHANGE_TALK_DB, &near_state);
+		cohere_frame_run(&l, talker ? near : NULL, &echo_energy,
+				 &out_energy, &reading, &info);
+		if (reading.trial_arm != UDSP_EC_NLMS_TRIAL_ARM_NONE)
+			*arm = reading.trial_arm;
+		if (reading.trial_end == UDSP_EC_NLMS_TRIAL_END_KEPT)
+			gain = info.echo_gain;
+	}
+	udsp_ec_nlms.destroy(l.ec);
+	return gain;
+}
+
+/*
+ * A latch trial kept on a near tone in phase leaves the gain to the tracker,
+ * which rises 2 dB at most in a second. After each keep the gain stands at most
+ * LEC_GAIN_RESEED_COEF_RATIO times coefficient energy, and the detector holds a
+ * white talker. A reseed under a talker stands within 1 dB of one.
+ */
+static void cohere_gain_test(unsigned rate)
+{
+	static const struct {
+		unsigned quarters;
+		double tone_db;
+		const char *what;
+	} legs[] = {
+		{ 0, 6.0, "in phase, 6 dB" },
+		{ 2, 6.0, "half a cycle, 6 dB" },
+		{ 2, 14.0, "half a cycle, 14 dB" },
+	};
+	unsigned clean_arm;
+	unsigned talk_arm;
+	float clean;
+	float talk;
+	unsigned i;
+
+	case_rate(rate, "lec reseeds the learned gain from echo evidence "
+		  "alone");
+	for (i = 0; i < sizeof(legs) / sizeof(legs[0]); i++) {
+		struct gain_result r;
+
+		gain_run(rate, legs[i].quarters, legs[i].tone_db, &r);
+		printf("# %u Hz, near tone %s: trial %s kept on frame %u; gain "
+		       "%.6f before, %.6f after, coefficient energy %.6f; "
+		       "talker held on %u of %u frames, near %.2f dB through, "
+		       "output %.2f dB against the microphone, echo %.2f dB "
+		       "under its level\n", rate, legs[i].what,
+		       lecr_trial_arm_name(r.arm), r.kept,
+		       (double)r.gain_before, (double)r.gain_after,
+		       (double)r.coef_energy, r.held, GAIN_TALK_FRAMES,
+		       expose_near_db_get(&r.st),
+		       expose_db_get(r.st.out, r.st.mic),
+		       expose_db_get(r.st.echo, r.st.leak));
+		CHECK(r.kept > 0u);
+		CHECK((double)r.gain_after <=
+		      GAIN_RESEED_COEF_RATIO * r.coef_energy);
+		CHECK(10u * r.held >= 9u * GAIN_TALK_FRAMES);
+		CHECK(fabs(expose_near_db_get(&r.st)) <= EXPOSE_NEAR_DB);
+		if (r.arm == UDSP_EC_NLMS_TRIAL_ARM_LATCH)
+			CHECK(r.gain_after <= r.gain_before * GAIN_RISE_TRIAL);
+		else
+			CHECK_UINT(r.arm, UDSP_EC_NLMS_TRIAL_ARM_PATH);
+	}
+	clean = gain_change_run(rate, false, &clean_arm);
+	talk = gain_change_run(rate, true, &talk_arm);
+	printf("# %u Hz, change 10 dB louder: gain %.6f after the %s trial "
+	       "with no talker, %.6f after the %s trial under a talker %.0f dB "
+	       "under the new echo, %+.2f dB\n", rate, (double)clean,
+	       lecr_trial_arm_name(clean_arm), (double)talk,
+	       lecr_trial_arm_name(talk_arm), -GAIN_CHANGE_TALK_DB,
+	       clean > 0.0f && talk > 0.0f ?
+	       10.0 * log10((double)talk / clean) : 0.0);
+	CHECK_UINT(talk_arm, UDSP_EC_NLMS_TRIAL_ARM_COHERE);
+	CHECK(clean > 0.0f);
+	CHECK(talk > 0.0f);
+	CHECK(talk <= clean * GAIN_TALK_SPREAD);
+	CHECK(talk >= clean / GAIN_TALK_SPREAD);
+}
+
+/* The creep line: the floor measured at CREEP_FLOOR_DBM0 rises CREEP_RISE_DB.
+ * On given frames its readings dip to CREEP_DIP_DB over the tracked floor, so
+ * each dip creeps the floor. */
+#define CREEP_FLOOR_DBM0	-60.0
+#define CREEP_RISE_DB		10.0
+#define CREEP_DIP_DB		1.5
+#define CREEP_MEASURE_FRAMES	100u
+#define CREEP_RISE_FRAMES	120u
+#define CREEP_RISE_TOL_DB	1.5
+#define CREEP_HOLD_DB		1.0
+
+static double creep_floor_dbm0_get(const struct udsp_ec_nlms_info *info)
+{
+	return rms_dbm0_get(32767.0 * pow(10.0, -info->noise_dbov / 20.0));
+}
+
+/* A floor rise, with a dip on each frame f of the rise for which f % period
+ * is in dips[0..ndips). It returns the loudest tracked floor of the rise, in
+ * dBov. Reason: once the run completes, a dip pulls the floor down at
+ * LEC_NOISE_ALPHA_DOWN, the rule that keeps the floor under its mean. */
+static float creep_rise_run(unsigned rate, unsigned period,
+			    const unsigned *dips, unsigned ndips,
+			    float *before)
+{
+	struct udsp_ec_nlms_info info;
+	uint32_t state = 0x9e3779b9u;
+	int16_t ref[UDSP_FRAME_MAX];
+	int16_t mic[UDSP_FRAME_MAX];
+	unsigned frame = rate / 100u;
+	struct udsp_ec *ec = udsp_ec_nlms.create_rate(0, rate);
+	float loudest;
+	double dip_dbm0;
+	unsigned f;
+	unsigned i;
+
+	memset(ref, 0, sizeof(ref));
+	for (f = 0; f < CREEP_MEASURE_FRAMES; f++) {
+		noise_fill(mic, frame, CREEP_FLOOR_DBM0, &state);
+		udsp_ec_nlms.run(ec, mic, ref);
+	}
+	udsp_ec_nlms_info_get(ec, &info);
+	*before = info.noise_dbov;
+	loudest = info.noise_dbov;
+	dip_dbm0 = creep_floor_dbm0_get(&info) + CREEP_DIP_DB;
+	for (f = 0; f < CREEP_RISE_FRAMES; f++) {
+		bool dip = false;
+
+		for (i = 0; i < ndips; i++)
+			dip |= f % period == dips[i];
+		noise_fill(mic, frame, dip ? dip_dbm0 :
+			   CREEP_FLOOR_DBM0 + CREEP_RISE_DB, &state);
+		udsp_ec_nlms.run(ec, mic, ref);
+		udsp_ec_nlms_info_get(ec, &info);
+		if (info.noise_dbov < loudest)
+			loudest = info.noise_dbov;
+	}
+	udsp_ec_nlms.destroy(ec);
+	return loudest;
+}
+
+/*
+ * A floor rises 10 dB with dips within 3 dB of the floor before the rise. One
+ * dip in 20 lets the rise run complete; two in 16 exceed 1 in 16 of its
+ * readings, so the run clears and the floor stays. A run that clears on each
+ * dip, or keeps any number, fails.
+ */
+static void noise_creep_test(unsigned rate)
+{
+	static const unsigned one[] = { 19u };
+	static const unsigned two[] = { 7u, 15u };
+	double target = floor_dbov_get(CREEP_FLOOR_DBM0 + CREEP_RISE_DB);
+	float before_one;
+	float before_two;
+	float rose = creep_rise_run(rate, 20u, one, 1u, &before_one);
+	float held = creep_rise_run(rate, 16u, two, 2u, &before_two);
+
+	case_rate(rate, "lec rise run of the floor survives one reading near "
+		  "the old floor in 20 and clears on two in 16");
+	printf("# floor measured at %.2f dBov; a floor %.0f dB louder (%.2f "
+	       "dBov) with a dip once in 20 frames: loudest tracked %.2f dBov "
+	       "in %u frames; with two dips in 16: %.2f dBov (measured "
+	       "%.2f)\n",
+	       (double)before_one, CREEP_RISE_DB, target, (double)rose,
+	       CREEP_RISE_FRAMES, (double)held, (double)before_two);
+	CHECK(fabs(rose - target) <= CREEP_RISE_TOL_DB);
+	CHECK(held >= before_two - CREEP_HOLD_DB);
+}
+
+/* The late line: the composite hybrid at 12 dB plus a copy of the reference
+ * LATE_MS late, past the tail, at late_db under the echo (0: off). The ERLE
+ * then holds near the processor's gate. */
+#define LATE_MS			70u
+#define LATE_HIST_MAX		(LATE_MS * UDSP_SAMPLE_RATE_WB / 1000u + \
+				 UDSP_FRAME_MAX)
+
+struct late_line {
+	struct udsp_ec *ec;
+	struct echo_path path;
+	int16_t hist[LATE_HIST_MAX];
+	uint32_t hiss;
+	unsigned rate;
+	unsigned frame;
+	unsigned delay;
+	double late_db;
+};
+
+static void late_line_init(struct late_line *l, unsigned rate,
+			   unsigned tail_ms)
+{
+	memset(l, 0, sizeof(*l));
+	l->rate = rate;
+	l->frame = rate / 100u;
+	l->delay = LATE_MS * rate / 1000u;
+	l->hiss = 0x2468acefu;
+	path_composite_init(&l->path, rate, CHANGE_ERL_DB);
+	l->ec = udsp_ec_nlms.create_rate(tail_ms, rate);
+	udsp_ec_nlms.nlp(l->ec, true);
+}
+
+/* One frame of the late line with ref at the far end and near on top when
+ * it is given. info takes the counts after the frame. */
+static void late_frame_run(struct late_line *l, const int16_t *ref,
+			   const int16_t *near,
+			   struct udsp_ec_nlms_frame *reading,
+			   struct udsp_ec_nlms_info *info)
+{
+	int16_t echo[UDSP_FRAME_MAX];
+	int16_t floor[UDSP_FRAME_MAX];
+	int16_t mic[UDSP_FRAME_MAX];
+	double gain = l->late_db > 0.0 ?
+		      pow(10.0, -(CHANGE_ERL_DB + l->late_db) / 20.0) : 0.0;
+	unsigned i;
+
+	path_run(&l->path, ref, echo);
+	noise_fill(floor, l->frame, CHANGE_FLOOR_DBM0, &l->hiss);
+	memmove(l->hist, l->hist + l->frame, l->delay * sizeof(*l->hist));
+	memcpy(l->hist + l->delay, ref, l->frame * sizeof(*ref));
+	for (i = 0; i < l->frame; i++)
+		mic[i] = sample_clamp((double)echo[i] + floor[i] +
+				      gain * l->hist[i] +
+				      (near ? near[i] : 0));
+	udsp_ec_nlms.run(l->ec, mic, ref);
+	udsp_ec_nlms_frame_get(l->ec, reading);
+	udsp_ec_nlms_info_get(l->ec, info);
+}
+
+/* G.168 test 3C on the late line from a fresh canceller: near talker alone,
+ * double talk, far end alone. Later come a copy dip under the gate and its
+ * return, then a reset and a second convergence. */
+#define FIRST_NEAR_FRAMES	(2u * FRAMES_PER_SECOND)
+#define FIRST_TALK_FRAMES	(2u * FRAMES_PER_SECOND)
+#define FIRST_FAR_FRAMES	(4u * FRAMES_PER_SECOND)
+#define FIRST_DIP_FRAMES	(2u * FRAMES_PER_SECOND)
+#define FIRST_LATE_DB		16.0
+/* Past the 8th pass frame from the first one, the end of any engage wait
+ * there. */
+#define FIRST_WAIT_SPAN		16u
+
+/* first, later and reset take the figures of each convergence. */
+struct first_figures {
+	unsigned erle;
+	unsigned waits;
+	unsigned first_pass;
+	bool acted_first;
+	bool found;
+};
+
+/* The far end alone for frames frames. fig takes the erle frames before the
+ * first pass frame and the wait frames up to FIRST_WAIT_SPAN frames after it.
+ * It also takes whether the processor acts on that pass frame. */
+static void first_far_run(struct late_line *l, uint32_t *state,
+			  unsigned long *phase, unsigned frames,
+			  struct first_figures *fig)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	uint32_t waits;
+	unsigned f;
+
+	memset(fig, 0, sizeof(*fig));
+	udsp_ec_nlms_info_get(l->ec, &info);
+	waits = info.nlp_wait_frames;
+	for (f = 0; f < frames; f++) {
+		int16_t ref[UDSP_FRAME_MAX];
+
+		css_fill(ref, l->frame, CHANGE_FAR_DBM0, state, phase, l->rate);
+		late_frame_run(l, ref, NULL, &reading, &info);
+		if (fig->found) {
+			if (f == fig->first_pass + FIRST_WAIT_SPAN)
+				fig->waits = info.nlp_wait_frames - waits;
+			continue;
+		}
+		fig->erle += reading.nlp_verdict == LECR_VERDICT_ERLE;
+		if (reading.nlp_verdict == LECR_VERDICT_PASS) {
+			fig->found = true;
+			fig->first_pass = f;
+			fig->acted_first = info.nlp_active;
+		}
+	}
+	if (!fig->found || fig->first_pass + FIRST_WAIT_SPAN >= frames)
+		fig->waits = info.nlp_wait_frames - waits;
+}
+
+static void first_engage_run(unsigned rate, struct first_figures *first,
+			     struct first_figures *later,
+			     struct first_figures *reset, unsigned *dip_erle)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct word_source talker;
+	struct late_line l;
+	uint32_t state = 0x13572468u;
+	unsigned long phase = 0;
+	unsigned f;
+
+	late_line_init(&l, rate, 0u);
+	word_source_init(&talker, rate, CHANGE_ECHO_DBM0, 0x0badcafeu);
+	for (f = 0; f < FIRST_NEAR_FRAMES + FIRST_TALK_FRAMES; f++) {
+		int16_t ref[UDSP_FRAME_MAX];
+		int16_t near[UDSP_FRAME_MAX];
+
+		css_fill(ref, l.frame, CHANGE_FAR_DBM0, &state, &phase, rate);
+		if (f < FIRST_NEAR_FRAMES)
+			memset(ref, 0, sizeof(ref));
+		word_fill(&talker, near, l.frame);
+		late_frame_run(&l, ref, near, &reading, &info);
+	}
+	first_far_run(&l, &state, &phase, FIRST_FAR_FRAMES, first);
+	l.late_db = FIRST_LATE_DB;
+	*dip_erle = 0;
+	for (f = 0; f < FIRST_DIP_FRAMES; f++) {
+		int16_t ref[UDSP_FRAME_MAX];
+
+		css_fill(ref, l.frame, CHANGE_FAR_DBM0, &state, &phase, rate);
+		late_frame_run(&l, ref, NULL, &reading, &info);
+		*dip_erle += reading.nlp_verdict == LECR_VERDICT_ERLE;
+	}
+	l.late_db = 0.0;
+	first_far_run(&l, &state, &phase, FIRST_FAR_FRAMES, later);
+	udsp_ec_nlms_reset(l.ec);
+	first_far_run(&l, &state, &phase, FIRST_FAR_FRAMES, reset);
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/* The processor switches on over a line converged with it off; a later copy
+ * drops the ERLE under the gate and the processor off. The pass runs before the
+ * drop exceed LEC_NLP_FIRST_FRAMES, short of LEC_NLP_ON_FRAMES. */
+#define ENABLE_CONVERGE_FRAMES	(4u * FRAMES_PER_SECOND)
+#define ENABLE_OFF_AT		6u
+#define ENABLE_LATE_AT		12u
+#define ENABLE_LATE_DB		10.0
+#define ENABLE_LATE_FRAMES	20u
+#define ENABLE_FRAMES		60u
+#define ENABLE_FAR_DBM0		-15.0
+
+/* fig takes the pass runs, the dip and the return. */
+static void first_enable_run(unsigned rate, struct first_figures *fig,
+			     unsigned *early_acted)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct late_line l;
+	uint32_t state = 0x13572468u;
+	uint32_t waits = 0;
+	unsigned since = 0;
+	bool back = false;
+	unsigned f;
+
+	memset(fig, 0, sizeof(*fig));
+	*early_acted = 0;
+	late_line_init(&l, rate, 48u);
+	udsp_ec_nlms.nlp(l.ec, false);
+	for (f = 0; f < ENABLE_CONVERGE_FRAMES + ENABLE_FRAMES; f++) {
+		int16_t ref[UDSP_FRAME_MAX];
+		unsigned at = f - ENABLE_CONVERGE_FRAMES;
+
+		if (f >= ENABLE_CONVERGE_FRAMES)
+			udsp_ec_nlms.nlp(l.ec, at != ENABLE_OFF_AT);
+		if (f >= ENABLE_CONVERGE_FRAMES)
+			l.late_db = at >= ENABLE_LATE_AT &&
+				    at < ENABLE_LATE_AT + ENABLE_LATE_FRAMES ?
+				    ENABLE_LATE_DB : 0.0;
+		noise_fill(ref, l.frame, ENABLE_FAR_DBM0, &state);
+		late_frame_run(&l, ref, NULL, &reading, &info);
+		if (f < ENABLE_CONVERGE_FRAMES)
+			continue;
+		if (!fig->erle && reading.nlp_verdict == LECR_VERDICT_PASS) {
+			fig->first_pass++;
+			*early_acted += info.nlp_active;
+			continue;
+		}
+		if (!back) {
+			fig->erle += reading.nlp_verdict == LECR_VERDICT_ERLE;
+			if (!fig->erle ||
+			    reading.nlp_verdict != LECR_VERDICT_PASS)
+				continue;
+			back = true;
+			fig->found = true;
+			fig->acted_first = info.nlp_active;
+			waits = info.nlp_wait_frames - !info.nlp_active;
+		}
+		if (since++ <= FIRST_WAIT_SPAN)
+			fig->waits = info.nlp_wait_frames - waits;
+	}
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/* The ERLE touches the gate at the first engage: after the switch-on the copy
+ * stops for fewer acts than LEC_NLP_FIRST_FRAMES, returns to dip it, and stops.
+ * With reset_acts the line converges with the processor on and resets first. */
+#define TOUCH_LATE_DB		17.0
+#define TOUCH_SETTLE_FRAMES	40u
+#define TOUCH_OFF_FRAMES	4u
+#define TOUCH_DIP_FRAMES	46u
+#define TOUCH_FRAMES		100u
+
+static void first_touch_run(unsigned rate, struct first_figures *fig,
+			    unsigned *touch_acts, unsigned *reset_acts)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct late_line l;
+	uint32_t state = 0x13572468u;
+	unsigned off_at = TOUCH_SETTLE_FRAMES;
+	unsigned back_at = off_at + TOUCH_OFF_FRAMES;
+	unsigned end_at = back_at + TOUCH_DIP_FRAMES;
+	uint32_t waits = 0;
+	unsigned since = 0;
+	unsigned f;
+
+	memset(fig, 0, sizeof(*fig));
+	*touch_acts = 0;
+	late_line_init(&l, rate, 48u);
+	for (f = 0; reset_acts && f < ENABLE_CONVERGE_FRAMES; f++) {
+		int16_t ref[UDSP_FRAME_MAX];
+
+		if (!f)
+			*reset_acts = 0;
+		noise_fill(ref, l.frame, ENABLE_FAR_DBM0, &state);
+		late_frame_run(&l, ref, NULL, &reading, &info);
+		*reset_acts += info.nlp_active;
+	}
+	if (reset_acts)
+		udsp_ec_nlms_reset(l.ec);
+	udsp_ec_nlms.nlp(l.ec, false);
+	for (f = 0; f < ENABLE_CONVERGE_FRAMES + TOUCH_SETTLE_FRAMES; f++) {
+		int16_t ref[UDSP_FRAME_MAX];
+
+		l.late_db = f >= ENABLE_CONVERGE_FRAMES ? TOUCH_LATE_DB : 0.0;
+		noise_fill(ref, l.frame, ENABLE_FAR_DBM0, &state);
+		late_frame_run(&l, ref, NULL, &reading, &info);
+	}
+	udsp_ec_nlms.nlp(l.ec, true);
+	for (f = 0; f < end_at + TOUCH_FRAMES; f++) {
+		int16_t ref[UDSP_FRAME_MAX];
+
+		l.late_db = (f >= off_at && f < back_at) || f >= end_at ?
+			    0.0 : TOUCH_LATE_DB;
+		noise_fill(ref, l.frame, ENABLE_FAR_DBM0, &state);
+		late_frame_run(&l, ref, NULL, &reading, &info);
+		if (f < end_at) {
+			*touch_acts += info.nlp_active;
+			fig->erle += f >= back_at &&
+				     reading.nlp_verdict == LECR_VERDICT_ERLE;
+			continue;
+		}
+		if (!fig->found) {
+			if (reading.nlp_verdict != LECR_VERDICT_PASS)
+				continue;
+			fig->found = true;
+			fig->acted_first = info.nlp_active;
+			waits = info.nlp_wait_frames - !info.nlp_active;
+		}
+		if (since++ <= FIRST_WAIT_SPAN)
+			fig->waits = info.nlp_wait_frames - waits;
+	}
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/* The ERLE that dips under the gate after DIP_ACTS acting frames of a first
+ * engage, fewer than LEC_NLP_FIRST_FRAMES. dip_acts takes the acts before the
+ * dip, and fig the erle frames of the dip and the crossing after it. */
+#define DIP_PLATEAU_DB		20.0
+#define DIP_DB			14.0
+#define DIP_ACTS		10u
+#define DIP_ERLE		2u
+#define DIP_FRAMES		200u
+
+static void first_dip_run(unsigned rate, struct first_figures *fig,
+			  unsigned *dip_acts)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct late_line l;
+	uint32_t state = 0x13572468u;
+	uint32_t waits = 0;
+	unsigned since = 0;
+	unsigned stage = 0;
+	unsigned f;
+
+	memset(fig, 0, sizeof(*fig));
+	*dip_acts = 0;
+	late_line_init(&l, rate, 48u);
+	udsp_ec_nlms.nlp(l.ec, false);
+	for (f = 0; f < ENABLE_CONVERGE_FRAMES + TOUCH_SETTLE_FRAMES; f++) {
+		int16_t ref[UDSP_FRAME_MAX];
+
+		l.late_db = f >= ENABLE_CONVERGE_FRAMES ? TOUCH_LATE_DB : 0.0;
+		noise_fill(ref, l.frame, ENABLE_FAR_DBM0, &state);
+		late_frame_run(&l, ref, NULL, &reading, &info);
+	}
+	udsp_ec_nlms.nlp(l.ec, true);
+	for (f = 0; f < DIP_FRAMES; f++) {
+		int16_t ref[UDSP_FRAME_MAX];
+
+		l.late_db = stage == 0 ? DIP_PLATEAU_DB :
+			    stage == 1 ? DIP_DB : 0.0;
+		noise_fill(ref, l.frame, ENABLE_FAR_DBM0, &state);
+		late_frame_run(&l, ref, NULL, &reading, &info);
+		if (stage == 0) {
+			*dip_acts += info.nlp_active;
+			stage = *dip_acts >= DIP_ACTS;
+			continue;
+		}
+		if (stage == 1) {
+			fig->erle += reading.nlp_verdict == LECR_VERDICT_ERLE;
+			if (fig->erle >= DIP_ERLE)
+				stage = 2;
+			continue;
+		}
+		if (!fig->found) {
+			if (reading.nlp_verdict != LECR_VERDICT_PASS)
+				continue;
+			fig->found = true;
+			fig->acted_first = info.nlp_active;
+			waits = info.nlp_wait_frames - !info.nlp_active;
+		}
+		if (since++ <= FIRST_WAIT_SPAN)
+			fig->waits = info.nlp_wait_frames - waits;
+	}
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/*
+ * The first engage: in a far-alone 3C convergence, erle frames fill the run, so
+ * the processor acts on its first pass frame; later a return from a dip waits.
+ * No frame waits after a reset, a switch-on, a touch of the gate or a dip after
+ * 10 acts.
+ */
+static void nlp_first_engage_test(unsigned rate)
+{
+	struct first_figures first;
+	struct first_figures later;
+	struct first_figures reset;
+	struct first_figures enable;
+	struct first_figures touch;
+	struct first_figures again;
+	struct first_figures dip;
+	unsigned early_acted;
+	unsigned dip_acts;
+	unsigned touch_acts;
+	unsigned again_acts;
+	unsigned reset_acts;
+	unsigned dip_erle;
+
+	first_engage_run(rate, &first, &later, &reset, &dip_erle);
+	first_enable_run(rate, &enable, &early_acted);
+	first_touch_run(rate, &touch, &touch_acts, NULL);
+	first_touch_run(rate, &again, &again_acts, &reset_acts);
+	first_dip_run(rate, &dip, &dip_acts);
+	case_rate(rate, "lec nlp acts from the first pass frame of the first "
+		  "engage and keeps the hysteresis after it");
+	printf("# 3C sequence from a fresh canceller, far alone: %u erle "
+	       "frames before the first pass frame %u, which the processor %s; "
+	       "%u wait frames; later, %u erle frames in the dip, then %u "
+	       "erle frames before the first pass frame %u and %u wait "
+	       "frames; after a reset, %u erle frames before the first pass "
+	       "frame %u, %u wait frames\n", first.erle, first.first_pass,
+	       first.acted_first ? "acts on" : "does not act on", first.waits,
+	       dip_erle, later.erle, later.first_pass, later.waits, reset.erle,
+	       reset.first_pass, reset.waits);
+	printf("# switched on over a converged line: %u pass frames, %u of "
+	       "them acted on, then %u erle frames; the return %s its first "
+	       "pass frame, %u wait frames\n", enable.first_pass, early_acted,
+	       enable.erle, enable.acted_first ? "acts on" : "waits on",
+	       enable.waits);
+	printf("# ERLE touching the gate: %u acting frames, then %u erle "
+	       "frames; the crossing %s its first pass frame, %u wait "
+	       "frames\n", touch_acts, touch.erle,
+	       touch.acted_first ? "acts on" : "waits on", touch.waits);
+	printf("# the same after a reset, %u acting frames before it: %u "
+	       "acting frames, then %u erle frames; the crossing %s its first "
+	       "pass frame, %u wait frames\n", reset_acts, again_acts,
+	       again.erle, again.acted_first ? "acts on" : "waits on",
+	       again.waits);
+	printf("# ERLE dipping after %u acting frames: %u erle frames; the "
+	       "crossing %s its first pass frame, %u wait frames\n", dip_acts,
+	       dip.erle, dip.acted_first ? "acts on" : "waits on", dip.waits);
+	CHECK(first.found);
+	CHECK(first.erle > 0u);
+	CHECK(first.acted_first);
+	CHECK_UINT(first.waits, 0);
+	CHECK(dip_erle > 0u);
+	CHECK(later.found);
+	CHECK_UINT(later.waits, WORDS_ENGAGE_FRAME);
+	CHECK(reset.found);
+	CHECK(reset.erle > 0u);
+	CHECK(reset.acted_first);
+	CHECK_UINT(reset.waits, 0);
+	CHECK(enable.first_pass > WORDS_ENGAGE_FRAME);
+	CHECK_UINT(early_acted, 0);
+	CHECK(enable.erle > 0u);
+	CHECK(enable.found);
+	CHECK(enable.acted_first);
+	CHECK_UINT(enable.waits, 0);
+	CHECK(touch_acts > 0u);
+	CHECK(touch_acts < WORDS_ENGAGE_FRAME + 1u);
+	CHECK(touch.erle > 0u);
+	CHECK(touch.found);
+	CHECK(touch.acted_first);
+	CHECK_UINT(touch.waits, 0);
+	CHECK(reset_acts > ENABLE_CONVERGE_FRAMES / 2u);
+	CHECK(again_acts > 0u);
+	CHECK(again_acts < WORDS_ENGAGE_FRAME + 1u);
+	CHECK(again.erle > 0u);
+	CHECK(again.found);
+	CHECK(again.acted_first);
+	CHECK_UINT(again.waits, 0);
+	CHECK(dip_acts >= DIP_ACTS);
+	CHECK(dip.erle >= DIP_ERLE);
+	CHECK(dip.found);
+	CHECK(dip.acted_first);
+	CHECK_UINT(dip.waits, 0);
+}
+
+/* The hover line: the late line with the copy HOVER_LATE_DB under the echo, so
+ * the ERLE settles at the gate; the case counts the processor's changes of
+ * state over HOVER_FRAMES. */
+#define HOVER_LATE_DB		18.0
+#define HOVER_FAR_DBM0		-15.0
+#define HOVER_SETTLE_FRAMES	(10u * FRAMES_PER_SECOND)
+#define HOVER_FRAMES		(30u * FRAMES_PER_SECOND)
+#define HOVER_EDGES_8K		20u
+#define HOVER_EDGES_16K		18u
+
+static void nlp_gate_hover_test(unsigned rate)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct late_line l;
+	uint32_t state = 0x13572468u;
+	unsigned edges = 0;
+	unsigned erle = 0;
+	double erle_db = 0.0;
+	bool last = false;
+	unsigned f;
+
+	late_line_init(&l, rate, 48u);
+	l.late_db = HOVER_LATE_DB;
+	for (f = 0; f < HOVER_SETTLE_FRAMES + HOVER_FRAMES; f++) {
+		int16_t ref[UDSP_FRAME_MAX];
+
+		noise_fill(ref, l.frame, HOVER_FAR_DBM0, &state);
+		late_frame_run(&l, ref, NULL, &reading, &info);
+		if (f >= HOVER_SETTLE_FRAMES) {
+			edges += info.nlp_active != last;
+			erle += reading.nlp_verdict == LECR_VERDICT_ERLE;
+			erle_db += info.erle_db;
+		}
+		last = info.nlp_active;
+	}
+	udsp_ec_nlms.destroy(l.ec);
+	case_rate(rate, "lec nlp keeps its flap guard where the ERLE hovers at "
+		  "the gate");
+	printf("# ERLE %.1f dB on average, %u erle frames of %u; %u changes of "
+	       "state, %.2f a second, against %u for a run of pass frames "
+	       "alone\n",
+	       erle_db / HOVER_FRAMES, erle, HOVER_FRAMES, edges,
+	       edges * (double)FRAMES_PER_SECOND / HOVER_FRAMES,
+	       rate == UDSP_SAMPLE_RATE ? HOVER_EDGES_8K : HOVER_EDGES_16K);
+	CHECK(erle > 0u);
+	CHECK(edges <= (rate == UDSP_SAMPLE_RATE ? HOVER_EDGES_8K :
+			HOVER_EDGES_16K));
+}
+
+/* The legs of hangover_tail_pair_test on the late line: pair (late copy alone)
+ * and floor (second verdicts 12 to 15 dB over the floor). Then bar (6 dB or
+ * more over it) and talker (test 3B at X 30, in far pauses). */
+#define TAIL_PAIR_FAR_DBM0	-10.0
+#define TAIL_PAIR_SETTLE_FRAMES	(10u * FRAMES_PER_SECOND)
+#define TAIL_PAIR_FRAMES	(6u * FRAMES_PER_SECOND)
+/* The far frames of the pair leg that the processor must act on, a share. */
+#define TAIL_PAIR_ACT_SHARE	0.5
+/* LEC_GEIGEL_HANGOVER_SHORT of dsp/lec.c. */
+#define TAIL_PAIR_SHORT_FRAMES	4u
+/* The pairs that each leg must form. */
+#define TAIL_PAIR_MIN		4u
+/* The bounds of dsp/lec.c as power ratios over the bar and the floor. The bar
+ * leg must form pairs over the bar bound and within the floor bound. */
+#define TAIL_PAIR_MARGINAL_RATIO	2.0
+#define TAIL_PAIR_BAR_RATIO	4.0
+#define TAIL_PAIR_FLOOR_RATIO	16.0
+#define TAIL_PAIR_BAR_MIN	2u
+
+struct tail_pair_leg {
+	const char *name;
+	double late_db[2];
+	double near_dbm0[2];
+	unsigned pos[2];
+};
+
+static const struct tail_pair_leg tail_pair_legs[] = {
+	{ "pair", { 40.0, 40.0 }, { 0.0, 0.0 }, { 0u, 48u } },
+	{ "floor", { 36.5, 36.0 }, { 0.0, 0.0 }, { 8u, 24u } },
+	{ "bar", { 0.0, 39.0 }, { -59.0, 0.0 }, { 128u, 136u } },
+	{ "talker", { 0.0, 0.0 }, { -40.0, -40.0 }, { 24u, 16u } },
+};
+
+/*
+ * The figures of a leg: pairs whose second verdict stands on a thin frame and
+ * those that keep the short hangover. Pairs on an active frame and those that
+ * take the long one follow. Then the levels of thin second verdicts, the pairs
+ * over the bar bound and in the floor bound, and the far and acting frames.
+ */
+struct tail_pair_result {
+	unsigned thin;
+	unsigned thin_short;
+	unsigned active;
+	unsigned active_long;
+	double bar_lo, bar_hi;
+	double floor_lo, floor_hi;
+	unsigned bar_pairs;
+	unsigned bar_short;
+	unsigned far;
+	unsigned acted;
+};
+
+static double tail_pair_db(double power)
+{
+	return 10.0 * log10(power > 1e-9 ? power : 1e-9);
+}
+
+/* Whether the frame of reading is a thin frame (thin_frame_get of
+ * dsp/lec.c). */
+static bool pair_thin_get(const struct udsp_ec_nlms_frame *reading)
+{
+	bool active = reading->ref_power >= reading->ref_bar;
+
+	return (reading->classic_arm && reading->window_run == 1u) || !active;
+}
+
+/* One verdict that is the second of a pair: its side and its levels. The
+ * function returns whether the pair stands over the bar bound and within the
+ * floor bound. */
+static bool tail_pair_count(struct tail_pair_result *r, bool thin,
+			    const struct udsp_ec_nlms_frame *reading)
+{
+	double over_bar = tail_pair_db(reading->mic_power) -
+			  tail_pair_db(reading->bar);
+	double over_floor = tail_pair_db(reading->mic_power) -
+			    tail_pair_db(reading->noise_power);
+
+	if (!thin) {
+		r->active++;
+		return false;
+	}
+	r->thin++;
+	r->bar_lo = fmin(r->bar_lo, over_bar);
+	r->bar_hi = fmax(r->bar_hi, over_bar);
+	r->floor_lo = fmin(r->floor_lo, over_floor);
+	r->floor_hi = fmax(r->floor_hi, over_floor);
+	if (over_bar < 10.0 * log10(TAIL_PAIR_BAR_RATIO) ||
+	    over_floor >= 10.0 * log10(TAIL_PAIR_FLOOR_RATIO))
+		return false;
+	r->bar_pairs++;
+	return true;
+}
+
+static void tail_pair_run(unsigned rate, const struct tail_pair_leg *leg,
+			  struct tail_pair_result *r)
+{
+	unsigned k = rate == UDSP_SAMPLE_RATE_WB;
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct css_annex css;
+	struct late_line l;
+	uint32_t near_state = 0x31415926u;
+	unsigned long near_phase = 0;
+	bool last_thin = false, last_short = false, fired_before = false;
+	bool pending = false, pending_thin = false, pending_bar = false;
+	unsigned f;
+
+	memset(r, 0, sizeof(*r));
+	r->bar_lo = r->floor_lo = 99.0;
+	r->bar_hi = r->floor_hi = -99.0;
+	late_line_init(&l, rate, 0u);
+	l.late_db = leg->late_db[k];
+	css_annex_init(&css, rate, TAIL_PAIR_FAR_DBM0, 7u);
+	css.pos = leg->pos[k];
+	for (f = 0; f < TAIL_PAIR_SETTLE_FRAMES + TAIL_PAIR_FRAMES; f++) {
+		int16_t ref[UDSP_FRAME_MAX];
+		int16_t near[UDSP_FRAME_MAX];
+		bool active, thin;
+
+		css_annex_fill(ref, l.frame, &css);
+		if (leg->near_dbm0[k] < 0.0)
+			css_fill(near, l.frame, leg->near_dbm0[k], &near_state,
+				 &near_phase, rate);
+		late_frame_run(&l, ref, leg->near_dbm0[k] < 0.0 ? near : NULL,
+			       &reading, &info);
+		active = reading.ref_power >= reading.ref_bar;
+		thin = pair_thin_get(&reading);
+		/* hold_left reads the hangover that the verdict of the frame
+		 * before set. */
+		if (fired_before) {
+			last_short = reading.hold_left ==
+				     TAIL_PAIR_SHORT_FRAMES;
+			if (pending && pending_bar)
+				r->bar_short += reading.hold_left <=
+						TAIL_PAIR_SHORT_FRAMES;
+			if (pending && pending_thin)
+				r->thin_short += reading.hold_left <=
+						 TAIL_PAIR_SHORT_FRAMES;
+			else if (pending)
+				r->active_long += reading.hold_left >
+						  TAIL_PAIR_SHORT_FRAMES;
+		}
+		pending = false;
+		if (f >= TAIL_PAIR_SETTLE_FRAMES && reading.dt_fired &&
+		    reading.hold_left > 0u &&
+		    reading.hold_left <= TAIL_PAIR_SHORT_FRAMES &&
+		    last_thin && last_short) {
+			pending_bar = tail_pair_count(r, thin, &reading);
+			pending = true;
+			pending_thin = thin;
+		}
+		if (reading.dt_fired)
+			last_thin = thin;
+		fired_before = reading.dt_fired;
+		if (f >= TAIL_PAIR_SETTLE_FRAMES && active) {
+			r->far++;
+			r->acted += info.nlp_active;
+		}
+	}
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+static void tail_pair_print(unsigned rate, const char *name,
+			    const struct tail_pair_result *r)
+{
+	printf("# %u Hz, %s: %u thin pairs, %u keep the short hangover, "
+	       "%.1f to %.1f dB over the bar, %.1f to %.1f dB over the "
+	       "floor; %u over the bar bound and within the floor bound, %u "
+	       "of them keep the short hangover; %u active pairs, %u take the "
+	       "long one; the processor acts on %u of %u far frames\n", rate,
+	       name, r->thin, r->thin_short, r->bar_lo, r->bar_hi,
+	       r->floor_lo, r->floor_hi, r->bar_pairs, r->bar_short,
+	       r->active, r->active_long, r->acted, r->far);
+}
+
+/*
+ * The thin pair of dsp/lec.c (the LEC_GEIGEL_HANGOVER_SHORT comment) on the
+ * late line. Its copy past the tail fires on the tail frames of each burst
+ * end. On the pair leg every second verdict keeps the short hangover, and the
+ * processor acts on TAIL_PAIR_ACT_SHARE of the far frames or more. The floor,
+ * bar and talker legs take the long hangover through each bound.
+ */
+static void hangover_tail_pair_test(unsigned rate)
+{
+	unsigned i;
+
+	for (i = 0; i < sizeof(tail_pair_legs) / sizeof(tail_pair_legs[0]);
+	     i++) {
+		const struct tail_pair_leg *leg = &tail_pair_legs[i];
+		struct tail_pair_result r;
+		char what[96];
+
+		tail_pair_run(rate, leg, &r);
+		snprintf(what, sizeof(what), "lec hangover of a thin pair, %s "
+			 "leg", leg->name);
+		case_rate(rate, what);
+		tail_pair_print(rate, leg->name, &r);
+		CHECK(r.thin >= TAIL_PAIR_MIN);
+		if (i == 0u) {
+			CHECK_UINT(r.thin_short, r.thin);
+			CHECK((double)r.acted >= TAIL_PAIR_ACT_SHARE * r.far);
+		} else if (i == 2u) {
+			CHECK(r.bar_pairs >= TAIL_PAIR_BAR_MIN);
+			CHECK_UINT(r.bar_short, 0);
+		} else {
+			CHECK_UINT(r.thin_short, 0);
+		}
+		CHECK_UINT(r.active_long, r.active);
+	}
+}
+
+/* The frames of hangover_pair_script_test: after convergence, cycles of pause,
+ * burst, far gap and a burst whose onset frame holds PAIR_SCRIPT_ONSET_MS.
+ * Pulses sit on the last gap and onset frames, or on the burst's last frame. */
+#define PAIR_SCRIPT_CONVERGE_FRAMES	(4u * FRAMES_PER_SECOND)
+#define PAIR_SCRIPT_CYCLES	4u
+#define PAIR_SCRIPT_PAUSE_FRAMES	30u
+#define PAIR_SCRIPT_BURST_FRAMES	20u
+#define PAIR_SCRIPT_GAP_FRAMES	4u
+#define PAIR_SCRIPT_ONSET_MS	1u
+#define PAIR_SCRIPT_PULSE_DB	5.0
+#define PAIR_SCRIPT_LOUD_DBM0	-15.0
+/* The bounds of a thin pair in dsp/lec.c: LEC_GEIGEL_PAIR_RATIO over the bar
+ * and LEC_GEIGEL_SOFT_RATIO over the floor, power ratios. */
+#define PAIR_SCRIPT_BAR_RATIO	4.0
+#define PAIR_SCRIPT_FLOOR_RATIO	16.0
+
+/*
+ * The figures of a leg. An event is a second verdict inside the hangover of a
+ * first one, outside a trial. It stands within both bounds of a thin pair, on
+ * the frame types that the leg sets. events_long counts those that take the
+ * long hangover; bar_lo .. floor_hi their levels in dB.
+ */
+struct pair_script_result {
+	unsigned events;
+	unsigned events_long;
+	double bar_lo, bar_hi;
+	double floor_lo, floor_hi;
+};
+
+/* Counts the second verdict of a cycle when it is an event, and returns
+ * whether it is one. */
+static bool pair_script_count(struct pair_script_result *r, bool onset_leg,
+			      const struct udsp_ec_nlms_frame *reading)
+{
+	bool inside = reading->hold_left > 0u &&
+		      (!onset_leg ||
+		       reading->hold_left <= TAIL_PAIR_SHORT_FRAMES);
+
+	if (!reading->dt_fired || reading->probing || !inside ||
+	    pair_thin_get(reading) == onset_leg ||
+	    reading->mic_power >= PAIR_SCRIPT_BAR_RATIO * reading->bar ||
+	    reading->mic_power >=
+	    PAIR_SCRIPT_FLOOR_RATIO * reading->noise_power)
+		return false;
+	r->events++;
+	r->bar_lo = fmin(r->bar_lo, tail_pair_db(reading->mic_power) -
+				    tail_pair_db(reading->bar));
+	r->bar_hi = fmax(r->bar_hi, tail_pair_db(reading->mic_power) -
+				    tail_pair_db(reading->bar));
+	r->floor_lo = fmin(r->floor_lo, tail_pair_db(reading->mic_power) -
+					tail_pair_db(reading->noise_power));
+	r->floor_hi = fmax(r->floor_hi, tail_pair_db(reading->mic_power) -
+					tail_pair_db(reading->noise_power));
+	return true;
+}
+
+/* The reference of frame at of a cycle of the scripted frames. */
+static void pair_script_ref_fill(int16_t *ref, unsigned frame, unsigned at,
+				 unsigned onset_samples, uint32_t *state)
+{
+	unsigned end = PAIR_SCRIPT_PAUSE_FRAMES + PAIR_SCRIPT_BURST_FRAMES;
+	unsigned onset = end + PAIR_SCRIPT_GAP_FRAMES;
+
+	memset(ref, 0, frame * sizeof(*ref));
+	if ((at >= PAIR_SCRIPT_PAUSE_FRAMES && at < end) || at > onset)
+		noise_fill(ref, frame, TAIL_PAIR_FAR_DBM0, state);
+	else if (at == onset)
+		noise_fill(ref + frame - onset_samples, onset_samples,
+			   TAIL_PAIR_FAR_DBM0, state);
+}
+
+/* One leg of the scripted frames on a new instance; r takes its figures. */
+static void pair_script_run(unsigned rate, bool onset_leg,
+			    struct pair_script_result *r)
+{
+	unsigned end = PAIR_SCRIPT_PAUSE_FRAMES + PAIR_SCRIPT_BURST_FRAMES;
+	unsigned onset = end + PAIR_SCRIPT_GAP_FRAMES;
+	unsigned cycle = onset + PAIR_SCRIPT_BURST_FRAMES;
+	unsigned first_at = onset_leg ? onset - 1u : end - 1u;
+	unsigned second_at = onset_leg ? onset : onset - 1u;
+	unsigned onset_samples = PAIR_SCRIPT_ONSET_MS * rate / 1000u;
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct late_line l;
+	uint32_t far_state = 0x13572468u, near_state = 0x24681357u;
+	bool set = false, pending = false;
+	unsigned f;
+
+	memset(r, 0, sizeof(*r));
+	r->bar_lo = r->floor_lo = 99.0;
+	r->bar_hi = r->floor_hi = -99.0;
+	late_line_init(&l, rate, 0u);
+	for (f = 0; f < FRAMES_PER_SECOND + PAIR_SCRIPT_CONVERGE_FRAMES; f++) {
+		int16_t ref[UDSP_FRAME_MAX];
+
+		memset(ref, 0, sizeof(ref));
+		if (f >= FRAMES_PER_SECOND)
+			noise_fill(ref, l.frame, TAIL_PAIR_FAR_DBM0,
+				   &far_state);
+		late_frame_run(&l, ref, NULL, &reading, &info);
+	}
+	for (f = 0; f < PAIR_SCRIPT_CYCLES * cycle; f++) {
+		int16_t ref[UDSP_FRAME_MAX];
+		int16_t near[UDSP_FRAME_MAX];
+		unsigned at = f % cycle;
+		bool pulse = at == first_at || at == second_at;
+
+		pair_script_ref_fill(ref, l.frame, at, onset_samples,
+				     &far_state);
+		if (pulse)
+			noise_fill(near, l.frame,
+				   !onset_leg && at == first_at ?
+				   PAIR_SCRIPT_LOUD_DBM0 :
+				   CHANGE_FLOOR_DBM0 + PAIR_SCRIPT_PULSE_DB,
+				   &near_state);
+		late_frame_run(&l, ref, pulse ? near : NULL, &reading, &info);
+		/* hold_left reads the hangover that the verdict of the frame
+		 * before set. */
+		if (pending)
+			r->events_long += reading.hold_left >
+					  TAIL_PAIR_SHORT_FRAMES;
+		pending = at == second_at && set &&
+			  pair_script_count(r, onset_leg, &reading);
+		if (reading.dt_fired)
+			set = at == first_at && !reading.probing &&
+			      pair_thin_get(&reading) == onset_leg;
+	}
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/*
+ * The thin pair on scripted frames: a verdict on an active frame inside the
+ * short hangover of a thin verdict takes the long hangover. So does a thin
+ * verdict inside the hangover of an active one. Each event stands within both
+ * bounds, and each leg forms one or more at each rate.
+ */
+static void hangover_pair_script_test(unsigned rate)
+{
+	static const char *const names[] = { "onset", "burst end" };
+	unsigned k;
+
+	for (k = 0; k < 2u; k++) {
+		struct pair_script_result r;
+		char what[96];
+
+		pair_script_run(rate, k == 0u, &r);
+		snprintf(what, sizeof(what), "lec hangover of a thin pair, %s "
+			 "leg", names[k]);
+		case_rate(rate, what);
+		printf("# %u Hz, %s: %u events, %u take the long hangover, "
+		       "%.1f to %.1f dB over the bar, %.1f to %.1f dB over the "
+		       "floor\n", rate, names[k], r.events, r.events_long,
+		       r.bar_lo, r.bar_hi, r.floor_lo, r.floor_hi);
+		CHECK(r.events >= 1u);
+		CHECK_UINT(r.events_long, r.events);
+	}
+}
+
+/* The floor peak line (G.168 test 3C t3): the composite hybrid at 12 dB, the
+ * composite source at -10 dBm0, a -70 dBm0 floor, the processor on. Each noise
+ * segment completes the engage run; the echo-like pause frames keep it. */
+#define PEAK_CYCLE_FRAMES	50u
+#define PEAK_ONSET_FRAME	20u
+#define PEAK_ONSET_FRAMES	20u
+#define PEAK_SETTLE_PERIODS	4u
+/* The peak of the line floor over the tracked floor in a captured 3C t3 pause.
+ * It stands just over the bar of a quiet frame with no estimate. */
+#define PEAK_OVER_DB		6.5
+#define PEAK_FRAMES_MAX		3u
+
+/*
+ * One frame of the floor peak line, with its floor over_db over the tracked
+ * floor of reading. reading holds the reading of the previous frame. The
+ * frame carries the line's own floor for that frame, scaled, so the peak is
+ * the line floor itself. reading and info then take the readings of the
+ * frame.
+ */
+static void peak_frame_run(struct cohere_line *l, double over_db,
+			   struct udsp_ec_nlms_frame *reading,
+			   struct udsp_ec_nlms_info *info)
+{
+	int16_t hiss[UDSP_FRAME_MAX];
+	int16_t near[UDSP_FRAME_MAX];
+	uint32_t state = l->state[2];
+	double echo_energy = 0.0;
+	double out_energy = 0.0;
+	double gain;
+	unsigned i;
+
+	noise_fill(hiss, l->frame, CHANGE_FLOOR_DBM0, &state);
+	gain = sqrt((double)reading->noise_power * pow(10.0, over_db / 10.0) /
+		    udsp_ec_nlms_frame_power_get(hiss, l->frame));
+	for (i = 0; i < l->frame; i++)
+		near[i] = sample_clamp((gain - 1.0) * hiss[i]);
+	cohere_frame_run(l, near, &echo_energy, &out_energy, reading, info);
+}
+
+/* The figures of a floor peak run: the readings of the peak frames, and the
+ * wait frames and first acting frame of the noise segment after them. The later
+ * peak follows with its waits. */
+struct peak_result {
+	struct udsp_ec_nlms_frame peak[PEAK_FRAMES_MAX];
+	struct udsp_ec_nlms_frame again;
+	unsigned at;
+	unsigned waits;
+	unsigned acts_from;
+	unsigned again_waits;
+};
+
+/* The later peak of a floor peak run, on the first quiet frame after the
+ * noise segment. The line then runs to the end of the next noise segment. */
+static void peak_again_run(struct cohere_line *l, struct peak_result *r,
+			   struct udsp_ec_nlms_frame *reading,
+			   struct udsp_ec_nlms_info *info)
+{
+	unsigned from = PEAK_ONSET_FRAME + PEAK_ONSET_FRAMES;
+	unsigned quiet_at = from + window_frames_get(l->ec) - 1u;
+	double echo_energy = 0.0;
+	double out_energy = 0.0;
+	uint32_t waits;
+	unsigned f;
+
+	for (f = from; f < quiet_at; f++)
+		cohere_frame_run(l, NULL, &echo_energy, &out_energy, reading,
+				 info);
+	peak_frame_run(l, PEAK_OVER_DB, reading, info);
+	r->again = *reading;
+	waits = info->nlp_wait_frames;
+	for (f = quiet_at + 1u; f < PEAK_CYCLE_FRAMES + from; f++)
+		cohere_frame_run(l, NULL, &echo_energy, &out_energy, reading,
+				 info);
+	r->again_waits = info->nlp_wait_frames - waits;
+}
+
+/* A floor peak on peaks frames in a row, ending on the last quiet frame
+ * before the noise segment of a period. That segment follows, and then the
+ * later peak of peak_again_run when again is set. */
+static void peak_run(unsigned rate, unsigned peaks, bool again,
+		     struct peak_result *r)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct echo_path path;
+	struct cohere_line l;
+	double echo_energy = 0.0;
+	double out_energy = 0.0;
+	uint32_t waits;
+	unsigned f;
+
+	memset(r, 0, sizeof(*r));
+	path_composite_init(&path, rate, CHANGE_ERL_DB);
+	cohere_line_begin(&l, rate, &path, 0u, true, 0u);
+	udsp_ec_nlms.nlp(l.ec, true);
+	for (f = 0; f < PEAK_SETTLE_PERIODS * PEAK_CYCLE_FRAMES +
+			PEAK_ONSET_FRAME - peaks; f++)
+		cohere_frame_run(&l, NULL, &echo_energy, &out_energy, &reading,
+				 &info);
+	r->at = (unsigned)(l.phase / l.frame);
+	for (f = 0; f < peaks; f++) {
+		peak_frame_run(&l, PEAK_OVER_DB, &reading, &info);
+		r->peak[f] = reading;
+	}
+	waits = info.nlp_wait_frames;
+	r->acts_from = PEAK_ONSET_FRAMES;
+	for (f = 0; f < PEAK_ONSET_FRAMES; f++) {
+		cohere_frame_run(&l, NULL, &echo_energy, &out_energy, &reading,
+				 &info);
+		if (info.nlp_active && r->acts_from == PEAK_ONSET_FRAMES)
+			r->acts_from = f;
+	}
+	r->waits = info.nlp_wait_frames - waits;
+	if (again)
+		peak_again_run(&l, r, &reading, &info);
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/*
+ * Floor peaks PEAK_OVER_DB over the tracked floor stand over the quiet bar and
+ * under the bound; one or two in a row before a far onset keep the engage run.
+ * Three in a row zero it, and the onset resumes it (LEC_NLP_RESUME_DB), so each
+ * onset acts on its first frame.
+ */
+static void floor_peak_test(unsigned rate)
+{
+	struct peak_result none;
+	struct peak_result one;
+	struct peak_result two;
+	struct peak_result three;
+	unsigned f;
+
+	peak_run(rate, 0u, false, &none);
+	peak_run(rate, 1u, true, &one);
+	peak_run(rate, 2u, false, &two);
+	peak_run(rate, 3u, false, &three);
+	case_rate(rate, "lec nlp keeps the engage run through two floor peaks "
+		  "in a row before a far onset and resumes it after three");
+	printf("# no peak: %u wait frames at the onset, acts from its frame "
+	       "%u; one peak frame %.2f dB over the tracked floor, frame %u of "
+	       "the period: %u wait frames, acts from frame %u; a later peak "
+	       "%.2f dB over it on the first quiet frame after the segment: "
+	       "%u wait frames to the end of the next segment; two peak "
+	       "frames %.2f and %.2f dB over it: %u wait frames, acts from "
+	       "frame %u; three peak frames %.2f, %.2f and %.2f dB over it: "
+	       "%u wait frames, acts from frame %u\n", none.waits,
+	       none.acts_from,
+	       ratio_db_get(one.peak[0].mic_power, one.peak[0].noise_power),
+	       one.at, one.waits, one.acts_from,
+	       ratio_db_get(one.again.mic_power, one.again.noise_power),
+	       one.again_waits,
+	       ratio_db_get(two.peak[0].mic_power, two.peak[0].noise_power),
+	       ratio_db_get(two.peak[1].mic_power, two.peak[1].noise_power),
+	       two.waits, two.acts_from,
+	       ratio_db_get(three.peak[0].mic_power,
+			    three.peak[0].noise_power),
+	       ratio_db_get(three.peak[1].mic_power,
+			    three.peak[1].noise_power),
+	       ratio_db_get(three.peak[2].mic_power,
+			    three.peak[2].noise_power),
+	       three.waits, three.acts_from);
+	CHECK_UINT(none.waits, 0);
+	CHECK_UINT(none.acts_from, 0);
+	CHECK_UINT(one.at, PEAK_ONSET_FRAME - 1u);
+	CHECK_UINT(two.at, PEAK_ONSET_FRAME - 2u);
+	CHECK_UINT(three.at, PEAK_ONSET_FRAME - 3u);
+	for (f = 0; f < 3u; f++) {
+		const struct udsp_ec_nlms_frame *p = &three.peak[f];
+
+		CHECK_UINT(p->nlp_verdict, LECR_VERDICT_QUIET);
+		CHECK(p->noise_power > 0.0f);
+		CHECK(p->estimate_power == 0.0f);
+		CHECK(ratio_db_get(p->mic_power, p->noise_power) >
+		      PEAK_OVER_DB - 0.25);
+	}
+	for (f = 0; f < 2u; f++) {
+		const struct udsp_ec_nlms_frame *p = f ? &two.peak[1] :
+							 &one.peak[0];
+
+		CHECK_UINT(p->nlp_verdict, LECR_VERDICT_QUIET);
+		CHECK(p->noise_power > 0.0f);
+		CHECK(p->estimate_power == 0.0f);
+		CHECK(ratio_db_get(p->mic_power, p->noise_power) >
+		      PEAK_OVER_DB - 0.25);
+	}
+	CHECK_UINT(two.peak[0].nlp_verdict, LECR_VERDICT_QUIET);
+	CHECK_UINT(one.again.nlp_verdict, LECR_VERDICT_QUIET);
+	CHECK(ratio_db_get(one.again.mic_power, one.again.noise_power) >
+	      PEAK_OVER_DB - 0.25);
+	CHECK_UINT(one.waits, 0);
+	CHECK_UINT(one.acts_from, 0);
+	CHECK_UINT(one.again_waits, 0);
+	CHECK_UINT(two.waits, 0);
+	CHECK_UINT(two.acts_from, 0);
+	CHECK_UINT(three.waits, 0);
+	CHECK_UINT(three.acts_from, 0);
+}
+
+/*
+ * G.168 test 3C on the floor peak line, a floor peak on each far pause's last
+ * quiet frame. After the first engage, SEQ_LEVEL_DB bounds the active-window
+ * output over the tracked floor, not the quiet frames, where the NLP releases.
+ */
+#define SEQ_NEAR_FRAMES		(2u * FRAMES_PER_SECOND)
+#define SEQ_TALK_FRAMES		(2u * FRAMES_PER_SECOND)
+#define SEQ_FAR_FRAMES		(5u * FRAMES_PER_SECOND)
+#define SEQ_LEVEL_DB		6.0
+
+/* The figures of the far-alone phase: the peak frames and those that read
+ * quiet, and the first engage. After it come the waits, the refusals, the
+ * active frames and those that act, and the loudest output of each kind. */
+struct seq_result {
+	unsigned peaks;
+	unsigned peaks_quiet;
+	unsigned first;
+	unsigned waits;
+	unsigned dt;
+	unsigned unlike;
+	unsigned erle;
+	unsigned active;
+	unsigned acted;
+	double active_db;
+	double quiet_db;
+	bool engaged;
+};
+
+static void seq_note(struct seq_result *q, const struct cohere_line *l,
+		     const struct ring_planes *planes,
+		     const struct udsp_ec_nlms_frame *reading, bool acted)
+{
+	double energy = 0.0;
+	double db;
+	unsigned i;
+
+	for (i = 0; i < l->frame; i++)
+		energy += (double)planes->out[i] * planes->out[i];
+	db = ratio_db_get((float)(energy / l->frame), reading->noise_power);
+	if (reading->nlp_verdict == LECR_VERDICT_QUIET) {
+		if (db > q->quiet_db)
+			q->quiet_db = db;
+		return;
+	}
+	q->active++;
+	q->acted += acted;
+	if (db > q->active_db)
+		q->active_db = db;
+}
+
+/* The near-alone and double-talk phases of the sequence. */
+static void seq_talk_run(struct cohere_line *l, struct word_source *talker,
+			 struct udsp_ec_nlms_frame *reading,
+			 struct udsp_ec_nlms_info *info)
+{
+	double echo_energy = 0.0;
+	double out_energy = 0.0;
+	unsigned f;
+
+	l->quiet = true;
+	for (f = 0; f < SEQ_NEAR_FRAMES + SEQ_TALK_FRAMES; f++) {
+		int16_t near[UDSP_FRAME_MAX];
+
+		if (f == SEQ_NEAR_FRAMES)
+			l->quiet = false;
+		word_fill(talker, near, l->frame);
+		cohere_frame_run(l, near, &echo_energy, &out_energy, reading,
+				 info);
+	}
+}
+
+static void seq_run(unsigned rate, struct seq_result *q)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info engage;
+	struct udsp_ec_nlms_info info;
+	struct word_source talker;
+	struct ring_planes planes;
+	struct echo_path path;
+	struct cohere_line l;
+	double echo_energy = 0.0;
+	double out_energy = 0.0;
+	unsigned f;
+
+	memset(q, 0, sizeof(*q));
+	memset(&engage, 0, sizeof(engage));
+	q->active_db = -200.0;
+	q->quiet_db = -200.0;
+	path_composite_init(&path, rate, CHANGE_ERL_DB);
+	cohere_line_begin(&l, rate, &path, 0u, true, 0u);
+	l.planes = &planes;
+	udsp_ec_nlms.nlp(l.ec, true);
+	word_source_init(&talker, rate, CHANGE_ECHO_DBM0, 0x0badcafeu);
+	seq_talk_run(&l, &talker, &reading, &info);
+	for (f = 0; f < SEQ_FAR_FRAMES; f++) {
+		unsigned p = (unsigned)(l.phase / l.frame);
+		bool peak = (p == PEAK_ONSET_FRAME - 1u ||
+			     p == PEAK_CYCLE_FRAMES - 1u) &&
+			    reading.noise_power > 0.0f;
+
+		if (peak)
+			peak_frame_run(&l, PEAK_OVER_DB, &reading, &info);
+		else
+			cohere_frame_run(&l, NULL, &echo_energy, &out_energy,
+					 &reading, &info);
+		q->peaks += peak;
+		q->peaks_quiet += peak &&
+				  reading.nlp_verdict == LECR_VERDICT_QUIET;
+		if (q->engaged) {
+			seq_note(q, &l, &planes, &reading, info.nlp_active);
+		} else if (info.nlp_active) {
+			q->engaged = true;
+			q->first = f;
+			engage = info;
+		}
+	}
+	q->waits = info.nlp_wait_frames - engage.nlp_wait_frames;
+	q->dt = info.nlp_dt_frames - engage.nlp_dt_frames;
+	q->unlike = info.nlp_unlike_frames - engage.nlp_unlike_frames;
+	q->erle = info.nlp_erle_frames - engage.nlp_erle_frames;
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/* After the first engage of the far-alone phase, every far onset acts on its
+ * first frame. Every active-window frame stands at most SEQ_LEVEL_DB over the
+ * tracked floor, so a line that waits no frame but passes echo fails too. */
+static void floor_peak_sequence_test(unsigned rate)
+{
+	struct seq_result q;
+
+	seq_run(rate, &q);
+	case_rate(rate, "lec nlp acts on the first frame of every far onset of "
+		  "a 3C sequence with floor peaks in the far pauses");
+	printf("# near alone %u frames, double talk %u, far alone %u: %u floor "
+	       "peaks %.1f dB over the tracked floor, %u of them on quiet "
+	       "frames; first engage on far frame %u; after it %u wait, %u dt, "
+	       "%u unlike and %u erle frames; the processor acts on %u of %u "
+	       "frames with an active window, the loudest %.2f dB over the "
+	       "tracked floor; quiet frames up to %.2f dB over it\n",
+	       SEQ_NEAR_FRAMES, SEQ_TALK_FRAMES, SEQ_FAR_FRAMES, q.peaks,
+	       PEAK_OVER_DB, q.peaks_quiet, q.first, q.waits, q.dt, q.unlike,
+	       q.erle, q.acted, q.active, q.active_db, q.quiet_db);
+	CHECK(q.engaged);
+	CHECK(q.peaks > 0u);
+	CHECK_UINT(q.peaks_quiet, q.peaks);
+	CHECK(q.active > 0u);
+	CHECK_UINT(q.waits, 0);
+	CHECK(q.active_db <= SEQ_LEVEL_DB);
+}
+
+/* A soft near word ALT_WORD_OVER_DB over the floor and 19 dB under the echo
+ * starts ALT_LEAD_FRAMES before the far word. Its pause frames alternate under
+ * and over the bar of a quiet frame. */
+#define ALT_LEAD_FRAMES		4u
+#define ALT_WORD_OVER_DB	6.0
+#define ALT_UNDER_DB		3.0
+#define ALT_IN_DB		7.0
+#define ALT_EDGE_DB		8.5
+#define ALT_OUT_DB		11.0
+
+static void alt_word_run(struct words_run *r, unsigned rate, double over_db)
+{
+	words_quiet_set(r, rate);
+	r->near_word = WORDS_MARK;
+	r->near_from = -(int)ALT_LEAD_FRAMES;
+	r->near_frames = ALT_LEAD_FRAMES + WORDS_NEAR_FRAMES;
+	r->near_dbm0 = FAN_FLOOR_DBM0 + ALT_WORD_OVER_DB;
+	r->alt_over_db = over_db;
+	r->alt_under_db = ALT_UNDER_DB;
+	words_run(r);
+}
+
+static void alt_word_print(const char *what, const struct words_run *r)
+{
+	printf("# %s: pause frames %.2f to %.2f dB over the tracked floor; the "
+	       "processor acts on %u of the %u frames of the word, from frame "
+	       "%u of the far word; over its %u frames in the far word %.2f dB "
+	       "through, filter alone %.2f dB; over all %u frames %.2f dB "
+	       "through, filter alone %.2f dB\n",
+	       what, r->near_pause_lo, r->near_pause_hi, r->near_acted,
+	       r->near_frames, r->latency[WORDS_MARK], WORDS_NEAR_FRAMES,
+	       near_gain_db_get(r->overlap_on, r->overlap),
+	       near_gain_db_get(r->overlap_off, r->overlap), r->near_frames,
+	       near_gain_db_get(r->near_on, r->near),
+	       near_gain_db_get(r->near_off, r->near));
+}
+
+/*
+ * A soft near word whose pause frames alternate over and under the bar. Under
+ * the bound its frames keep the run and the processor replaces the word; over
+ * the bound they zero the run, and the processor acts on no frame of it. Legs
+ * that keep the run under any rule print with no check.
+ */
+static void floor_peak_talker_test(unsigned rate)
+{
+	struct words_run under;
+	struct words_run in;
+	struct words_run edge;
+	struct words_run out;
+
+	alt_word_run(&under, rate, ALT_UNDER_DB);
+	alt_word_run(&in, rate, ALT_IN_DB);
+	alt_word_run(&edge, rate, ALT_EDGE_DB);
+	alt_word_run(&out, rate, ALT_OUT_DB);
+	case_rate(rate, "lec nlp exposure of a soft near word that alternates "
+		  "over and under the bar in a far pause");
+	alt_word_print("all frames under the bar", &under);
+	alt_word_print("frames over the bar under the bound", &in);
+	alt_word_print("frames over the bar near the bound", &edge);
+	alt_word_print("frames over the bound", &out);
+	CHECK(under.near > 0.0);
+	CHECK(in.near > 0.0);
+	CHECK(edge.near > 0.0);
+	CHECK(out.near > 0.0);
+	CHECK_UINT(in.near_pause, ALT_LEAD_FRAMES);
+	CHECK_UINT(out.near_pause, ALT_LEAD_FRAMES);
+	CHECK(out.near_pause_hi > ALT_OUT_DB - 1.5);
+	CHECK_UINT(out.near_acted, 0);
+	CHECK_UINT(out.latency[WORDS_MARK], WORDS_ENGAGE_FRAME);
+}
+
+/* The lull line: a flat LULL_ERL_DB path behind LULL_BULK_MS of bulk delay, and
+ * far noise bursts of LULL_ON_FRAMES in 30 from a third into a frame. A near
+ * floor dips on one silent frame in LULL_DIP_EVERY. */
+#define LULL_PERIOD_FRAMES	30u
+#define LULL_ON_FRAMES		23u
+#define LULL_ONSET_PHASE	(LULL_PERIOD_FRAMES - 1u)
+#define LULL_BULK_MS		25u
+#define LULL_ERL_DB		12.0
+#define LULL_LATE_MS		44.0
+#define LULL_LATE_DB		33.0
+#define LULL_TAIL_MS		48u
+#define LULL_FAR_DBM0		-20.0
+#define LULL_FLOOR_DBM0		-63.0
+#define LULL_DIP_DB		8.0
+#define LULL_DIP_EVERY		3u
+#define LULL_SETTLE_FRAMES	600u
+#define LULL_BURSTS		50u
+/* LEC_GEIGEL_FLOOR_HEADROOM of dsp/lec.c: the floor term of the bar. */
+#define LULL_FLOOR_HEADROOM	2.0f
+#define LULL_TALK_DB		6.0
+#define LULL_TALK_LEAD		5u
+#define LULL_CAP_TALK_DB	12.0
+#define LULL_CAP_TALK_LEAD	(LULL_ONSET_PHASE - LULL_ON_FRAMES)
+#define LULL_OLD_TALK_DB	12.0
+#define LULL_AFTER_FRAMES	30u
+#define LULL_SKIP_FRAMES	4u
+#define LULL_SKIP_RATIO		1.5f
+/* LEC_GEIGEL_MARGIN of dsp/lec.c: the margin of the bar. */
+#define LULL_MARGIN		1.41f
+
+struct lull_line {
+	struct echo_path path;
+	struct udsp_ec *ec;
+	unsigned rate;
+	unsigned frame;
+	unsigned long pos;
+	unsigned long count;
+	unsigned quiet;
+	double dip_db;
+	uint32_t far_state;
+	uint32_t floor_state;
+	uint32_t talk_state;
+};
+
+/* late_db > 0 adds the late reflection that far under the main one. Onset, tail
+ * and pre-echo frames carry no echo, but the reflection puts echo under the
+ * floor on tail frames. */
+static void lull_line_init(struct lull_line *l, unsigned rate, double dip_db,
+			   double late_db)
+{
+	unsigned late = path_samples_get(LULL_LATE_MS, rate);
+
+	memset(l, 0, sizeof(*l));
+	l->rate = rate;
+	l->frame = rate / 100u;
+	l->pos = l->frame * 2u / 3u;
+	l->dip_db = dip_db;
+	l->far_state = 0x1234567u;
+	l->floor_state = 0x2468aceu;
+	l->talk_state = 0x5eed5eedu;
+	path_flat_init(&l->path, rate, LULL_BULK_MS, LULL_ERL_DB);
+	if (late_db > 0.0) {
+		l->path.h[late] = (float)(l->path.h[l->path.taps - 1u] *
+					  pow(10.0, -late_db / 20.0));
+		l->path.taps = late + 1u;
+	}
+	l->ec = udsp_ec_nlms.create_rate(LULL_TAIL_MS, rate);
+}
+
+/* The phase of the next frame in its period; LULL_ONSET_PHASE is the frame a
+ * burst starts in. */
+static unsigned lull_phase_get(const struct lull_line *l)
+{
+	return (unsigned)(l->count % LULL_PERIOD_FRAMES);
+}
+
+/* The reference of the next frame: the far bursts when bursts is set, else
+ * the far end throughout the frame. Returns whether the frame is silent. */
+static bool lull_ref_fill(struct lull_line *l, bool bursts, int16_t *ref)
+{
+	unsigned long period = LULL_PERIOD_FRAMES * l->frame;
+	unsigned long on = LULL_ON_FRAMES * l->frame;
+	bool silent = true;
+	unsigned i;
+
+	noise_fill(ref, l->frame, LULL_FAR_DBM0, &l->far_state);
+	for (i = 0; i < l->frame; i++) {
+		if (!bursts || (l->pos + i) % period < on)
+			silent = false;
+		else
+			ref[i] = 0;
+	}
+	l->pos += l->frame;
+	l->count++;
+	return silent;
+}
+
+/* One frame of the line: the reference of lull_ref_fill, and the near
+ * talker at talk_db over the floor when talk is set. */
+static void lull_frame_run(struct lull_line *l, bool bursts, bool talk,
+			   double talk_db, struct udsp_ec_nlms_frame *reading,
+			   struct udsp_ec_nlms_info *info)
+{
+	int16_t ref[UDSP_FRAME_MAX];
+	int16_t echo[UDSP_FRAME_MAX];
+	int16_t floor[UDSP_FRAME_MAX];
+	int16_t near[UDSP_FRAME_MAX];
+	int16_t mic[UDSP_FRAME_MAX];
+	bool silent = lull_ref_fill(l, bursts, ref);
+	double floor_dbm0;
+	unsigned i;
+
+	path_run(&l->path, ref, echo);
+	if (silent)
+		l->quiet++;
+	floor_dbm0 = LULL_FLOOR_DBM0;
+	if (silent && l->quiet % LULL_DIP_EVERY == 0u)
+		floor_dbm0 -= l->dip_db;
+	noise_fill(floor, l->frame, floor_dbm0, &l->floor_state);
+	noise_fill(near, l->frame, LULL_FLOOR_DBM0 + talk_db, &l->talk_state);
+	for (i = 0; i < l->frame; i++)
+		mic[i] = sample_clamp((double)echo[i] + floor[i] +
+				      (talk ? near[i] : 0));
+	udsp_ec_nlms.run(l->ec, mic, ref);
+	udsp_ec_nlms_frame_get(l->ec, reading);
+	udsp_ec_nlms_info_get(l->ec, info);
+}
+
+/* One frame of the bursts through the reference intake alone, as the
+ * engine feeds a skipped frame (udsp_ec_nlms_ref_feed). */
+static void lull_frame_feed(struct lull_line *l)
+{
+	int16_t ref[UDSP_FRAME_MAX];
+	int16_t echo[UDSP_FRAME_MAX];
+
+	if (lull_ref_fill(l, true, ref))
+		l->quiet++;
+	path_run(&l->path, ref, echo);
+	udsp_ec_nlms_ref_feed(l->ec, ref);
+}
+
+/* LULL_SETTLE_FRAMES of the far end throughout and LULL_BURSTS bursts, then
+ * the bursts on up to the frame before phase. */
+static void lull_line_settle(struct lull_line *l, unsigned phase,
+			     struct udsp_ec_nlms_frame *reading,
+			     struct udsp_ec_nlms_info *info)
+{
+	unsigned long end = LULL_SETTLE_FRAMES +
+			    LULL_BURSTS * LULL_PERIOD_FRAMES;
+
+	while (l->count < LULL_SETTLE_FRAMES)
+		lull_frame_run(l, false, false, 0.0, reading, info);
+	while (l->count < end || lull_phase_get(l) != phase)
+		lull_frame_run(l, true, false, 0.0, reading, info);
+}
+
+struct lull_far_figures {
+	unsigned onset;
+	unsigned tail;
+	unsigned bare;
+	unsigned other;
+	unsigned bursts;
+	float noise_dbov;
+};
+
+/* The far end alone: after LULL_SETTLE_FRAMES, LULL_BURSTS bursts. The
+ * detector's fires count from the first onset that reads a measured floor, by
+ * the class of the frame: onset, tail, pre-echo and the rest. */
+static void lull_far_run(unsigned rate, double late_db,
+			 struct lull_far_figures *fig)
+{
+	struct udsp_ec_nlms_frame rd;
+	struct udsp_ec_nlms_info info;
+	struct lull_line l;
+	bool counting = false;
+	unsigned f;
+
+	memset(fig, 0, sizeof(*fig));
+	lull_line_init(&l, rate, LULL_DIP_DB, late_db);
+	for (f = 0; f < LULL_SETTLE_FRAMES; f++)
+		lull_frame_run(&l, false, false, 0.0, &rd, &info);
+	for (f = 0; f < LULL_BURSTS * LULL_PERIOD_FRAMES; f++) {
+		unsigned phase = lull_phase_get(&l);
+
+		lull_frame_run(&l, true, false, 0.0, &rd, &info);
+		if (phase == LULL_ONSET_PHASE && rd.noise_power > 0.0f)
+			counting = true;
+		fig->bursts += counting && phase == LULL_ONSET_PHASE;
+		if (!counting || !rd.dt_fired)
+			continue;
+		if (phase == LULL_ONSET_PHASE)
+			fig->onset++;
+		else if (rd.ref_quiet)
+			fig->tail++;
+		else if (rd.estimate_power <
+			 rd.noise_power * LULL_FLOOR_HEADROOM)
+			fig->bare++;
+		else
+			fig->other++;
+	}
+	fig->noise_dbov = info.noise_dbov;
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+static void lull_far_print(const char *line,
+			   const struct lull_far_figures *fig)
+{
+	printf("# %s: %u bursts, tracked floor -%.1f dBov; fires on the onset "
+	       "frame %u, on tail frames %u, on pre-echo frames %u, on other "
+	       "frames %u\n", line, fig->bursts, fig->noise_dbov, fig->onset,
+	       fig->tail, fig->bare, fig->other);
+}
+
+/*
+ * On the lull line, onset, tail and pre-echo frames carry the floor and no
+ * echo, 8 dB over the tracked floor. Each takes the pause level as its floor
+ * term (LEC_PAUSE_RING), so the far end alone fires on none. A rule without one
+ * of the conditions, or a level of one quiet frame, fails.
+ */
+static void lull_far_test(unsigned rate)
+{
+	struct lull_far_figures flat;
+	struct lull_far_figures late;
+
+	lull_far_run(rate, 0.0, &flat);
+	lull_far_run(rate, LULL_LATE_DB, &late);
+	case_rate(rate, "lec far end alone does not fire on the onset, tail "
+		  "and pre-echo frames of its bursts");
+	lull_far_print("flat path", &flat);
+	lull_far_print("with the late reflection", &late);
+	CHECK(flat.bursts >= LULL_BURSTS - 1u);
+	CHECK_UINT(flat.onset, 0);
+	CHECK_UINT(flat.tail, 0);
+	CHECK_UINT(flat.bare, 0);
+	CHECK(late.bursts >= LULL_BURSTS - 1u);
+	CHECK_UINT(late.onset, 0);
+	CHECK_UINT(late.tail, 0);
+	CHECK_UINT(late.bare, 0);
+}
+
+struct lull_talk_figures {
+	float move;
+	float energy;
+	float over_db;
+	bool fired;
+};
+
+/* A near talker at talk_db over the floor from lead frames before an onset
+ * frame through LULL_AFTER_FRAMES after it. dip_db sets the dips of the
+ * floor; old_db > 0 adds a talker at old_db through the pause two pauses
+ * before the onset's own. */
+static void lull_talk_run(unsigned rate, double dip_db, double talk_db,
+			  unsigned lead, double old_db,
+			  struct lull_talk_figures *fig)
+{
+	struct udsp_ec_nlms_frame rd;
+	struct udsp_ec_nlms_info info;
+	struct lull_line l;
+	unsigned k;
+
+	memset(fig, 0, sizeof(*fig));
+	lull_line_init(&l, rate, dip_db, 0.0);
+	lull_line_settle(&l, LULL_ON_FRAMES, &rd, &info);
+	for (k = 0; old_db > 0.0 && k < 2u * LULL_PERIOD_FRAMES; k++)
+		lull_frame_run(&l, true, k < LULL_ONSET_PHASE - LULL_ON_FRAMES,
+			       old_db, &rd, &info);
+	while (lull_phase_get(&l) !=
+	       (LULL_ONSET_PHASE + LULL_PERIOD_FRAMES - lead) %
+	       LULL_PERIOD_FRAMES)
+		lull_frame_run(&l, true, false, 0.0, &rd, &info);
+	for (k = 0; k < lead + LULL_AFTER_FRAMES; k++) {
+		float before = info.coef_energy;
+
+		lull_frame_run(&l, true, true, talk_db, &rd, &info);
+		if (k == lead) {
+			fig->energy = before;
+			fig->move = info.coef_energy - before;
+			fig->fired = rd.dt_fired;
+			fig->over_db = (float)(10.0 * log10(rd.mic_power /
+							   rd.bar));
+		}
+	}
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/* A near talker LULL_TALK_DB over the floor starts on an onset frame or in the
+ * pause before. That onset frame fires and does not adapt, because the cap of
+ * LEC_PAUSE_LEVEL_CAP bounds the pause level. */
+static void lull_talk_test(unsigned rate)
+{
+	struct lull_talk_figures on;
+	struct lull_talk_figures lead;
+
+	lull_talk_run(rate, LULL_DIP_DB, LULL_TALK_DB, 0u, 0.0, &on);
+	lull_talk_run(rate, LULL_DIP_DB, LULL_TALK_DB, LULL_TALK_LEAD, 0.0,
+		      &lead);
+	case_rate(rate, "lec near talker over the floor fires on the onset "
+		  "frame of a far burst and the frame does not adapt");
+	printf("# talker %.0f dB over the floor from the onset frame: fired "
+	       "%d, %+.1f dB over the bar, coefficient energy %+.2e of %.4f; "
+	       "from %u frames before: fired %d, %+.1f dB, %+.2e of %.4f\n",
+	       LULL_TALK_DB, on.fired, on.over_db, on.move, on.energy,
+	       LULL_TALK_LEAD, lead.fired, lead.over_db, lead.move,
+	       lead.energy);
+	CHECK(on.fired);
+	CHECK(on.move == 0.0f);
+	CHECK(lead.fired);
+	CHECK(lead.move == 0.0f);
+}
+
+/*
+ * A near talker LULL_CAP_TALK_DB over the floor, from a pause's first frame
+ * on into its burst. The pause's quiet-window frames carry that talker, so
+ * the pause level reads it. With a cap, a bar's floor term stands 6 dB over
+ * the tracked floor, so the onset frame fires and does not adapt. Without a
+ * cap, that talker sets the bar and fails here.
+ */
+static void lull_cap_test(unsigned rate)
+{
+	struct lull_talk_figures fig;
+
+	lull_talk_run(rate, LULL_DIP_DB, LULL_CAP_TALK_DB, LULL_CAP_TALK_LEAD,
+		      0.0, &fig);
+	case_rate(rate, "lec near talker through the far pause fires on the "
+		  "onset frame under the capped pause level");
+	printf("# talker %.0f dB over the floor from the first pause frame: "
+	       "fired %d, %+.1f dB over the bar, coefficient energy %+.2e of "
+	       "%.4f\n", LULL_CAP_TALK_DB, fig.fired, fig.over_db, fig.move,
+	       fig.energy);
+	CHECK(fig.fired);
+	CHECK(fig.move == 0.0f);
+}
+
+/*
+ * A talker speaks through one pause and stops; two pauses later a talker starts
+ * on an onset frame. The pause level reads the last LEC_PAUSE_RING quiet
+ * frames, which exclude the first talker, so that onset fires; a level over
+ * eight frames fails.
+ */
+static void lull_ring_test(unsigned rate)
+{
+	struct lull_talk_figures fig;
+
+	lull_talk_run(rate, 0.0, LULL_TALK_DB, 0u, LULL_OLD_TALK_DB, &fig);
+	case_rate(rate, "lec talker two far pauses back does not lift the bar "
+		  "of the next onset frame");
+	printf("# talker %.0f dB over a flat floor through the pause two "
+	       "before; talker %.0f dB from the onset frame: fired %d, %+.1f "
+	       "dB over the bar, coefficient energy %+.2e of %.4f\n",
+	       LULL_OLD_TALK_DB, LULL_TALK_DB, fig.fired, fig.over_db,
+	       fig.move, fig.energy);
+	CHECK(fig.fired);
+	CHECK(fig.move == 0.0f);
+}
+
+struct lull_skip_figures {
+	float term_ratio;
+	float noise_dbov;
+	float est_dbov;
+	bool active;
+	bool trusted;
+	bool classic;
+};
+
+/*
+ * A skipped frame takes the reference through udsp_ec_nlms_ref_feed alone. The
+ * canceller runs a quiet frame and feeds the onset and the frames after it. It
+ * runs again on an echo frame, whose bar gives the floor term
+ * (doubletalk_update).
+ */
+static void lull_skip_run(unsigned rate, struct lull_skip_figures *fig)
+{
+	struct udsp_ec_nlms_frame rd;
+	struct udsp_ec_nlms_info info;
+	struct lull_line l;
+	float misalign;
+	float term;
+	unsigned k;
+
+	memset(fig, 0, sizeof(*fig));
+	lull_line_init(&l, rate, LULL_DIP_DB, 0.0);
+	lull_line_settle(&l, LULL_ONSET_PHASE, &rd, &info);
+	for (k = 0; k < LULL_SKIP_FRAMES; k++)
+		lull_frame_feed(&l);
+	lull_frame_run(&l, true, false, 0.0, &rd, &info);
+	misalign = rd.erle_db > 0.0f ? powf(10.0f, -rd.erle_db / 10.0f) :
+				       1.0f;
+	term = (rd.bar / LULL_MARGIN -
+		rd.estimate_power * (1.0f + misalign)) / LULL_FLOOR_HEADROOM;
+	fig->term_ratio = term / rd.noise_power;
+	fig->noise_dbov = (float)(10.0 * log10(rd.noise_power / 536854528.0));
+	fig->est_dbov = (float)(10.0 * log10(rd.estimate_power /
+					     536854528.0));
+	fig->active = rd.window_power >= rd.ref_bar && !rd.ref_quiet;
+	fig->trusted = rd.trusted;
+	fig->classic = rd.classic_arm;
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/*
+ * The first frame that runs after a burst starts inside the reference intake is
+ * no onset, as its previous frame's window is active. Its bar therefore carries
+ * the tracked floor, not the pause level. A window flag that only run() keeps
+ * reads an onset there and admits near speech; that form fails.
+ */
+static void lull_skip_test(unsigned rate)
+{
+	struct lull_skip_figures fig;
+
+	lull_skip_run(rate, &fig);
+	case_rate(rate, "lec frame after a burst start inside a reference-only "
+		  "intake reads the tracked floor");
+	printf("# %u frames through the intake from the onset frame; next "
+	       "frame: estimate %.1f dBov, tracked floor %.1f dBov, floor term "
+	       "of the bar %.2f times the tracked floor; trusted %d, classic "
+	       "arm %d\n", LULL_SKIP_FRAMES, fig.est_dbov, fig.noise_dbov,
+	       fig.term_ratio, fig.trusted, fig.classic);
+	CHECK(fig.active);
+	CHECK(fig.trusted);
+	CHECK(!fig.classic);
+	CHECK(fig.term_ratio < LULL_SKIP_RATIO);
+}
+
+/* The quiet-miss line (G.168 test 3C t3): a flat path returns the echo
+ * MISS_DELAY_MS late. Its product with an independent noise stands a set level
+ * under it, which the ERLE tracker reads. Bursts start inside a frame. */
+#define MISS_DELAY_MS		28.5
+#define MISS_ERL_DB		6.0
+#define MISS_RES_DB		25.0
+#define MISS_FAR_DBM0		-20.0
+#define MISS_FLOOR_DBM0		-70.0
+#define MISS_BURST_FRAMES	25u
+#define MISS_QUIET_FRAMES	4u
+#define MISS_SETTLE_FRAMES	(6u * FRAMES_PER_SECOND)
+#define MISS_PHASES		8u
+/* The floor of a pattern frame over the tracked floor: g under the bar, h
+ * between the two bars, m over the bar under the bound. p and P stand over the
+ * bound, under and over 12 dB over the floor; '-' is the line floor. */
+#define MISS_GOOD_DB		4.5
+#define MISS_HEAD_DB		5.3
+#define MISS_OVER_DB		7.0
+#define MISS_PEAK_DB		10.5
+#define MISS_LOUD_DB		13.5
+/* The bars of a quiet frame with no estimate and of an active window over the
+ * tracked floor (headroom times margin). Then the peak bound over the bar. */
+#define MISS_PAUSE_BAR		(2.8f * 1.41f)
+#define MISS_ACTIVE_BAR		(2.0f * 1.41f)
+#define MISS_PEAK_RATIO		2.0f
+/* The first frames of a burst whose output the edge figure covers, with the
+ * cross-fade frame. The bound of that figure against the engaged level. */
+#define MISS_EDGE_FRAMES	8u
+#define MISS_EDGE_TOL_DB	1.0
+/* The ERLE of the resume and of the gate under it. Then the product levels at
+ * which the tracker reads about 6 dB over the resume, and between the two. */
+#define MISS_RESUME_DB		24.0
+#define MISS_GATE_DB		18.0
+#define MISS_RES_DEEP_DB	30.0
+#define MISS_RES_LOW_DB		21.0
+
+struct miss_line {
+	struct echo_path path;
+	struct udsp_ec *ec;
+	unsigned frame;
+	unsigned quiet;
+	unsigned period;
+	unsigned offset;
+	unsigned long count;
+	uint32_t far_state;
+	uint32_t floor_state;
+	uint32_t res_state;
+	double res_db;
+	double far_dbm0;
+	int16_t out[UDSP_FRAME_MAX];
+};
+
+/* The line at the rate, with its bursts at far_dbm0 (MISS_FAR_DBM0) and offset
+ * samples into their first frame. Its echo product stands res_db under the
+ * echo, with the processor on and the default tail of the rate. Each pause
+ * holds MISS_QUIET_FRAMES quiet frames (miss_line_quiet_set). */
+static void miss_line_init(struct miss_line *l, unsigned rate,
+			   unsigned offset, double res_db)
+{
+	unsigned delay = path_samples_get(MISS_DELAY_MS, rate);
+
+	memset(l, 0, sizeof(*l));
+	l->frame = rate / 100u;
+	l->offset = offset;
+	l->res_db = res_db;
+	l->far_dbm0 = MISS_FAR_DBM0;
+	l->far_state = 0x31415926u;
+	l->floor_state = 0x27182818u;
+	l->res_state = 0x16180339u;
+	path_geometry_set(&l->path, rate);
+	l->path.taps = delay + 1u;
+	l->path.h[delay] = 1.0f;
+	path_erl_set(&l->path, MISS_ERL_DB);
+	l->ec = udsp_ec_nlms.create_rate(0u, rate);
+	udsp_ec_nlms.nlp(l->ec, true);
+	l->quiet = MISS_QUIET_FRAMES;
+	l->period = MISS_BURST_FRAMES + window_frames_get(l->ec) +
+		    l->quiet - 1u;
+}
+
+/* The pauses of the line hold quiet quiet frames, from the next period on.
+ * The line takes it before it settles. */
+static void miss_line_quiet_set(struct miss_line *l, unsigned quiet)
+{
+	l->quiet = quiet;
+	l->period = MISS_BURST_FRAMES + window_frames_get(l->ec) + quiet - 1u;
+}
+
+/* The frame of the period that the next frame is, counted from 0. */
+static unsigned miss_phase_get(const struct miss_line *l)
+{
+	return (unsigned)(l->count % l->period);
+}
+
+/* The level of a pattern frame over the tracked floor, or 0 for the line
+ * floor. */
+static double miss_level_get(char c)
+{
+	switch (c) {
+	case 'g':
+		return MISS_GOOD_DB;
+	case 'h':
+		return MISS_HEAD_DB;
+	case 'm':
+		return MISS_OVER_DB;
+	case 'p':
+		return MISS_PEAK_DB;
+	case 'P':
+		return MISS_LOUD_DB;
+	}
+	return 0.0;
+}
+
+/*
+ * One frame of the line. A nonzero over_db scales the floor of the frame to
+ * stand that far over the floor that the detector reads on the frame.
+ */
+static void miss_frame_run(struct miss_line *l, double over_db,
+			   struct udsp_ec_nlms_frame *reading,
+			   struct udsp_ec_nlms_info *info)
+{
+	int16_t ref[UDSP_FRAME_MAX];
+	int16_t echo[UDSP_FRAME_MAX];
+	int16_t floor[UDSP_FRAME_MAX];
+	int16_t mic[UDSP_FRAME_MAX];
+	unsigned p = miss_phase_get(l);
+	double res = pow(10.0, -l->res_db / 20.0) * sqrt(3.0);
+	double gain = 1.0;
+	unsigned i;
+
+	noise_fill(ref, l->frame, l->far_dbm0, &l->far_state);
+	for (i = 0; i < l->frame; i++) {
+		if (p >= MISS_BURST_FRAMES || (p == 0u && i < l->offset))
+			ref[i] = 0;
+	}
+	path_run(&l->path, ref, echo);
+	noise_fill(floor, l->frame, MISS_FLOOR_DBM0, &l->floor_state);
+	if (over_db != 0.0) {
+		udsp_ec_nlms_info_get(l->ec, info);
+		gain = sqrt(32767.0 * 32767.0 *
+			    pow(10.0, (over_db - info->noise_dbov) / 10.0) /
+			    udsp_ec_nlms_frame_power_get(floor, l->frame));
+	}
+	for (i = 0; i < l->frame; i++) {
+		double unit = rng_next(&l->res_state) / 4294967295.0 * 2.0 -
+			      1.0;
+
+		mic[i] = sample_clamp((double)echo[i] * (1.0 + res * unit) +
+				      gain * floor[i]);
+	}
+	udsp_ec_nlms.run(l->ec, mic, ref);
+	memcpy(l->out, mic, l->frame * sizeof(*mic));
+	udsp_ec_nlms_frame_get(l->ec, reading);
+	udsp_ec_nlms_info_get(l->ec, info);
+	l->count++;
+}
+
+/* MISS_SETTLE_FRAMES of bursts and pauses with the line floor, up to the
+ * first pause frame of a period. */
+static void miss_line_settle(struct miss_line *l)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+
+	while (l->count < MISS_SETTLE_FRAMES ||
+	       miss_phase_get(l) != MISS_BURST_FRAMES)
+		miss_frame_run(l, 0.0, &reading, &info);
+}
+
+/*
+ * The figures of one pause and the burst after it: its quiet frames and the
+ * level ranges of each pattern class over the bar. Then the first acting frame
+ * of the burst, whether it reads pass, and the waits. Last, edge_db (the first
+ * frames' output against the engaged level), and the onset's verdict and ERLE.
+ */
+struct miss_leg {
+	unsigned quiet;
+	double hi_good;
+	double lo_miss;
+	double hi_miss;
+	double lo_head;
+	double hi_head;
+	double lo_peak;
+	double hi_peak;
+	double lo_peak_floor;
+	double hi_peak_floor;
+	unsigned first;
+	bool first_pass;
+	unsigned waits;
+	double edge_db;
+	unsigned onset_verdict;
+	double onset_erle_db;
+};
+
+/* The figures of a p or P frame: db over the bar, floor_db over the tracked
+ * floor. */
+static void miss_peak_keep(struct miss_leg *g, double db, double floor_db)
+{
+	if (db < g->lo_peak)
+		g->lo_peak = db;
+	if (db > g->hi_peak)
+		g->hi_peak = db;
+	if (floor_db < g->lo_peak_floor)
+		g->lo_peak_floor = floor_db;
+	if (floor_db > g->hi_peak_floor)
+		g->hi_peak_floor = floor_db;
+}
+
+/* The pause of the period from the frame the line stands on, with pattern on
+ * its quiet frames, then the burst of the next period. */
+static void miss_leg_run(struct miss_line *l, const char *pattern,
+			 struct miss_leg *g)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	unsigned from = l->period - l->quiet;
+	double edge = 0.0;
+	double engaged = 0.0;
+	uint32_t waits;
+	unsigned f;
+	unsigned i;
+
+	memset(g, 0, sizeof(*g));
+	g->hi_good = -200.0;
+	g->lo_miss = 200.0;
+	g->hi_miss = -200.0;
+	g->lo_head = 200.0;
+	g->hi_head = -200.0;
+	g->lo_peak = 200.0;
+	g->hi_peak = -200.0;
+	g->lo_peak_floor = 200.0;
+	g->hi_peak_floor = -200.0;
+	g->first = MISS_BURST_FRAMES;
+	for (f = miss_phase_get(l); f < l->period; f++) {
+		char c = f >= from ? pattern[f - from] : '-';
+		double db;
+
+		miss_frame_run(l, miss_level_get(c), &reading, &info);
+		g->quiet += reading.nlp_verdict == LECR_VERDICT_QUIET;
+		db = ratio_db_get(reading.mic_power,
+				  reading.estimate_power +
+				  reading.noise_power * MISS_PAUSE_BAR);
+		if (c == 'g' && db > g->hi_good)
+			g->hi_good = db;
+		if (c == 'm' && db < g->lo_miss)
+			g->lo_miss = db;
+		if (c == 'm' && db > g->hi_miss)
+			g->hi_miss = db;
+		if (c == 'h' && db < g->lo_head)
+			g->lo_head = db;
+		if (c == 'h' && db > g->hi_head)
+			g->hi_head = db;
+		if (c == 'p' || c == 'P')
+			miss_peak_keep(g, db,
+				       ratio_db_get(reading.mic_power,
+						    reading.noise_power));
+	}
+	waits = info.nlp_wait_frames;
+	for (f = 0; f < MISS_BURST_FRAMES; f++) {
+		miss_frame_run(l, 0.0, &reading, &info);
+		if (f == 0u) {
+			g->onset_verdict = reading.nlp_verdict;
+			g->onset_erle_db = reading.erle_db;
+		}
+		if (info.nlp_active && g->first == MISS_BURST_FRAMES) {
+			g->first = f;
+			g->first_pass = reading.nlp_verdict ==
+					LECR_VERDICT_PASS;
+		}
+		for (i = 0; f < 2u * MISS_EDGE_FRAMES && i < l->frame; i++) {
+			double e = (double)l->out[i] * l->out[i];
+
+			if (f < MISS_EDGE_FRAMES)
+				edge += e;
+			else
+				engaged += e;
+		}
+	}
+	g->waits = info.nlp_wait_frames - waits;
+	g->edge_db = 10.0 * log10(edge / engaged);
+}
+
+/*
+ * The legs of one line, in order: the line floor, then the captured patterns
+ * miss, miss, good and good, miss, miss. Then a pause that starts with two
+ * misses after one that ends with two. Last come a miss, a kept frame and two
+ * misses, then three misses, and one frame over the bound.
+ */
+enum {
+	MISS_LEG_FLOOR,
+	MISS_LEG_PAIR_GOOD,
+	MISS_LEG_GOOD_PAIR,
+	MISS_LEG_PAIR_AGAIN,
+	MISS_LEG_SPLIT,
+	MISS_LEG_FLOOR_2,
+	MISS_LEG_THREE,
+	MISS_LEG_FLOOR_3,
+	MISS_LEG_PEAK,
+	MISS_LEGS
+};
+
+static const char *const miss_patterns[MISS_LEGS] = {
+	"----", "-mmg", "-gmm", "mmgg", "mgmm", "----", "-mmm", "----", "-gpg",
+};
+
+/* All legs of one line, bursts offset samples into their first frame, with
+ * its echo product res_db under the echo. */
+static void miss_line_run(unsigned rate, unsigned offset, double res_db,
+			  struct miss_leg *legs)
+{
+	struct miss_line l;
+	unsigned n;
+
+	miss_line_init(&l, rate, offset, res_db);
+	miss_line_settle(&l);
+	for (n = 0; n < MISS_LEGS; n++)
+		miss_leg_run(&l, miss_patterns[n], &legs[n]);
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/* The legs of every phase on a line with its echo product res_db under the
+ * echo: the offset of phase k is k eighths of a frame. */
+static void miss_phases_run(unsigned rate, double res_db,
+			    struct miss_leg legs[MISS_PHASES][MISS_LEGS])
+{
+	unsigned frame = rate / 100u;
+	unsigned k;
+
+	for (k = 0; k < MISS_PHASES; k++)
+		miss_line_run(rate, k * frame / MISS_PHASES, res_db, legs[k]);
+}
+
+/* The checks of a leg that keeps its run:
+ * - its pattern frames stand where their pattern puts them;
+ * - the whole pause reads quiet;
+ * - the burst acts from its first frame, a pass frame, with no wait;
+ * - its edge stands within MISS_EDGE_TOL_DB of the engaged level. */
+static void miss_kept_check(const struct miss_leg *g, const char *pattern)
+{
+	CHECK_UINT(g->quiet, MISS_QUIET_FRAMES);
+	if (strchr(pattern, 'g'))
+		CHECK(g->hi_good < 0.0);
+	if (strchr(pattern, 'm')) {
+		CHECK(g->lo_miss > 0.0);
+		CHECK(g->hi_miss < 10.0 * log10(MISS_PEAK_RATIO));
+	}
+	CHECK_UINT(g->first, 0);
+	CHECK(g->first_pass);
+	CHECK_UINT(g->waits, 0);
+	CHECK(fabs(g->edge_db) <= MISS_EDGE_TOL_DB);
+}
+
+/* The figures of leg over every phase:
+ * - the largest edge figure;
+ * - the range of the miss frames over the bar;
+ * - the first acting frame and the waits of the phase that waits most. */
+static void miss_legs_print(const char *what,
+			    struct miss_leg legs[MISS_PHASES][MISS_LEGS],
+			    unsigned leg)
+{
+	double edge = -200.0;
+	double lo = 200.0;
+	double hi = -200.0;
+	double good = -200.0;
+	unsigned first = 0;
+	unsigned waits = 0;
+	unsigned k;
+
+	for (k = 0; k < MISS_PHASES; k++) {
+		const struct miss_leg *g = &legs[k][leg];
+
+		if (g->edge_db > edge)
+			edge = g->edge_db;
+		if (g->lo_miss < lo)
+			lo = g->lo_miss;
+		if (g->hi_miss > hi)
+			hi = g->hi_miss;
+		if (g->hi_good > good)
+			good = g->hi_good;
+		if (g->first > first)
+			first = g->first;
+		if (g->waits > waits)
+			waits = g->waits;
+	}
+	printf("# %s, pause %s over %u phases: good frames up to %.2f dB "
+	       "over the bar, miss frames %.2f to %.2f dB over it; the burst "
+	       "acts from its frame %u at most, %u wait frames at most; its "
+	       "first %u frames up to %.2f dB over the engaged level\n", what,
+	       miss_patterns[leg], MISS_PHASES, good, lo, hi, first, waits,
+	       MISS_EDGE_FRAMES, edge);
+}
+
+/*
+ * Captured patterns of G.168 test 3C t3 at 8 phases: two quiet misses in a row
+ * keep the run (LEC_NLP_QUIET_MISSES). The burst then acts on its first frame,
+ * and its first 8 frames stay within 1 dB of the engaged level. A count that a
+ * far burst or a kept frame does not reset fails.
+ */
+static void quiet_miss_test(unsigned rate)
+{
+	static struct miss_leg legs[MISS_PHASES][MISS_LEGS];
+	unsigned k;
+
+	miss_phases_run(rate, MISS_RES_DB, legs);
+	case_rate(rate, "lec nlp keeps the engage run through a far pause of "
+		  "miss, miss, good");
+	miss_legs_print("line floor", legs, MISS_LEG_FLOOR);
+	miss_legs_print("miss, miss, good", legs, MISS_LEG_PAIR_GOOD);
+	miss_legs_print("the same after a pause that ends with two misses",
+			legs, MISS_LEG_PAIR_AGAIN);
+	for (k = 0; k < MISS_PHASES; k++) {
+		miss_kept_check(&legs[k][MISS_LEG_FLOOR],
+				miss_patterns[MISS_LEG_FLOOR]);
+		miss_kept_check(&legs[k][MISS_LEG_PAIR_GOOD],
+				miss_patterns[MISS_LEG_PAIR_GOOD]);
+		miss_kept_check(&legs[k][MISS_LEG_PAIR_AGAIN],
+				miss_patterns[MISS_LEG_PAIR_AGAIN]);
+	}
+	case_rate(rate, "lec nlp keeps the engage run through a far pause of "
+		  "good, miss, miss");
+	miss_legs_print("good, miss, miss", legs, MISS_LEG_GOOD_PAIR);
+	for (k = 0; k < MISS_PHASES; k++)
+		miss_kept_check(&legs[k][MISS_LEG_GOOD_PAIR],
+				miss_patterns[MISS_LEG_GOOD_PAIR]);
+	case_rate(rate, "lec nlp keeps the engage run through a far pause of "
+		  "miss, good, miss, miss");
+	miss_legs_print("miss, good, miss, miss", legs, MISS_LEG_SPLIT);
+	for (k = 0; k < MISS_PHASES; k++)
+		miss_kept_check(&legs[k][MISS_LEG_SPLIT],
+				miss_patterns[MISS_LEG_SPLIT]);
+}
+
+/* The range of the ERLE tracker on the first frame of the burst of leg, over
+ * every phase. */
+static void miss_onset_erle_get(struct miss_leg legs[MISS_PHASES][MISS_LEGS],
+				unsigned leg, double *lo, double *hi)
+{
+	unsigned k;
+
+	*lo = 200.0;
+	*hi = -200.0;
+	for (k = 0; k < MISS_PHASES; k++) {
+		if (legs[k][leg].onset_erle_db < *lo)
+			*lo = legs[k][leg].onset_erle_db;
+		if (legs[k][leg].onset_erle_db > *hi)
+			*hi = legs[k][leg].onset_erle_db;
+	}
+}
+
+/*
+ * Three quiet misses in a row, and one frame over the peak bound, at 8 phases.
+ * After the three misses the first pass frame resumes the run
+ * (LEC_NLP_RESUME_DB); after the frame over the bound the burst waits 7 frames.
+ */
+static void quiet_miss_limit_test(unsigned rate)
+{
+	static struct miss_leg legs[MISS_PHASES][MISS_LEGS];
+	double lo;
+	double hi;
+	unsigned k;
+
+	miss_phases_run(rate, MISS_RES_DEEP_DB, legs);
+	case_rate(rate, "lec nlp resumes the engage run at a far onset after "
+		  "three quiet misses and waits after one over the peak bound");
+	miss_legs_print("three misses", legs, MISS_LEG_THREE);
+	miss_legs_print("one frame over the bound", legs, MISS_LEG_PEAK);
+	miss_onset_erle_get(legs, MISS_LEG_THREE, &lo, &hi);
+	printf("# ERLE tracker on the first burst frame after three misses: "
+	       "%.2f to %.2f dB\n", lo, hi);
+	for (k = 0; k < MISS_PHASES; k++) {
+		const struct miss_leg *three = &legs[k][MISS_LEG_THREE];
+		const struct miss_leg *peak = &legs[k][MISS_LEG_PEAK];
+
+		miss_kept_check(three, miss_patterns[MISS_LEG_THREE]);
+		CHECK(three->onset_erle_db >= MISS_RESUME_DB);
+		CHECK_UINT(peak->quiet, MISS_QUIET_FRAMES);
+		CHECK(peak->hi_good < 0.0);
+		CHECK_UINT(peak->first, WORDS_ENGAGE_FRAME);
+		CHECK_UINT(peak->waits, WORDS_ENGAGE_FRAME);
+		CHECK(peak->edge_db > MISS_EDGE_TOL_DB);
+	}
+}
+
+/* The legs of one line whose echo product stands res_db under the echo:
+ * the line floor, then three misses. */
+static void miss_three_run(unsigned rate, unsigned offset, double res_db,
+			   struct miss_leg *legs)
+{
+	struct miss_line l;
+
+	miss_line_init(&l, rate, offset, res_db);
+	miss_line_settle(&l);
+	miss_leg_run(&l, miss_patterns[MISS_LEG_FLOOR], &legs[MISS_LEG_FLOOR]);
+	miss_leg_run(&l, miss_patterns[MISS_LEG_THREE], &legs[MISS_LEG_THREE]);
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/*
+ * Three quiet misses on the quiet-miss line whose ERLE tracker reads over the
+ * gate and under LEC_NLP_RESUME_DB of dsp/lec.c. No resume follows, so the
+ * burst waits 7 frames. A resume without the ERLE condition, or with it at
+ * the gate, fails here.
+ */
+static void resume_erle_test(unsigned rate)
+{
+	static struct miss_leg legs[MISS_PHASES][MISS_LEGS];
+	unsigned frame = rate / 100u;
+	double lo;
+	double hi;
+	unsigned k;
+
+	for (k = 0; k < MISS_PHASES; k++)
+		miss_three_run(rate, k * frame / MISS_PHASES, MISS_RES_LOW_DB,
+			       legs[k]);
+	case_rate(rate, "lec nlp waits at a far onset after three quiet misses "
+		  "with the ERLE tracker under the resume level");
+	miss_legs_print("three misses", legs, MISS_LEG_THREE);
+	miss_onset_erle_get(legs, MISS_LEG_THREE, &lo, &hi);
+	printf("# ERLE tracker on the first burst frame: %.2f to %.2f dB\n",
+	       lo, hi);
+	for (k = 0; k < MISS_PHASES; k++) {
+		const struct miss_leg *three = &legs[k][MISS_LEG_THREE];
+
+		CHECK_UINT(three->quiet, MISS_QUIET_FRAMES);
+		CHECK(three->lo_miss > 0.0);
+		CHECK(three->hi_miss < 10.0 * log10(MISS_PEAK_RATIO));
+		CHECK_UINT(three->onset_verdict, LECR_VERDICT_PASS);
+		CHECK(three->onset_erle_db >= MISS_GATE_DB);
+		CHECK(three->onset_erle_db < MISS_RESUME_DB);
+		CHECK_UINT(three->first, WORDS_ENGAGE_FRAME);
+		CHECK_UINT(three->waits, WORDS_ENGAGE_FRAME);
+		CHECK(three->edge_db > MISS_EDGE_TOL_DB);
+	}
+}
+
+/* The near sound of resume_talker_test: its level over the tracked floor on
+ * the first MISS_TALK_FRAMES frames of a burst, about 2 dB over the echo. */
+#define MISS_TALK_DB		46.0
+#define MISS_TALK_FRAMES	8u
+
+/*
+ * A near sound that holds a burst, then the pause after it. The sound stands
+ * MISS_TALK_DB over the tracked floor on the first MISS_TALK_FRAMES frames of
+ * the burst and MISS_OVER_DB over it on the rest. It goes on at that level on
+ * the quiet frames of the pause, and the burst after the pause follows. acts
+ * counts the frames of the held burst that read nlp_active.
+ */
+static void miss_talk_leg_run(struct miss_line *l, struct miss_leg *g,
+			      unsigned *acts)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	unsigned f;
+
+	for (f = MISS_BURST_FRAMES; f < l->period; f++)
+		miss_frame_run(l, 0.0, &reading, &info);
+	*acts = 0;
+	for (f = 0; f < MISS_BURST_FRAMES; f++) {
+		miss_frame_run(l, f < MISS_TALK_FRAMES ? MISS_TALK_DB :
+			       MISS_OVER_DB, &reading, &info);
+		*acts += info.nlp_active;
+	}
+	miss_leg_run(l, "mmmm", g);
+}
+
+/*
+ * A near sound that the detector holds over a far burst goes on in the far
+ * pause after it, under the bound. The processor acts on no frame of that
+ * burst, so no resume follows the pause, and the next burst waits 7 frames.
+ * A resume without the acted burst fails here.
+ */
+static void resume_talker_test(unsigned rate)
+{
+	unsigned frame = rate / 100u;
+	unsigned k;
+
+	case_rate(rate, "lec nlp waits at a far onset after a near sound that "
+		  "held the burst before the pause");
+	for (k = 0; k < MISS_PHASES; k++) {
+		struct miss_leg floor;
+		struct miss_leg g;
+		struct miss_line l;
+		unsigned acts;
+
+		miss_line_init(&l, rate, k * frame / MISS_PHASES,
+			       MISS_RES_DEEP_DB);
+		miss_line_settle(&l);
+		miss_leg_run(&l, miss_patterns[MISS_LEG_FLOOR], &floor);
+		miss_talk_leg_run(&l, &g, &acts);
+		udsp_ec_nlms.destroy(l.ec);
+		printf("# phase %u: held burst %u acting frames; pause frames "
+		       "%.2f to %.2f dB over the bar; next burst: verdict %s "
+		       "and ERLE tracker %.2f dB on its first frame, acts "
+		       "from its frame %u, %u wait frames\n", k, acts,
+		       g.lo_miss, g.hi_miss,
+		       udsp_ec_nlms_verdict_name(g.onset_verdict),
+		       g.onset_erle_db, g.first, g.waits);
+		CHECK_UINT(acts, 0);
+		CHECK_UINT(g.quiet, MISS_QUIET_FRAMES);
+		CHECK(g.hi_miss < 10.0 * log10(MISS_PEAK_RATIO));
+		CHECK_UINT(g.onset_verdict, LECR_VERDICT_PASS);
+		CHECK(g.onset_erle_db >= MISS_RESUME_DB);
+		CHECK_UINT(g.first, WORDS_ENGAGE_FRAME);
+		CHECK_UINT(g.waits, WORDS_ENGAGE_FRAME);
+	}
+}
+
+/* The far end in the pause of resume_floor_test, under the active bar of the
+ * reference, and the room noise at the level of its echo. */
+#define STATE_LOW_FAR_DBM0	-65.0
+#define STATE_LOW_ROOM_DBM0	-78.5
+/* The bar of a quiet frame with no measured floor over the estimate,
+ * LEC_GEIGEL_MARGIN of dsp/lec.c. */
+#define STATE_LIKE_MARGIN	1.41f
+
+/* One pause frame of resume_floor_test: the far end at STATE_LOW_FAR_DBM0,
+ * with the room noise at STATE_LOW_ROOM_DBM0 when room is set. */
+static void state_low_frame_run(struct state_line *s, bool room,
+				struct udsp_ec_nlms_frame *reading)
+{
+	int16_t ref[UDSP_FRAME_MAX];
+
+	noise_fill(ref, s->path.frame, STATE_LOW_FAR_DBM0, &s->far_state);
+	memset(s->room, 0, sizeof(s->room));
+	if (room)
+		noise_fill(s->room, s->path.frame, STATE_LOW_ROOM_DBM0,
+			   &s->room_state);
+	verdict_out_step(s->ec, &s->path, ref, room ? s->room : NULL, s->out,
+			 &s->acted);
+	udsp_ec_nlms_frame_get(s->ec, reading);
+}
+
+/*
+ * The first pause of the state line, with no measured floor. Room noise at
+ * the level of the far echo on the first quiet frame zeroes the engage run.
+ * No resume follows a pause frame without a floor, so the far return acts
+ * on its 8th frame. A resume without that condition fails here.
+ */
+static void resume_floor_test(unsigned rate)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_frame first;
+	struct udsp_ec_nlms_info info;
+	struct state_line s;
+	unsigned tail;
+	unsigned at;
+	unsigned f;
+	bool engaged;
+
+	state_line_init(&s, rate, 8u);
+	udsp_ec_nlms_info_get(s.ec, &info);
+	engaged = info.nlp_active;
+	tail = window_frames_get(s.ec) - 1u;
+	memset(&first, 0, sizeof(first));
+	for (f = 0; f < STATE_PAUSE_FRAMES; f++) {
+		state_low_frame_run(&s, f >= tail, &reading);
+		if (f == tail)
+			first = reading;
+	}
+	at = state_far_run(&s, false);
+	udsp_ec_nlms_frame_get(s.ec, &reading);
+	case_rate(rate, "lec nlp waits at a far return after a pause frame "
+		  "between the bar and the bound with no measured floor");
+	printf("# engaged before the pause %d; first quiet frame: verdict %s, "
+	       "floor %.3g, %.2f dB over its bar, bound %.2f dB; ERLE tracker "
+	       "%.2f dB; the far return acts from its frame %u\n", engaged,
+	       udsp_ec_nlms_verdict_name(first.nlp_verdict),
+	       (double)first.noise_power,
+	       ratio_db_get(first.mic_power,
+			    first.estimate_power * STATE_LIKE_MARGIN),
+	       10.0 * log10(MISS_PEAK_RATIO), reading.erle_db, at);
+	CHECK(engaged);
+	CHECK_UINT(first.nlp_verdict, LECR_VERDICT_QUIET);
+	CHECK(first.noise_power == 0.0f);
+	CHECK(first.mic_power > first.estimate_power * STATE_LIKE_MARGIN);
+	CHECK(first.mic_power <= first.estimate_power * STATE_LIKE_MARGIN *
+				 MISS_PEAK_RATIO);
+	CHECK(reading.erle_db >= MISS_RESUME_DB);
+	CHECK_UINT(at, WORDS_ENGAGE_FRAME);
+	udsp_ec_nlms.destroy(s.ec);
+}
+
+/* The patterns of quiet_miss_low_test. Each follows a pause of the line floor,
+ * so its first quiet frame carries the line floor. */
+static const char *const miss_low_patterns[] = { "-mmg", "-gmm" };
+#define MISS_LOW_LEGS		2u
+
+/* The legs of every phase on the quiet-miss line with its echo product
+ * MISS_RES_LOW_DB under the echo: each of count patterns after a pause of the
+ * line floor. */
+static void miss_low_run(unsigned rate, const char *const *patterns,
+			 unsigned count,
+			 struct miss_leg legs[MISS_PHASES][MISS_LOW_LEGS])
+{
+	unsigned frame = rate / 100u;
+	unsigned k;
+	unsigned n;
+
+	for (k = 0; k < MISS_PHASES; k++) {
+		struct miss_leg floor;
+		struct miss_line l;
+
+		miss_line_init(&l, rate, k * frame / MISS_PHASES,
+			       MISS_RES_LOW_DB);
+		miss_line_settle(&l);
+		for (n = 0; n < count; n++) {
+			miss_leg_run(&l, miss_patterns[MISS_LEG_FLOOR], &floor);
+			miss_leg_run(&l, patterns[n], &legs[k][n]);
+		}
+		udsp_ec_nlms.destroy(l.ec);
+	}
+}
+
+/*
+ * The patterns miss, miss, good and good, miss, miss on the quiet-miss line.
+ * Its ERLE tracker reads under LEC_NLP_RESUME_DB of dsp/lec.c, so a zeroed
+ * run waits. Two quiet misses in a row keep the run (LEC_NLP_QUIET_MISSES),
+ * and the burst acts on its first frame. A count of 1 fails here.
+ */
+static void quiet_miss_low_test(unsigned rate)
+{
+	static struct miss_leg legs[MISS_PHASES][MISS_LOW_LEGS];
+	unsigned k;
+	unsigned n;
+
+	miss_low_run(rate, miss_low_patterns, MISS_LOW_LEGS, legs);
+	case_rate(rate, "lec nlp keeps the engage run through two quiet misses "
+		  "on a line under the resume level");
+	for (n = 0; n < MISS_LOW_LEGS; n++) {
+		double lo = 200.0;
+		double hi = -200.0;
+		double good = -200.0;
+		double edge = -200.0;
+		double erle = 200.0;
+		unsigned first = 0;
+
+		for (k = 0; k < MISS_PHASES; k++) {
+			const struct miss_leg *g = &legs[k][n];
+
+			lo = g->lo_miss < lo ? g->lo_miss : lo;
+			hi = g->hi_miss > hi ? g->hi_miss : hi;
+			good = g->hi_good > good ? g->hi_good : good;
+			edge = g->edge_db > edge ? g->edge_db : edge;
+			erle = g->onset_erle_db < erle ? g->onset_erle_db :
+							erle;
+			first = g->first > first ? g->first : first;
+			miss_kept_check(g, miss_low_patterns[n]);
+			CHECK(g->onset_erle_db < MISS_RESUME_DB);
+		}
+		printf("# pause %s over %u phases: good frames up to %.2f dB "
+		       "over the bar, miss frames %.2f to %.2f dB over it; the "
+		       "burst acts from its frame %u at most, its first %u "
+		       "frames up to %.2f dB over the engaged level; ERLE "
+		       "tracker from %.2f dB\n", miss_low_patterns[n],
+		       MISS_PHASES, good, lo, hi, first, MISS_EDGE_FRAMES,
+		       edge, erle);
+	}
+}
+
+/*
+ * A pause of the line floor after an acted burst. The processor is then off
+ * from the next burst through the frames of the window after it. It is on
+ * again for the quiet frames of that pause and the burst after them.
+ * acts counts the frames of the switched-off burst that read nlp_active.
+ */
+static void miss_off_leg_run(struct miss_line *l, struct miss_leg *g,
+			     unsigned *acts)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	unsigned from = l->period - l->quiet;
+	unsigned f;
+
+	for (f = MISS_BURST_FRAMES; f < l->period; f++)
+		miss_frame_run(l, 0.0, &reading, &info);
+	udsp_ec_nlms.nlp(l->ec, false);
+	*acts = 0;
+	for (f = 0; f < from; f++) {
+		miss_frame_run(l, 0.0, &reading, &info);
+		*acts += info.nlp_active;
+	}
+	udsp_ec_nlms.nlp(l->ec, true);
+	miss_leg_run(l, "----", g);
+}
+
+/* The processor switch: a frame with the switch off clears the evidence of the
+ * resume. A burst before the pause ran with the switch off, so the burst after
+ * the pause waits 7 frames. */
+static void resume_off_test(unsigned rate)
+{
+	unsigned frame = rate / 100u;
+	unsigned k;
+
+	case_rate(rate, "lec nlp waits at the first far onset after the "
+		  "processor switch returns");
+	for (k = 0; k < MISS_PHASES; k++) {
+		struct miss_leg floor;
+		struct miss_leg g;
+		struct miss_line l;
+		unsigned acts;
+
+		miss_line_init(&l, rate, k * frame / MISS_PHASES,
+			       MISS_RES_DEEP_DB);
+		miss_line_settle(&l);
+		miss_leg_run(&l, miss_patterns[MISS_LEG_FLOOR], &floor);
+		miss_off_leg_run(&l, &g, &acts);
+		udsp_ec_nlms.destroy(l.ec);
+		printf("# phase %u: burst before the switch acts from its "
+		       "frame %u; switched-off burst %u acting frames; next "
+		       "burst: verdict %s and ERLE tracker %.2f dB on its "
+		       "first frame, acts from its frame %u, %u wait frames\n",
+		       k, floor.first, acts,
+		       udsp_ec_nlms_verdict_name(g.onset_verdict),
+		       g.onset_erle_db, g.first, g.waits);
+		CHECK_UINT(floor.first, 0);
+		CHECK_UINT(acts, 0);
+		CHECK_UINT(g.quiet, MISS_QUIET_FRAMES);
+		CHECK_UINT(g.onset_verdict, LECR_VERDICT_PASS);
+		CHECK(g.onset_erle_db >= MISS_RESUME_DB);
+		CHECK_UINT(g.first, WORDS_ENGAGE_FRAME);
+		CHECK_UINT(g.waits, WORDS_ENGAGE_FRAME);
+	}
+}
+
+/* The pattern of quiet_headroom_low_test: three frames between the bars. */
+static const char *const miss_head_patterns[] = { "-hhh" };
+
+/*
+ * Three quiet frames between the bar of an active window and the bar of a
+ * quiet frame (LEC_GEIGEL_PAUSE_HEADROOM), on the quiet-miss line. Its ERLE
+ * tracker reads under LEC_NLP_RESUME_DB. The frames keep the run, and the burst
+ * acts on its first frame. A pause headroom equal to the active one makes
+ * them misses that zero the run, and fails here.
+ */
+static void quiet_headroom_low_test(unsigned rate)
+{
+	static struct miss_leg legs[MISS_PHASES][MISS_LOW_LEGS];
+	double gap = 10.0 * log10(MISS_PAUSE_BAR / MISS_ACTIVE_BAR);
+	double lo = 200.0;
+	double hi = -200.0;
+	double edge = -200.0;
+	double erle = 200.0;
+	unsigned first = 0;
+	unsigned k;
+
+	miss_low_run(rate, miss_head_patterns, 1u, legs);
+	case_rate(rate, "lec nlp keeps the engage run through quiet frames "
+		  "between the bars of an active window and of a pause");
+	for (k = 0; k < MISS_PHASES; k++) {
+		const struct miss_leg *g = &legs[k][0];
+
+		lo = g->lo_head < lo ? g->lo_head : lo;
+		hi = g->hi_head > hi ? g->hi_head : hi;
+		edge = g->edge_db > edge ? g->edge_db : edge;
+		erle = g->onset_erle_db < erle ? g->onset_erle_db : erle;
+		first = g->first > first ? g->first : first;
+		CHECK(g->hi_head < 0.0);
+		CHECK(g->lo_head + gap > 0.0);
+		CHECK(g->onset_erle_db < MISS_RESUME_DB);
+		miss_kept_check(g, miss_head_patterns[0]);
+	}
+	printf("# pause %s over %u phases: frames %.2f to %.2f dB over the "
+	       "bar of a quiet frame, %.2f to %.2f dB over the bar of an "
+	       "active window; the burst acts from its frame %u at most, its "
+	       "first %u frames up to %.2f dB over the engaged level; ERLE "
+	       "tracker from %.2f dB\n", miss_head_patterns[0], MISS_PHASES,
+	       lo, hi, lo + gap, hi + gap, first, MISS_EDGE_FRAMES, edge,
+	       erle);
+}
+
+/*
+ * The soft near word of floor_peak_talker_test, its pause frames by pattern:
+ * - o: at ALT_IN_DB over the tracked floor, over the bar and under the bound;
+ * - u: at ALT_UNDER_DB, under the bar.
+ */
+static void quiet_word_run(struct words_run *r, unsigned rate,
+			   const char *pattern)
+{
+	words_quiet_set(r, rate);
+	r->near_word = WORDS_MARK;
+	r->near_from = -(int)ALT_LEAD_FRAMES;
+	r->near_frames = ALT_LEAD_FRAMES + WORDS_NEAR_FRAMES;
+	r->near_dbm0 = FAN_FLOOR_DBM0 + ALT_WORD_OVER_DB;
+	r->alt_over_db = ALT_IN_DB;
+	r->alt_under_db = ALT_UNDER_DB;
+	r->alt_pattern = pattern;
+	words_run(r);
+}
+
+/* The bound of the word of quiet_miss_talker_test against the word whose
+ * pause frames alternate over and under the bar. */
+#define QUIET_WORD_TOL_DB	0.5
+
+/*
+ * Exposure of LEC_NLP_QUIET_MISSES to the soft word of floor_peak_talker_test
+ * with pause frames good, miss, miss, good. It keeps the run, and the processor
+ * replaces its 6 frames in the far word. The word loses at most
+ * QUIET_WORD_TOL_DB more than a word that alternates over and under the bar.
+ */
+static void quiet_miss_talker_test(unsigned rate)
+{
+	struct words_run alt;
+	struct words_run pair;
+	struct words_run three;
+
+	quiet_word_run(&alt, rate, "uouo");
+	quiet_word_run(&pair, rate, "uoou");
+	quiet_word_run(&three, rate, "ooou");
+	case_rate(rate, "lec nlp exposure of a soft near word with two "
+		  "frames in a row over the bar in a far pause");
+	alt_word_print("over and under the bar in turn", &alt);
+	alt_word_print("good, miss, miss, good", &pair);
+	alt_word_print("three frames over the bar", &three);
+	CHECK(pair.near > 0.0);
+	CHECK(three.near > 0.0);
+	CHECK_UINT(pair.near_pause, ALT_LEAD_FRAMES);
+	CHECK_UINT(three.near_pause, ALT_LEAD_FRAMES);
+	CHECK(pair.near_pause_hi > ALT_IN_DB - 1.5);
+	CHECK(pair.near_pause_hi < ALT_EDGE_DB);
+	CHECK_UINT(pair.near_acted, WORDS_NEAR_FRAMES);
+	CHECK_UINT(pair.latency[WORDS_MARK], 0);
+	CHECK(near_gain_db_get(pair.overlap_on, pair.overlap) >=
+	      near_gain_db_get(alt.overlap_on, alt.overlap) -
+	      QUIET_WORD_TOL_DB);
+	CHECK_UINT(three.near_acted, 0);
+	CHECK_UINT(three.latency[WORDS_MARK], WORDS_ENGAGE_FRAME);
+}
+
+/* The tone line: a far dial tone at TONE_DIAL_DBM0 over a white floor, PCMU, a
+ * flat TONE_ERL_DB hybrid, TONE_LOSS_HALF_DB of loss, the processor on. After
+ * TONE_WARM_FRAMES each trial adds five near digits at TONE_DIGIT_DBM0. */
+#define TONE_LO_HZ		350.0
+#define TONE_HI_HZ		440.0
+#define TONE_DIAL_DBM0		-18.0
+#define TONE_FLOOR_DBM0		-35.0
+#define TONE_DIGIT_DBM0		-12.0
+#define TONE_LEAD_US		375u
+#define TONE_ERL_DB		6.0
+#define TONE_LOSS_HALF_DB	18u
+#define TONE_WARM_FRAMES	(2u * FRAMES_PER_SECOND)
+#define TONE_TRIAL_FRAMES	150u
+#define TONE_ON_FRAMES		100u
+#define TONE_DIGIT_FROM		45u
+#define TONE_DIGIT_PERIOD	15u
+#define TONE_DIGIT_ON		5u
+#define TONE_DIGITS		5u
+#define TONE_TRIALS		20u
+#define TONE_LOSS_DB		1.0
+
+struct tone_result {
+	unsigned arms;
+	unsigned run_max;
+	unsigned digits;
+	double worst_db;
+};
+
+/* One sample through a G.711 mu-law round trip: the segment law of
+ * udsp_ulaw_encode and udsp_ulaw_decode in dsp/g711.c. */
+static int16_t tone_ulaw_get(int16_t sample)
+{
+	int magnitude = sample;
+	unsigned exponent = 0;
+	unsigned code;
+
+	if (magnitude < 0)
+		magnitude = -magnitude;
+	if (magnitude > 32635)
+		magnitude = 32635;
+	magnitude += 0x84;
+	while (exponent < 7 && magnitude >= (0x100 << exponent))
+		exponent++;
+	code = (exponent << 4) | (((unsigned)magnitude >> (exponent + 3)) &
+				  0x0fu);
+	magnitude = (int)(((code & 0x0fu) << 3) + 0x84u) << (code >> 4);
+	return sample < 0 ? (int16_t)(0x84 - magnitude) :
+			    (int16_t)(magnitude - 0x84);
+}
+
+/* The power of x at hz over one frame, a single-bin DFT. */
+static double tone_bin_get(const int16_t *x, unsigned n, double hz,
+			   unsigned rate)
+{
+	double re = 0.0;
+	double im = 0.0;
+	unsigned i;
+
+	for (i = 0; i < n; i++) {
+		double w = 2.0 * M_PI * hz * (double)i / rate;
+
+		re += x[i] * cos(w);
+		im -= x[i] * sin(w);
+	}
+	return (re * re + im * im) / ((double)n * n);
+}
+
+/* One frame of the near DTMF digits of a trial: digit k of the line takes
+ * row k % 4 and column k / 4 % 4. Returns the digit, or -1 off a digit. */
+static int tone_digit_fill(int16_t *near, unsigned frame, unsigned rate,
+			   unsigned trial, unsigned tf, unsigned long n0)
+{
+	static const double row[4] = { 697.0, 770.0, 852.0, 941.0 };
+	static const double col[4] = { 1209.0, 1336.0, 1477.0, 1633.0 };
+	double a = dbm0_rms_get(TONE_DIGIT_DBM0) * sqrt(2.0);
+	long lead = (long)(rate * TONE_LEAD_US / 1000000u);
+	unsigned slot;
+	int digit;
+	unsigned i;
+
+	memset(near, 0, frame * sizeof(*near));
+	if (tf + 1u < TONE_DIGIT_FROM ||
+	    tf >= TONE_DIGIT_FROM + TONE_DIGITS * TONE_DIGIT_PERIOD)
+		return -1;
+	slot = (tf + 1u - TONE_DIGIT_FROM) / TONE_DIGIT_PERIOD;
+	if (slot >= TONE_DIGITS)
+		return -1;
+	digit = (int)((trial * TONE_DIGITS + slot) % 16u);
+	for (i = 0; i < frame; i++) {
+		long pos = ((long)tf + 1 - (long)TONE_DIGIT_FROM -
+			    (long)(slot * TONE_DIGIT_PERIOD)) * (long)frame +
+			   (long)i - (long)frame + lead;
+		unsigned long k = n0 + i;
+
+		if (pos < 0 || pos >= (long)(TONE_DIGIT_ON * frame))
+			continue;
+		near[i] = sample_clamp(a * (sin(2.0 * M_PI * row[digit % 4] *
+						 (double)k / rate) +
+					    sin(2.0 * M_PI *
+						col[digit / 4 % 4] *
+						(double)k / rate)));
+	}
+	return digit;
+}
+
+/*
+ * The tone line at rate. r takes the coherence trials and the longest run that
+ * the rebuilt readings of the escape allow (struct cohere_view). It also takes
+ * the worst loss of a digit tone, read on the third and fourth frames of each
+ * digit, after the processor's release.
+ */
+static void tone_line_run(unsigned rate, struct tone_result *r)
+{
+	static const double row[4] = { 697.0, 770.0, 852.0, 941.0 };
+	static const double col[4] = { 1209.0, 1336.0, 1477.0, 1633.0 };
+	unsigned frame = rate / 100u;
+	struct udsp_ec *ec = udsp_ec_nlms.create_rate(0, rate);
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct cohere_view view;
+	struct echo_path path;
+	uint32_t state = 0x70ae1u;
+	double a = dbm0_rms_get(TONE_DIAL_DBM0) * sqrt(2.0);
+	unsigned long n = 0;
+	unsigned total = TONE_WARM_FRAMES + TONE_TRIALS * TONE_TRIAL_FRAMES;
+	unsigned run = 0;
+	unsigned f;
+
+	memset(r, 0, sizeof(*r));
+	memset(&view, 0, sizeof(view));
+	udsp_ec_nlms.nlp(ec, true);
+	udsp_ec_nlms_ref_loss_set(ec, TONE_LOSS_HALF_DB);
+	path_flat_init(&path, rate, 8, TONE_ERL_DB);
+	for (f = 0; f < total; f++) {
+		int16_t drive[UDSP_FRAME_MAX];
+		int16_t floor[UDSP_FRAME_MAX];
+		int16_t ref[UDSP_FRAME_MAX];
+		int16_t echo[UDSP_FRAME_MAX];
+		int16_t near[UDSP_FRAME_MAX];
+		int16_t mic[UDSP_FRAME_MAX];
+		int16_t out[UDSP_FRAME_MAX];
+		bool trial = f >= TONE_WARM_FRAMES;
+		unsigned tf = trial ? (f - TONE_WARM_FRAMES) %
+				      TONE_TRIAL_FRAMES : 0u;
+		bool on = !trial || tf < TONE_ON_FRAMES;
+		unsigned index = trial ? (f - TONE_WARM_FRAMES) /
+					 TONE_TRIAL_FRAMES : 0u;
+		int digit = trial ? tone_digit_fill(near, frame, rate, index,
+						    tf, n) : -1;
+		double ncc;
+		double share;
+		unsigned i;
+
+		if (!trial)
+			memset(near, 0, sizeof(near));
+		noise_fill(floor, frame, TONE_FLOOR_DBM0, &state);
+		for (i = 0; i < frame; i++, n++) {
+			double v = a * (sin(2.0 * M_PI * TONE_LO_HZ *
+					    (double)n / rate) +
+					sin(2.0 * M_PI * TONE_HI_HZ *
+					    (double)n / rate));
+
+			drive[i] = on ? tone_ulaw_get(sample_clamp(v +
+								   floor[i])) :
+					0;
+		}
+		level_loss_apply(ref, drive, frame, TONE_LOSS_HALF_DB);
+		path_run(&path, drive, echo);
+		for (i = 0; i < frame; i++)
+			mic[i] = sample_clamp((double)echo[i] + near[i]);
+		memcpy(out, mic, frame * sizeof(*mic));
+		udsp_ec_nlms.run(ec, out, ref);
+		udsp_ec_nlms_frame_get(ec, &reading);
+		udsp_ec_nlms_info_get(ec, &info);
+		cohere_view_add(&view, mic, out, frame, &reading);
+		if (reading.trial_arm == UDSP_EC_NLMS_TRIAL_ARM_COHERE)
+			r->arms++;
+		ncc = cohere_view_ncc_get(&view);
+		share = cohere_view_share_get(&view);
+		if (reading.ref_power >= reading.ref_bar) {
+			if (info.double_talk && !reading.talker &&
+			    ncc <= COHERE_BAR && share <= COHERE_SHARE_MAX)
+				run++;
+			else
+				run = 0;
+			if (run > r->run_max)
+				r->run_max = run;
+		}
+		if (digit >= 0) {
+			unsigned in = (tf + 1u - TONE_DIGIT_FROM) %
+				      TONE_DIGIT_PERIOD;
+
+			if (in >= 2u && in + 1u < TONE_DIGIT_ON) {
+				double lo = 10.0 * log10(
+					tone_bin_get(out, frame,
+						     row[digit % 4], rate) /
+					tone_bin_get(near, frame,
+						     row[digit % 4], rate));
+				double hi = 10.0 * log10(
+					tone_bin_get(out, frame,
+						     col[digit / 4 % 4],
+						     rate) /
+					tone_bin_get(near, frame,
+						     col[digit / 4 % 4],
+						     rate));
+
+				if (lo < r->worst_db)
+					r->worst_db = lo;
+				if (hi < r->worst_db)
+					r->worst_db = hi;
+				r->digits++;
+			}
+		}
+	}
+	udsp_ec_nlms.destroy(ec);
+}
+
+/*
+ * A near DTMF digit over a far dial tone starts no coherence trial, and digits
+ * pass within TONE_LOSS_DB. The rebuilt readings reach a run of COHERE_FRAMES,
+ * but a tonal frame of that run at LEC_COHERE_TONE_SHARE or more starts it over
+ * first.
+ */
+static void cohere_tone_test(unsigned rate)
+{
+	struct tone_result r;
+
+	tone_line_run(rate, &r);
+	case_rate(rate, "lec coherence escape starts no trial on near DTMF "
+		  "over a far dial tone");
+	printf("# coherence trials %u, longest run of the readings %u, "
+	       "%u digit frames, worst digit tone %.2f dB through the "
+	       "canceller\n", r.arms, r.run_max, r.digits, r.worst_db);
+	CHECK_UINT(r.arms, 0);
+	CHECK(r.digits > 0u);
+	CHECK(r.worst_db >= -TONE_LOSS_DB);
+	CHECK(r.run_max >= COHERE_FRAMES);
+}
+
+/* A near tone NEAR_TONE_OVER_DB over the echo of the composite source, over the
+ * composite hybrid at CHANGE_ERL_DB. */
+#define NEAR_TONE_HZ		1004.0
+#define NEAR_TONE_OVER_DB	12.0
+#define NEAR_TONE_FRAMES	(4u * FRAMES_PER_SECOND)
+
+/* A near tone at 1004 Hz, 12 dB over the echo, over a far broadband source
+ * starts no coherence trial. The reference stays broadband, so the tonal bound
+ * does not act, and the readings stay under the run on their own. */
+static void cohere_near_tone_test(unsigned rate)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct cohere_line l;
+	struct echo_path path;
+	double echo_energy = 0.0;
+	double out_energy = 0.0;
+	unsigned long phase = 0;
+	unsigned arms = 0;
+	unsigned run = 0;
+	unsigned run_max = 0;
+	unsigned f;
+
+	path_composite_init(&path, rate, CHANGE_ERL_DB);
+	cohere_line_begin(&l, rate, &path, 0u, true, 0u);
+	for (f = 0; f < NEAR_TONE_FRAMES; f++) {
+		int16_t near[UDSP_FRAME_MAX];
+		double ncc;
+		double share;
+
+		tone_fill(near, l.frame, CHANGE_ECHO_DBM0 + NEAR_TONE_OVER_DB,
+			  NEAR_TONE_HZ, &phase, rate);
+		cohere_frame_run(&l, near, &echo_energy, &out_energy,
+				 &reading, &info);
+		if (reading.trial_arm == UDSP_EC_NLMS_TRIAL_ARM_COHERE)
+			arms++;
+		ncc = cohere_view_ncc_get(&l.view);
+		share = cohere_view_share_get(&l.view);
+		if (reading.ref_power >= reading.ref_bar) {
+			if (info.double_talk && !reading.talker &&
+			    ncc <= COHERE_BAR && share <= COHERE_SHARE_MAX)
+				run++;
+			else
+				run = 0;
+			if (run > run_max)
+				run_max = run;
+		}
+	}
+	udsp_ec_nlms.destroy(l.ec);
+	case_rate(rate, "lec coherence escape starts no trial on a near tone "
+		  "over a far broadband source");
+	printf("# coherence trials %u, longest run of the readings %u\n",
+	       arms, run_max);
+	CHECK_UINT(arms, 0);
+	CHECK(run_max < COHERE_FRAMES);
+}
+
+/* G.168 tests 2A, 2B and 12 on the bench schedule, the processor off: the
+ * composite source or white noise at -10 dBm0 through m1. It changes to m4 or
+ * m6 at 6 dB, or m7 or m8 at 12 dB, over Table D.1a's least ERL. */
+#define PHASE2_FAR_DBM0		-10.0
+#define PHASE2_LOSS_HALF_DB	18u
+#define PHASE2_HISS_DBM0	-73.0
+#define PHASE2_DELAY_MS		32u
+#define PHASE2_DELTA_ERL_DB	10.0
+#define PHASE2_CONVERGE_FRAMES	(6u * FRAMES_PER_SECOND)
+#define PHASE2_FRAMES		(10u * FRAMES_PER_SECOND)
+/* The window of the 1 s anchor of G.168 Figures 10b and 12b: one CSS period
+ * of 0.7 s from 1 s after the change. */
+#define PHASE2_ANCHOR_FRAMES	FRAMES_PER_SECOND
+#define PHASE2_WINDOW_FRAMES	70u
+#define PHASE2_STEADY_FRAMES	(3u * FRAMES_PER_SECOND)
+#define PHASE2_BLOCK_FRAMES	10u
+#define PHASE2_SETTLED_DB	20.0
+#define PHASE2_DEEP_DB		30.0
+#define PHASE2_MODELS		4u
+
+static const enum annex_d_model phase2_models[PHASE2_MODELS] = {
+	ANNEX_D_M4, ANNEX_D_M6, ANNEX_D_M7, ANNEX_D_M8,
+};
+static const double phase2_erl_db[PHASE2_MODELS] = { 6.0, 6.0, 12.0, 12.0 };
+
+/*
+ * The figures of one change: the ERLE at the 1 s anchor and over the last
+ * PHASE2_STEADY_FRAMES, and the excess over the line noise. Then the frames to
+ * the first block at PHASE2_SETTLED_DB and PHASE2_DEEP_DB. Last, the first
+ * trial, its arm and end, and the trials and resets after the change.
+ */
+struct phase2_result {
+	double erle_db;
+	double steady_db;
+	double excess_db;
+	unsigned settled;
+	unsigned deep;
+	unsigned start;
+	unsigned arm;
+	unsigned end;
+	unsigned trials;
+	unsigned resets;
+};
+
+struct phase2_sums {
+	double echo;
+	double out;
+	double excess;
+	double hiss;
+};
+
+static void phase2_frame_run(struct udsp_ec *ec, struct echo_path *path,
+			     uint32_t state[2], unsigned long *phase,
+			     double hiss_dbm0, bool css,
+			     struct phase2_sums *sum)
+{
+	int16_t far[UDSP_FRAME_MAX];
+	int16_t ref[UDSP_FRAME_MAX];
+	int16_t echo[UDSP_FRAME_MAX];
+	int16_t hiss[UDSP_FRAME_MAX];
+	int16_t mic[UDSP_FRAME_MAX];
+	unsigned i;
+
+	if (css)
+		css_fill(far, path->frame, PHASE2_FAR_DBM0, &state[0], phase,
+			 path->frame * 100u);
+	else
+		noise_fill(far, path->frame, PHASE2_FAR_DBM0, &state[0]);
+	level_loss_apply(ref, far, path->frame, PHASE2_LOSS_HALF_DB);
+	path_run(path, far, echo);
+	noise_fill(hiss, path->frame, hiss_dbm0, &state[1]);
+	for (i = 0; i < path->frame; i++)
+		mic[i] = sample_clamp((double)echo[i] + hiss[i]);
+	udsp_ec_nlms.run(ec, mic, ref);
+	for (i = 0; i < path->frame; i++) {
+		double left = (double)mic[i] - hiss[i];
+
+		sum->echo += (double)echo[i] * echo[i];
+		sum->out += (double)mic[i] * mic[i];
+		sum->excess += left * left;
+		sum->hiss += (double)hiss[i] * hiss[i];
+	}
+}
+
+static double phase2_db_get(double num, double den)
+{
+	return den > 0.0 ? 10.0 * log10(num / den) : 200.0;
+}
+
+/* The change from m1 at to_erl_db plus PHASE2_DELTA_ERL_DB to the path to,
+ * on a line noise at hiss_dbm0. */
+static void phase2_path_run(unsigned rate, const struct echo_path *to,
+			    double to_erl_db, double hiss_dbm0, bool css,
+			    struct phase2_result *r)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct phase2_sums window = { 0 };
+	struct phase2_sums steady = { 0 };
+	struct phase2_sums block = { 0 };
+	struct phase2_sums lead = { 0 };
+	struct echo_path path;
+	struct echo_path next;
+	struct udsp_ec *ec = udsp_ec_nlms.create_rate(0, rate);
+	uint32_t state[2] = { 0x2a5e1c0du, 0x51ab0dd5u };
+	unsigned long phase = 0;
+	uint32_t probes;
+	unsigned f;
+
+	memset(r, 0, sizeof(*r));
+	udsp_ec_nlms.nlp(ec, false);
+	udsp_ec_nlms_ref_loss_set(ec, PHASE2_LOSS_HALF_DB);
+	path_annex_d_init(&path, rate, ANNEX_D_M1,
+			  to_erl_db + PHASE2_DELTA_ERL_DB, PHASE2_DELAY_MS);
+	for (f = 0; f < PHASE2_CONVERGE_FRAMES; f++)
+		phase2_frame_run(ec, &path, state, &phase, hiss_dbm0, css,
+				 &lead);
+	udsp_ec_nlms_info_get(ec, &info);
+	probes = info.probes;
+	r->resets = info.diverge_resets;
+	next = *to;
+	path_history_carry(&next, &path);
+	for (f = 1; f <= PHASE2_FRAMES; f++) {
+		phase2_frame_run(ec, &next, state, &phase, hiss_dbm0, css,
+				 &block);
+		udsp_ec_nlms_frame_get(ec, &reading);
+		if (!r->start &&
+		    reading.trial_arm != UDSP_EC_NLMS_TRIAL_ARM_NONE) {
+			r->start = f;
+			r->arm = reading.trial_arm;
+		}
+		if (r->start && !r->end &&
+		    reading.trial_end != UDSP_EC_NLMS_TRIAL_END_NONE)
+			r->end = f;
+		if (f % PHASE2_BLOCK_FRAMES)
+			continue;
+		if (f > PHASE2_ANCHOR_FRAMES &&
+		    f <= PHASE2_ANCHOR_FRAMES + PHASE2_WINDOW_FRAMES) {
+			window.echo += block.echo;
+			window.out += block.out;
+		}
+		if (f > PHASE2_FRAMES - PHASE2_STEADY_FRAMES) {
+			steady.echo += block.echo;
+			steady.out += block.out;
+			steady.excess += block.excess;
+			steady.hiss += block.hiss;
+		}
+		if (!r->settled &&
+		    phase2_db_get(block.echo, block.out) >= PHASE2_SETTLED_DB)
+			r->settled = f;
+		if (!r->deep &&
+		    phase2_db_get(block.echo, block.out) >= PHASE2_DEEP_DB)
+			r->deep = f;
+		memset(&block, 0, sizeof(block));
+	}
+	udsp_ec_nlms_info_get(ec, &info);
+	r->trials = info.probes - probes;
+	r->resets = info.diverge_resets - r->resets;
+	r->erle_db = phase2_db_get(window.echo, window.out);
+	r->steady_db = phase2_db_get(steady.echo, steady.out);
+	r->excess_db = phase2_db_get(steady.excess, steady.hiss);
+	udsp_ec_nlms.destroy(ec);
+}
+
+static void phase2_print(unsigned rate, const char *what,
+			 const struct phase2_result *r)
+{
+	printf("# %u Hz, %s: %.2f dB of ERLE at 1 s, %.2f dB at 7 to 10 s, "
+	       "excess %.2f dB relative to the line noise; 20 dB on frame %u, "
+	       "30 dB on frame %u; trial of arm %s on frame %u, ended on "
+	       "frame %u; %u trials, %u resets\n", rate, what, r->erle_db,
+	       r->steady_db, r->excess_db, r->settled, r->deep,
+	       lecr_trial_arm_name(r->arm), r->start, r->end, r->trials,
+	       r->resets);
+}
+
+/* The bound of phase2_test on the composite source, which a trial on the plain
+ * step stays under. */
+#define PHASE2_ERLE_DB		11.0
+
+/*
+ * The change of G.168 tests 2A, 2B and 12 on each model, at both rates. On
+ * the composite source each change must read PHASE2_ERLE_DB of ERLE or more
+ * at 1 s, with no reset. The white-noise legs print their figures.
+ */
+static void phase2_test(unsigned rate)
+{
+	unsigned i;
+
+	case_rate(rate, "lec reconverges on the Annex D path changes of G.168 "
+		  "test 2 within 1 s");
+	for (i = 0; i < 2u * PHASE2_MODELS; i++) {
+		struct phase2_result r;
+		struct echo_path to;
+		unsigned m = i % PHASE2_MODELS;
+		char what[64];
+
+		path_annex_d_init(&to, rate, phase2_models[m], phase2_erl_db[m],
+				  PHASE2_DELAY_MS);
+		phase2_path_run(rate, &to, phase2_erl_db[m], PHASE2_HISS_DBM0,
+				i >= PHASE2_MODELS, &r);
+		snprintf(what, sizeof(what), "%s, %s",
+			 annex_d_tables[phase2_models[m]].name,
+			 i >= PHASE2_MODELS ? "composite source" :
+			 "white noise");
+		phase2_print(rate, what, &r);
+		CHECK_UINT(r.resets, 0);
+		if (i >= PHASE2_MODELS)
+			CHECK(r.erle_db >= PHASE2_ERLE_DB);
+	}
+}
+
+/* The dense path: two reflections 20 ms apart, the second at DENSE_SECOND of
+ * the first. A tail from 4 to 44 ms at DENSE_TAIL follows, with the white-noise
+ * ERL of the change. */
+#define DENSE_SECOND		0.8
+#define DENSE_TAIL		0.25
+#define DENSE_TAIL_MS		12.0
+/*
+ * The frames to 30 dB of ERLE on the dense path with the plain step of an
+ * escape trial. They cover 8 and 16 kHz, white noise and the composite source.
+ * The change must reach 30 dB within DENSE_DEEP_SLACK of them.
+ */
+#define DENSE_DEEP_SLACK	1.1
+
+static const unsigned dense_plain_deep[2][2] = {
+	{ 120u, 210u },
+	{ 140u, 260u },
+};
+
+static void path_dense_init(struct echo_path *path, unsigned rate,
+			    double erl_db)
+{
+	double per_ms = (double)rate / 1000.0;
+	unsigned first = path_samples_get(4.0, rate);
+	unsigned second = path_samples_get(24.0, rate);
+	unsigned span = path_samples_get(8.0, rate);
+	unsigned k;
+
+	path_geometry_set(path, rate);
+	path->taps = path_samples_get(44.0, rate);
+	for (k = first; k < path->taps; k++) {
+		double t = (double)(k - first);
+
+		path->h[k] = (float)(DENSE_TAIL * exp(-t / (DENSE_TAIL_MS *
+							    per_ms)) *
+				     sin(2.0 * M_PI * 450.0 * t / rate));
+		if (k < first + span)
+			path->h[k] += (float)(exp(-t / (1.75 * per_ms)) *
+					      sin(5.6 / per_ms * t));
+		if (k >= second && k < second + span)
+			path->h[k] += (float)(DENSE_SECOND *
+					      exp(-(double)(k - second) /
+						  (1.75 * per_ms)) *
+					      sin(5.6 / per_ms *
+						  (double)(k - second)));
+	}
+	path_erl_set(path, erl_db);
+}
+
+/*
+ * A change to the dense path, 10 dB louder than m1, in the blocks that the
+ * filter of m1 does not hold. On both sources its output must reach 30 dB of
+ * ERLE within DENSE_DEEP_SLACK of the frames of the plain step
+ * (dense_plain_deep), with no reset.
+ */
+static void dense_change_test(unsigned rate)
+{
+	const unsigned *plain = dense_plain_deep[rate == UDSP_SAMPLE_RATE_WB];
+	struct phase2_result r;
+	struct echo_path to;
+	unsigned css;
+
+	path_dense_init(&to, rate, 6.0);
+	case_rate(rate, "lec reconverges on a dense path after a change");
+	for (css = 0; css < 2u; css++) {
+		phase2_path_run(rate, &to, 6.0, PHASE2_HISS_DBM0, css, &r);
+		phase2_print(rate, css ? "dense path, composite source" :
+			     "dense path, white noise", &r);
+		CHECK_UINT(r.resets, 0);
+		CHECK(r.deep > 0u);
+		CHECK(r.deep <= DENSE_DEEP_SLACK * plain[css]);
+	}
+}
+
+/* The line noise of misadjust_test, over the echo that a converged filter
+ * leaves, and the slack of the excess over it; misadjust_plain_db holds the
+ * excess of the plain step. */
+#define MISADJUST_HISS_DBM0	-45.0
+#define MISADJUST_SLACK_DB	1.0
+
+static const double misadjust_plain_db[2] = { -9.28, -8.40 };
+
+/*
+ * The misadjustment line: the change to m4 on white noise, with a line noise
+ * of MISADJUST_HISS_DBM0. Over the last 3 s the excess relative to the line
+ * noise must stand within MISADJUST_SLACK_DB of that of the plain step,
+ * misadjust_plain_db.
+ */
+static void misadjust_test(unsigned rate)
+{
+	struct phase2_result r;
+	struct echo_path to;
+
+	path_annex_d_init(&to, rate, ANNEX_D_M4, 6.0, PHASE2_DELAY_MS);
+	phase2_path_run(rate, &to, 6.0, MISADJUST_HISS_DBM0, false, &r);
+	case_rate(rate, "lec adds no misadjustment on a converged line after a "
+		  "change");
+	phase2_print(rate, "m4 on a noisy line, white noise", &r);
+	CHECK_UINT(r.resets, 0);
+	CHECK(r.excess_db <= misadjust_plain_db[rate == UDSP_SAMPLE_RATE_WB] +
+			     MISADJUST_SLACK_DB);
+}
+
+/*
+ * Phase I of G.168 tests 2A and 12, with the processor on: the filter converges
+ * from zero on m1 at the change's ERL plus PHASE2_DELTA_ERL_DB. The meter is
+ * the PHASE1_METER_MS one-pole of G.168 clause 6.4.1.2.1 without its weighting.
+ */
+#define PHASE1_FRAMES		(6u * FRAMES_PER_SECOND)
+#define PHASE1_METER_MS		35.0
+#define PHASE1_LINES		2u
+
+static const double phase1_erl_db[PHASE1_LINES] = { 16.0, 22.0 };
+
+/* The bound of phase1_test on css_annex_fill: 1.5 dB under the -63.5 dBm0 that
+ * G.168 Figure 9 allows at an active level of -10 dBm0. */
+#define PHASE1_LRET_DBM0	-65.0
+
+/* l_ret_dbm0 is the loudest meter reading from 1 s on, first_act the first act
+ * of the processor. */
+struct phase1_result {
+	double l_ret_dbm0;
+	unsigned first_act;
+};
+
+/* One frame of the line of phase1_line_run. near, when set, adds a near
+ * talker to the microphone, and out takes the output. */
+static void phase1_frame_run(struct udsp_ec *ec, struct echo_path *path,
+			     struct css_annex *css, uint32_t state[2],
+			     const int16_t *near, int16_t *out)
+{
+	int16_t far[UDSP_FRAME_MAX];
+	int16_t ref[UDSP_FRAME_MAX];
+	int16_t echo[UDSP_FRAME_MAX];
+	int16_t hiss[UDSP_FRAME_MAX];
+	unsigned i;
+
+	if (css)
+		css_annex_fill(far, path->frame, css);
+	else
+		noise_fill(far, path->frame, PHASE2_FAR_DBM0, &state[0]);
+	level_loss_apply(ref, far, path->frame, PHASE2_LOSS_HALF_DB);
+	path_run(path, far, echo);
+	noise_fill(hiss, path->frame, PHASE2_HISS_DBM0, &state[1]);
+	for (i = 0; i < path->frame; i++)
+		out[i] = sample_clamp((double)echo[i] + hiss[i] +
+				      (near ? near[i] : 0));
+	udsp_ec_nlms.run(ec, out, ref);
+}
+
+static void phase1_line_run(unsigned rate, double erl_db, bool use_css,
+			    struct phase1_result *r)
+{
+	struct udsp_ec_nlms_info info;
+	struct css_annex css;
+	struct echo_path path;
+	struct udsp_ec *ec = udsp_ec_nlms.create_rate(0, rate);
+	uint32_t state[2] = { 0x2a5e1c0du, 0x51ab0dd5u };
+	unsigned long from = rate + path_samples_get(PHASE2_DELAY_MS, rate);
+	double a = exp(-1000.0 / (PHASE1_METER_MS * rate));
+	double meter = 0.0;
+	double loudest = 0.0;
+	int16_t out[UDSP_FRAME_MAX];
+	unsigned f;
+	unsigned i;
+
+	memset(r, 0, sizeof(*r));
+	css_annex_init(&css, rate, PHASE2_FAR_DBM0, 0x0c55a11eu);
+	udsp_ec_nlms_ref_loss_set(ec, PHASE2_LOSS_HALF_DB);
+	path_annex_d_init(&path, rate, ANNEX_D_M1, erl_db, PHASE2_DELAY_MS);
+	for (f = 0; f < PHASE1_FRAMES; f++) {
+		phase1_frame_run(ec, &path, use_css ? &css : NULL, state, NULL,
+				 out);
+		udsp_ec_nlms_info_get(ec, &info);
+		if (!r->first_act && info.nlp_active)
+			r->first_act = f + 1u;
+		for (i = 0; i < path.frame; i++) {
+			meter = a * meter + (1.0 - a) * out[i] * out[i];
+			if ((unsigned long)f * path.frame + i >= from &&
+			    meter > loudest)
+				loudest = meter;
+		}
+	}
+	r->l_ret_dbm0 = rms_dbm0_get(sqrt(loudest));
+	udsp_ec_nlms.destroy(ec);
+}
+
+/*
+ * The steady state of Phase I against G.168 Figure 9, at both rates. On the
+ * source of css_annex_fill each line must read PHASE1_LRET_DBM0 or less.
+ * The white-noise legs print their figures.
+ */
+static void phase1_test(unsigned rate)
+{
+	unsigned i;
+
+	case_rate(rate, "lec processor holds the converging line of G.168 "
+		  "test 2 under the limit of Figure 9");
+	for (i = 0; i < 2u * PHASE1_LINES; i++) {
+		struct phase1_result r;
+		double erl_db = phase1_erl_db[i % PHASE1_LINES];
+		bool use_css = i >= PHASE1_LINES;
+
+		phase1_line_run(rate, erl_db, use_css, &r);
+		printf("# %u Hz, m1 at %.0f dB, %s: l_ret %.1f dBm0 from 1 s, "
+		       "first act on frame %u\n", rate, erl_db,
+		       use_css ? "CSS structure" : "white noise", r.l_ret_dbm0,
+		       r.first_act);
+		if (use_css)
+			CHECK(r.l_ret_dbm0 <= PHASE1_LRET_DBM0);
+	}
+}
+
+/* LEC_NLP_BOOT_FRAMES of dsp/lec.c: the active frames of the bootstrap. */
+#define NEAR_START_BOOT_FRAMES	150u
+
+/* The line of nlp_boot_near_start_test: m1 at 16 dB, the echo at -26 dBm0, and
+ * a dense talker at NEAR_START_DBM0 through the bootstrap. The detector does
+ * not fire on it, so the combined-loss arm decides its echo-like frames. */
+#define NEAR_START_ERL_DB	16.0
+#define NEAR_START_DBM0		-39.0
+#define NEAR_START_FRAMES	250u
+#define NEAR_START_SETTLE_FRAMES	(4u * FRAMES_PER_SECOND)
+#define NEAR_START_RUN_FRAMES	(8u * FRAMES_PER_SECOND)
+#define NEAR_START_TAKE_DB	0.5
+#define NEAR_START_NEW_TAKE_DB	1.0
+#define NEAR_START_SEED		0x0badcafeu
+
+/*
+ * One leg: the talker's energy and the output against it over its frames, and
+ * the frames that fire the detector and those that the processor acts on. Then
+ * the bootstrap's last active frame and the loudest meter reading from 1 s
+ * after the talker.
+ */
+struct near_start_result {
+	double near;
+	double product;
+	unsigned frames;
+	unsigned fired;
+	unsigned acted;
+	unsigned boot_frame;
+	double l_ret_dbm0;
+};
+
+/* The talker frame of a leg: the frame of the dense talker, or silence
+ * after NEAR_START_FRAMES. Returns whether the frame carries the talker. */
+static bool near_start_fill(struct dense_talker *talker, int16_t *near,
+			    unsigned frame, unsigned f)
+{
+	unsigned i;
+
+	memset(near, 0, frame * sizeof(*near));
+	if (f >= NEAR_START_FRAMES)
+		return false;
+	dense_talker_fill(talker, near, frame);
+	for (i = 0; i < frame; i++)
+		if (near[i])
+			return true;
+	return false;
+}
+
+static void near_start_leg_run(unsigned rate, bool reset, bool nlp,
+			       uint32_t seed, struct near_start_result *r)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct dense_talker talker;
+	struct css_annex css;
+	struct echo_path path;
+	struct udsp_ec *ec = udsp_ec_nlms.create_rate(0, rate);
+	uint32_t state[2] = { 0x2a5e1c0du, 0x51ab0dd5u };
+	double a = exp(-1000.0 / (PHASE1_METER_MS * rate));
+	double meter = 0.0;
+	double loudest = 0.0;
+	int16_t near[UDSP_FRAME_MAX];
+	int16_t out[UDSP_FRAME_MAX];
+	unsigned active = 0;
+	unsigned f;
+	unsigned i;
+
+	memset(r, 0, sizeof(*r));
+	css_annex_init(&css, rate, PHASE2_FAR_DBM0, 0x0c55a11eu);
+	dense_talker_init(&talker, rate, NEAR_START_DBM0, seed);
+	udsp_ec_nlms_ref_loss_set(ec, PHASE2_LOSS_HALF_DB);
+	udsp_ec_nlms.nlp(ec, nlp);
+	path_annex_d_init(&path, rate, ANNEX_D_M1, NEAR_START_ERL_DB,
+			  PHASE2_DELAY_MS);
+	for (f = 0; reset && f < NEAR_START_SETTLE_FRAMES; f++)
+		phase1_frame_run(ec, &path, &css, state, NULL, out);
+	if (reset)
+		udsp_ec_nlms_reset(ec);
+	for (f = 0; f < NEAR_START_RUN_FRAMES; f++) {
+		bool talking = near_start_fill(&talker, near, path.frame, f);
+
+		phase1_frame_run(ec, &path, &css, state, near, out);
+		udsp_ec_nlms_info_get(ec, &info);
+		udsp_ec_nlms_frame_get(ec, &reading);
+		if (reading.ref_power >= reading.ref_bar &&
+		    ++active == NEAR_START_BOOT_FRAMES)
+			r->boot_frame = f + 1u;
+		r->frames += talking;
+		r->fired += talking && reading.dt_fired;
+		r->acted += talking && info.nlp_active;
+		for (i = 0; talking && i < path.frame; i++) {
+			r->near += (double)near[i] * near[i];
+			r->product += (double)out[i] * near[i];
+		}
+		for (i = 0; i < path.frame; i++) {
+			meter = a * meter + (1.0 - a) * out[i] * out[i];
+			if (f >= NEAR_START_FRAMES + FRAMES_PER_SECOND &&
+			    meter > loudest)
+				loudest = meter;
+		}
+	}
+	r->l_ret_dbm0 = rms_dbm0_get(sqrt(loudest));
+	udsp_ec_nlms.destroy(ec);
+}
+
+/*
+ * A quiet near talker at the start of the line, in the bootstrap: from NEW and
+ * after a reset, with the processor on and off. The processor takes at most
+ * NEAR_START_NEW_TAKE_DB from NEW and NEAR_START_TAKE_DB after the reset. The
+ * meter reads PHASE1_LRET_DBM0 or less from 1 s after the talker.
+ */
+static void nlp_boot_near_start_test(unsigned rate)
+{
+	unsigned leg;
+
+	case_rate(rate, "lec nlp keeps a quiet near talker in the bootstrap of "
+		  "the combined-loss arm and after a reset");
+	for (leg = 0; leg < 2u; leg++) {
+		struct near_start_result on;
+		struct near_start_result off;
+		double take_db;
+
+		near_start_leg_run(rate, leg == 1u, true, NEAR_START_SEED, &on);
+		near_start_leg_run(rate, leg == 1u, false, NEAR_START_SEED,
+				   &off);
+		take_db = near_gain_db_get(off.product, off.near) -
+			  near_gain_db_get(on.product, on.near);
+		printf("# %u Hz, %s: talker at %.0f dBm0 on %u frames, %u "
+		       "fire the detector, the bootstrap ends on frame %u; "
+		       "%.2f dB through, filter alone %.2f dB, the processor "
+		       "takes %.2f dB and acts on %u of its frames; l_ret "
+		       "%.1f dBm0 from 1 s after the talker\n", rate,
+		       leg ? "after a reset" : "from NEW", NEAR_START_DBM0,
+		       on.frames, on.fired, on.boot_frame,
+		       near_gain_db_get(on.product, on.near),
+		       near_gain_db_get(off.product, off.near), take_db,
+		       on.acted, on.l_ret_dbm0);
+		CHECK(on.boot_frame > 0u && on.boot_frame <= NEAR_START_FRAMES);
+		CHECK(take_db <= (leg ? NEAR_START_TAKE_DB :
+					NEAR_START_NEW_TAKE_DB));
+		CHECK(on.l_ret_dbm0 <= PHASE1_LRET_DBM0);
+	}
+}
+
+/* The talker seeds of nlp_boot_seeds_test: NEAR_SEEDS seeds after
+ * NEAR_START_SEED, each NEAR_SEED_STEP after the one before. */
+#define NEAR_SEEDS		3u
+#define NEAR_SEED_STEP		0x9e3779b9u
+
+/* The leg from NEW of nlp_boot_near_start_test on NEAR_SEEDS other seeds: on
+ * each the processor takes NEAR_START_NEW_TAKE_DB or less and l_ret_dbm0 reads
+ * PHASE1_LRET_DBM0 or less. */
+static void nlp_boot_seeds_test(unsigned rate)
+{
+	unsigned k;
+
+	case_rate(rate, "lec nlp keeps quiet near talkers of other seeds in "
+		  "the bootstrap of the combined-loss arm");
+	for (k = 1u; k <= NEAR_SEEDS; k++) {
+		uint32_t seed = NEAR_START_SEED + k * NEAR_SEED_STEP;
+		struct near_start_result on;
+		struct near_start_result off;
+		double take_db;
+
+		near_start_leg_run(rate, false, true, seed, &on);
+		near_start_leg_run(rate, false, false, seed, &off);
+		take_db = near_gain_db_get(off.product, off.near) -
+			  near_gain_db_get(on.product, on.near);
+		printf("# %u Hz, talker seed %u: the processor takes %.2f dB "
+		       "and acts on %u of its %u frames; l_ret %.1f dBm0 from "
+		       "1 s after the talker\n", rate, k, take_db, on.acted,
+		       on.frames, on.l_ret_dbm0);
+		CHECK(take_db <= NEAR_START_NEW_TAKE_DB);
+		CHECK(on.l_ret_dbm0 <= PHASE1_LRET_DBM0);
+	}
+}
+
+/* G.168 test 9A on the bench schedule: white far noise through m1, near noise
+ * steps with the far end off then on, and an uncancellable cubic term. After
+ * the far return the output stands within CN9A_TOL_DB of l_sgen. */
+#define CN9A_FAR_DBM0		-10.0
+#define CN9A_ERL_DB		12.0
+#define CN9A_CUBIC		1.0
+#define CN9A_WARMUP_FRAMES	560u
+#define CN9A_QUIET_FRAMES	(3u * FRAMES_PER_SECOND)
+#define CN9A_ON_FRAMES		(5u * FRAMES_PER_SECOND)
+#define CN9A_SKIP_FRAMES	FRAMES_PER_SECOND
+#define CN9A_SETTLE_FRAMES	(2u * FRAMES_PER_SECOND + 4u)
+#define CN9A_WINDOW_FRAMES	70u
+#define CN9A_TOL_DB		2.0
+
+#define CN9A_LEVELS		4u
+
+static const double cn9a_levels[CN9A_LEVELS] = { -45.0, -50.0, -55.0, -60.0 };
+
+struct cn9a_line {
+	struct udsp_ec *ec;
+	struct echo_path path;
+	struct room_noise near;
+	struct udsp_resamp up_far;
+	struct udsp_resamp up_near;
+	struct udsp_resamp down;
+	uint32_t far_state;
+	unsigned rate;
+	int16_t out[UDSP_FRAME_MAX];
+};
+
+/* The errors of one step: the least and the most window error, in dB. */
+struct cn9a_step {
+	double l_sgen_dbm0;
+	double low_db;
+	double high_db;
+	float floor_dbov;
+};
+
+static void cn9a_line_init(struct cn9a_line *l, unsigned rate)
+{
+	memset(l, 0, sizeof(*l));
+	l->rate = rate;
+	l->far_state = 0x9a0f0a1du;
+	l->ec = udsp_ec_nlms.create_rate(0, rate);
+	udsp_ec_nlms_ref_loss_set(l->ec, PHASE2_LOSS_HALF_DB);
+	path_annex_d_init(&l->path, rate, ANNEX_D_M1, CN9A_ERL_DB,
+			  PHASE2_DELAY_MS);
+	l->path.cubic = CN9A_CUBIC;
+	udsp_resamp_reset(&l->up_far);
+	udsp_resamp_reset(&l->up_near);
+	udsp_resamp_reset(&l->down);
+}
+
+/*
+ * One frame of the line; returns the energy of its wire plane, and keeps the
+ * output of the canceller in l->out. Without near_on the near noise is zero
+ * at the line rate, so a stop of the near noise leaves no interpolator tail.
+ */
+static double cn9a_frame_run(struct cn9a_line *l, bool far_on, bool near_on)
+{
+	int16_t far8[UDSP_FRAME_SAMPLES];
+	int16_t near8[UDSP_FRAME_SAMPLES];
+	int16_t far[UDSP_FRAME_MAX];
+	int16_t near[UDSP_FRAME_MAX];
+	int16_t ref[UDSP_FRAME_MAX];
+	int16_t echo[UDSP_FRAME_MAX];
+	int16_t mic[UDSP_FRAME_MAX];
+	int16_t wire[UDSP_FRAME_SAMPLES];
+	unsigned n = l->path.frame;
+	double energy = 0.0;
+	unsigned i;
+
+	memset(far8, 0, sizeof(far8));
+	memset(near8, 0, sizeof(near8));
+	if (far_on)
+		noise_fill(far8, UDSP_FRAME_SAMPLES, CN9A_FAR_DBM0,
+			   &l->far_state);
+	if (near_on)
+		room_noise_fill(near8, UDSP_FRAME_SAMPLES, &l->near);
+	if (l->rate == UDSP_SAMPLE_RATE_WB) {
+		udsp_resamp_up2(&l->up_far, far8, UDSP_FRAME_SAMPLES, far);
+		memset(near, 0, sizeof(near));
+		if (near_on)
+			udsp_resamp_up2(&l->up_near, near8, UDSP_FRAME_SAMPLES,
+					near);
+	} else {
+		memcpy(far, far8, sizeof(far8));
+		memcpy(near, near8, sizeof(near8));
+	}
+	level_loss_apply(ref, far, n, PHASE2_LOSS_HALF_DB);
+	path_run(&l->path, far, echo);
+	for (i = 0; i < n; i++)
+		mic[i] = sample_clamp((double)echo[i] + near[i]);
+	udsp_ec_nlms.run(l->ec, mic, ref);
+	memcpy(l->out, mic, sizeof(mic[0]) * n);
+	if (l->rate == UDSP_SAMPLE_RATE_WB)
+		udsp_resamp_down2(&l->down, mic, n, wire);
+	else
+		memcpy(wire, mic, sizeof(wire));
+	for (i = 0; i < UDSP_FRAME_SAMPLES; i++)
+		energy += (double)wire[i] * wire[i];
+	return energy;
+}
+
+/* One step of near noise of kind at level_dbm0 on a converged line. */
+static void cn9a_step_run(struct cn9a_line *l, enum room_kind kind,
+			  double level_dbm0, uint32_t seed,
+			  struct cn9a_step *st)
+{
+	struct udsp_ec_nlms_info info;
+	double quiet = 0.0;
+	double window = 0.0;
+	unsigned f;
+
+	room_noise_init(&l->near, kind, level_dbm0, seed);
+	for (f = 0; f < CN9A_QUIET_FRAMES; f++) {
+		double e = cn9a_frame_run(l, false, true);
+
+		if (f >= CN9A_SKIP_FRAMES)
+			quiet += e;
+	}
+	st->l_sgen_dbm0 = energy_dbm0_get(quiet, (CN9A_QUIET_FRAMES -
+						  CN9A_SKIP_FRAMES) *
+						 UDSP_FRAME_SAMPLES);
+	st->low_db = INFINITY;
+	st->high_db = -INFINITY;
+	for (f = 0; f < CN9A_ON_FRAMES; f++) {
+		double e = cn9a_frame_run(l, true, true);
+		unsigned at;
+
+		if (f < CN9A_SETTLE_FRAMES)
+			continue;
+		at = f - CN9A_SETTLE_FRAMES;
+		if (at / CN9A_WINDOW_FRAMES >=
+		    (CN9A_ON_FRAMES - CN9A_SETTLE_FRAMES) / CN9A_WINDOW_FRAMES)
+			continue;
+		window += e;
+		if ((at + 1u) % CN9A_WINDOW_FRAMES == 0u) {
+			double err = energy_dbm0_get(window,
+						     CN9A_WINDOW_FRAMES *
+						     UDSP_FRAME_SAMPLES) -
+				     st->l_sgen_dbm0;
+
+			if (err < st->low_db)
+				st->low_db = err;
+			if (err > st->high_db)
+				st->high_db = err;
+			window = 0.0;
+		}
+	}
+	udsp_ec_nlms_info_get(l->ec, &info);
+	st->floor_dbov = info.noise_dbov;
+}
+
+static void cn9a_warmup_run(struct cn9a_line *l)
+{
+	unsigned f;
+
+	for (f = 0; f < CN9A_WARMUP_FRAMES; f++)
+		(void)cn9a_frame_run(l, true, false);
+}
+
+static void cn9a_print(unsigned rate, const char *kind, double level_dbm0,
+		       const struct cn9a_step *st)
+{
+	printf("# %u Hz, %s near noise at %.2f dBm0: l_sgen %.2f dBm0, "
+	       "windows %+.2f to %+.2f dB, floor %.2f dBov\n", rate, kind,
+	       level_dbm0, st->l_sgen_dbm0, st->low_db, st->high_db,
+	       (double)st->floor_dbov);
+}
+
+/*
+ * The comfort noise of the 9A line at both rates, on white and on
+ * Hoth-shaped near noise at each level of cn9a_levels. Every window must
+ * stand within CN9A_TOL_DB of l_sgen. The raise and the band of the fill
+ * (dsp/lec.c, LEC_CN_RAISE_DB) hold the windows there at 16 kHz.
+ */
+static void cn9a_test(unsigned rate)
+{
+	unsigned k;
+
+	for (k = 0; k < 2u; k++) {
+		enum room_kind kind = k ? ROOM_HOTH : ROOM_WHITE;
+		const char *name = k ? "Hoth-shaped" : "white";
+		struct cn9a_line l;
+		double low = INFINITY;
+		double high = -INFINITY;
+		unsigned i;
+
+		cn9a_line_init(&l, rate);
+		cn9a_warmup_run(&l);
+		if (k)
+			case_rate(rate, "lec comfort noise matches Hoth-shaped "
+				  "near noise of G.168 test 9A");
+		else
+			case_rate(rate, "lec comfort noise matches white near "
+				  "noise of G.168 test 9A");
+		for (i = 0; i < CN9A_LEVELS; i++) {
+			struct cn9a_step st;
+
+			cn9a_step_run(&l, kind, cn9a_levels[i],
+				      0x9a000000u + 16u * k + i, &st);
+			cn9a_print(rate, name, cn9a_levels[i], &st);
+			if (st.low_db < low)
+				low = st.low_db;
+			if (st.high_db > high)
+				high = st.high_db;
+		}
+		CHECK(low >= -CN9A_TOL_DB);
+		CHECK(high <= CN9A_TOL_DB);
+		udsp_ec_nlms.destroy(l.ec);
+	}
+}
+
+/*
+ * The levels of cn_quiet_test, CN_QUIET_STEP_DB apart so the fill's whole-dB
+ * step falls at four places, and the lowest level that the tracker reads. The
+ * fill rounds to a whole dB: CN_QUIET_BOUND_DB is LEC_CN_RAISE_DB plus 0.5 dB.
+ */
+#define CN_QUIET_DBM0		-70.0
+#define CN_QUIET_STEP_DB	0.25
+#define CN_QUIET_STEPS		4u
+#define CN_QUIET_LOW_DBM0	-80.0
+#define CN_QUIET_BOUND_DB	1.5
+
+/*
+ * The comfort noise of a quiet line at both rates: the 9A line with white
+ * near noise at each level of cn_quiet_test. White noise is the near noise
+ * of the least tracker bias, so its fill stands highest. Each window must
+ * stand at most CN_QUIET_BOUND_DB over l_sgen. The line must hold a measured
+ * floor at the lowest level.
+ */
+static void cn_quiet_test(unsigned rate)
+{
+	struct cn9a_line l;
+	struct cn9a_step st;
+	double high = -INFINITY;
+	unsigned i;
+
+	cn9a_line_init(&l, rate);
+	cn9a_warmup_run(&l);
+	case_rate(rate, "lec comfort noise stays near the noise of a quiet "
+		  "line");
+	for (i = 0; i <= CN_QUIET_STEPS; i++) {
+		double level = i < CN_QUIET_STEPS ?
+			       CN_QUIET_DBM0 - CN_QUIET_STEP_DB * i :
+			       CN_QUIET_LOW_DBM0;
+
+		cn9a_step_run(&l, ROOM_WHITE, level, 0x9b000000u + i, &st);
+		cn9a_print(rate, "white", level, &st);
+		if (st.high_db > high)
+			high = st.high_db;
+	}
+	CHECK(high <= CN_QUIET_BOUND_DB);
+	CHECK(st.floor_dbov < 127.0f);
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/*
+ * The near noise of cn_drop_test, the loudest level of cn9a_levels, and the
+ * length of its far phase. CN_DROP_TAIL_FRAMES bounds the frames from the
+ * stop of the far end to the release of the processor.
+ */
+#define CN_DROP_DBM0		-45.0
+#define CN_DROP_FAR_FRAMES	(2u * FRAMES_PER_SECOND)
+#define CN_DROP_TAIL_FRAMES	64u
+
+/* The frame before the release and the release frame of cn_drop_run. */
+struct cn_drop {
+	unsigned release;
+	bool acted;
+	int fill_dbov;
+	int res_dbov;
+	int out_dbov;
+};
+
+/* One frame of both lines of cn_drop_run; true when the processor acted. */
+static bool cn_drop_frame_run(struct cn9a_line *on, struct cn9a_line *off,
+			      bool far_on, bool near_on)
+{
+	struct udsp_ec_nlms_info info;
+
+	(void)cn9a_frame_run(on, far_on, near_on);
+	(void)cn9a_frame_run(off, far_on, near_on);
+	udsp_ec_nlms_info_get(on->ec, &info);
+	return info.nlp_active;
+}
+
+/*
+ * One run of cn_drop_test: the 9A line at 16 kHz with the processor on and a
+ * twin with it off, whose output is the residual. A 9A step runs, then the far
+ * end stops and the near noise runs on for stop frames. The release is the
+ * first frame after the stop with no act.
+ */
+static void cn_drop_run(unsigned stop, struct cn_drop *d)
+{
+	struct cn9a_line on;
+	struct cn9a_line off;
+	unsigned n;
+	unsigned f;
+
+	cn9a_line_init(&on, UDSP_SAMPLE_RATE_WB);
+	cn9a_line_init(&off, UDSP_SAMPLE_RATE_WB);
+	udsp_ec_nlms.nlp(off.ec, false);
+	cn9a_warmup_run(&on);
+	cn9a_warmup_run(&off);
+	room_noise_init(&on.near, ROOM_WHITE, CN_DROP_DBM0, 0x9c000000u);
+	room_noise_init(&off.near, ROOM_WHITE, CN_DROP_DBM0, 0x9c000000u);
+	n = on.path.frame;
+	memset(d, 0, sizeof(*d));
+	for (f = 0; f < CN9A_QUIET_FRAMES + CN_DROP_FAR_FRAMES; f++)
+		d->acted = cn_drop_frame_run(&on, &off,
+					     f >= CN9A_QUIET_FRAMES, true);
+	d->fill_dbov = udsp_cn_level_get(on.out, n);
+	for (f = 0; f < CN_DROP_TAIL_FRAMES; f++) {
+		if (!cn_drop_frame_run(&on, &off, false, f < stop))
+			break;
+		d->acted = true;
+		d->fill_dbov = udsp_cn_level_get(on.out, n);
+	}
+	d->release = f;
+	d->res_dbov = udsp_cn_level_get(off.out, n);
+	d->out_dbov = udsp_cn_level_get(on.out, n);
+	udsp_ec_nlms.destroy(on.ec);
+	udsp_ec_nlms.destroy(off.ec);
+}
+
+/*
+ * A fill at a loud floor followed by a silent request at 16 kHz. The near noise
+ * stops on the release frame, so the frame before is a fill at the near level.
+ * The release frame reads under 1 LSB, as the level applies after the
+ * interpolator (LEC_CN_DRAW_DBOV).
+ */
+static void cn_drop_test(void)
+{
+	struct cn_drop first;
+	struct cn_drop d;
+
+	case_rate(UDSP_SAMPLE_RATE_WB, "lec comfort noise goes silent with a "
+		  "silent request after a loud fill");
+	cn_drop_run(CN_DROP_TAIL_FRAMES, &first);
+	cn_drop_run(first.release, &d);
+	printf("# 16000 Hz: the processor releases %u frames after the far "
+	       "stop; fill %d dBov before it, release frame residual %d dBov "
+	       "and output %d dBov\n", d.release, d.fill_dbov, d.res_dbov,
+	       d.out_dbov);
+	CHECK_UINT(d.release, first.release);
+	CHECK(d.release < CN_DROP_TAIL_FRAMES);
+	CHECK(d.acted);
+	CHECK(fabs(d.fill_dbov - floor_dbov_get(CN_DROP_DBM0)) <= 2.0);
+	CHECK(d.res_dbov == 127);
+	CHECK(d.out_dbov == 127);
+}
+
+/* G.168 tests 3A and 3B on the bench schedule, the processor off: the source of
+ * css_annex_init through m1 and white line noise. The near source of
+ * css_annex_dt_init plays x_db under it from the echo onset. */
+#define DT_ERL_DB		6.0
+#define DT_HISS_DBM0		-64.6
+#define DT_LEAD_FRAMES		100u
+#define DT_PHASE_PCT		46u
+#define DT_PERIOD_FRAMES	70u
+#define DT_PERIODS		16u
+#define DT_PROBE_PERIODS	4u
+#define DT_CONVERGE_S		5.0
+/* G.168 clause 6.4.1.2: the active level of a CSS over its level, single
+ * talk and double talk. */
+#define DT_ACT_SINGLE_DB	1.49
+#define DT_ACT_DOUBLE_DB	1.66
+
+/* l_res_dbm0 is the residual meter from DT_CONVERGE_S on, worst_dbm0 its
+ * loudest reading over the double talk, held the frames that the detector
+ * holds. */
+struct dt_line_result {
+	double l_res_dbm0;
+	double worst_dbm0;
+	double l_sgen_act;
+	double l_rin_act;
+	unsigned trials;
+	unsigned resets;
+	unsigned held;
+};
+
+/* The phase of dt3a_test and dt3b_test: DT_PHASE_PCT of a frame, in
+ * samples. */
+static unsigned dt_phase_get(unsigned rate)
+{
+	return rate / 100u * DT_PHASE_PCT / 100u;
+}
+
+/* One sample of a source that plays on [from, to) of the line. */
+static int16_t dt_sample_get(struct css_annex *s, unsigned long n,
+			     unsigned long from, unsigned long to)
+{
+	int16_t v = 0;
+
+	if (n >= from && n < to)
+		css_annex_fill(&v, 1, s);
+	return v;
+}
+
+/* The figures of the line at far_dbm0 with a near end x_db under it. They
+ * follow converge periods of the far end alone. The far end starts phase
+ * samples into a frame. */
+static void dt_line_run(unsigned rate, double far_dbm0, double x_db,
+			unsigned converge, unsigned phase,
+			struct dt_line_result *r)
+{
+	struct udsp_ec_nlms_info info;
+	struct css_annex far_src;
+	struct css_annex near_src;
+	struct echo_path path;
+	struct udsp_ec *ec = udsp_ec_nlms.create_rate(0, rate);
+	uint32_t hiss_state = 0x51ab0dd5u;
+	unsigned frame = rate / 100u;
+	unsigned long period = (unsigned long)DT_PERIOD_FRAMES * frame;
+	unsigned long t0 = (unsigned long)DT_LEAD_FRAMES * frame + phase;
+	unsigned long dt0 = t0 + converge * period;
+	unsigned long dt1 = dt0 + DT_PERIODS * period;
+	unsigned long near_at = dt0 + path_samples_get(PHASE2_DELAY_MS, rate);
+	unsigned long near_end = dt1 + DT_PROBE_PERIODS * period;
+	unsigned long from = near_at + (unsigned long)(DT_CONVERGE_S * rate);
+	unsigned frames = (unsigned)(near_end / frame) + 1u;
+	double a = exp(-1000.0 / (PHASE1_METER_MS * rate));
+	double meter = 0.0;
+	double loudest = 0.0;
+	double worst = 0.0;
+	unsigned f;
+	unsigned i;
+
+	memset(r, 0, sizeof(*r));
+	r->l_rin_act = far_dbm0 + DT_ACT_SINGLE_DB;
+	r->l_sgen_act = r->l_rin_act - x_db;
+	css_annex_init(&far_src, rate, far_dbm0, 0x0c55a11eu);
+	css_annex_dt_init(&near_src, rate, r->l_sgen_act - DT_ACT_DOUBLE_DB,
+			  0x5eed0005u);
+	udsp_ec_nlms_ref_loss_set(ec, PHASE2_LOSS_HALF_DB);
+	udsp_ec_nlms.nlp(ec, false);
+	path_annex_d_init(&path, rate, ANNEX_D_M1, DT_ERL_DB, PHASE2_DELAY_MS);
+	for (f = 0; f < frames; f++) {
+		int16_t far[UDSP_FRAME_MAX];
+		int16_t ref[UDSP_FRAME_MAX];
+		int16_t echo[UDSP_FRAME_MAX];
+		int16_t hiss[UDSP_FRAME_MAX];
+		int16_t near[UDSP_FRAME_MAX];
+		int16_t mic[UDSP_FRAME_MAX];
+
+		for (i = 0; i < frame; i++) {
+			unsigned long n = (unsigned long)f * frame + i;
+
+			far[i] = dt_sample_get(&far_src, n, t0, dt1);
+			near[i] = dt_sample_get(&near_src, n, near_at,
+						near_end);
+		}
+		level_loss_apply(ref, far, frame, PHASE2_LOSS_HALF_DB);
+		path_run(&path, far, echo);
+		noise_fill(hiss, frame, DT_HISS_DBM0, &hiss_state);
+		for (i = 0; i < frame; i++)
+			mic[i] = sample_clamp((double)echo[i] + hiss[i] +
+					      near[i]);
+		udsp_ec_nlms.run(ec, mic, ref);
+		udsp_ec_nlms_info_get(ec, &info);
+		if ((unsigned long)f * frame >= dt0 &&
+		    (unsigned long)f * frame < dt1 && info.double_talk)
+			r->held++;
+		for (i = 0; i < frame; i++) {
+			unsigned long n = (unsigned long)f * frame + i;
+			double e = (double)mic[i] - near[i];
+
+			meter = a * meter + (1.0 - a) * e * e;
+			if (n >= from && n < dt1 && meter > loudest)
+				loudest = meter;
+			if (n >= near_at && n < dt1 && meter > worst)
+				worst = meter;
+		}
+	}
+	udsp_ec_nlms_info_get(ec, &info);
+	r->l_res_dbm0 = rms_dbm0_get(sqrt(loudest));
+	r->worst_dbm0 = rms_dbm0_get(sqrt(worst));
+	r->trials = info.probes;
+	r->resets = info.diverge_resets;
+	udsp_ec_nlms.destroy(ec);
+}
+
+static void dt_line_print(unsigned rate, const char *what,
+			  const struct dt_line_result *r)
+{
+	printf("# %u Hz, %s: l_res %.2f dBm0 from 5 s, %.2f dBm0 over the "
+	       "double talk, against L_Sgen,act %.2f dBm0; %u trials, %u "
+	       "resets\n", rate, what, r->l_res_dbm0, r->worst_dbm0,
+	       r->l_sgen_act, r->trials, r->resets);
+}
+
+/*
+ * G.168 test 3A at L_Rin -10 and -25 dBm0: the near end starts 15 dB under
+ * the far end with it, on a new instance. Each leg must read l_res_dbm0 at
+ * L_Sgen,act or under, the limit of the clause. Without the onset floor of
+ * dsp/lec.c (onset_floor_get), the -10 dBm0 line reads over that limit.
+ */
+static void dt3a_test(unsigned rate)
+{
+	struct dt_line_result r;
+
+	dt_line_run(rate, -10.0, 15.0, 0u, dt_phase_get(rate), &r);
+	case_rate(rate, "lec converges under double talk from the start of "
+		  "G.168 test 3A");
+	dt_line_print(rate, "test 3A at -10 dBm0", &r);
+	CHECK(r.l_res_dbm0 <= r.l_sgen_act);
+	dt_line_run(rate, -25.0, 15.0, 0u, dt_phase_get(rate), &r);
+	case_rate(rate, "lec keeps the residual of G.168 test 3A at -25 dBm0 "
+		  "under the limit");
+	dt_line_print(rate, "test 3A at -25 dBm0", &r);
+	CHECK(r.l_res_dbm0 <= r.l_sgen_act);
+}
+
+/* The phases of dt3a_phase_test as samples at 16 kHz: DT_THIN_SAMPLES_WB before
+ * a frame end for a thin onset. DT_TAIL_SAMPLES_WB into a frame sets the end of
+ * a burst, the tail-frame class. */
+#define DT_THIN_SAMPLES_WB	5u
+#define DT_TAIL_SAMPLES_WB	2u
+
+/* The bound of dt3a_phase_test on held: about twice what these lines hold with
+ * the short hangover on a thin frame. */
+#define DT_HELD_MAX		200u
+
+/* n samples at 16 kHz in samples at rate, rounded. */
+static unsigned dt_samples_get(unsigned n, unsigned rate)
+{
+	return (n * rate + UDSP_SAMPLE_RATE_WB / 2u) / UDSP_SAMPLE_RATE_WB;
+}
+
+/* The phase at which the far end of dt_line_run starts DT_THIN_SAMPLES_WB
+ * before a frame end. */
+static unsigned dt_thin_phase_get(unsigned rate)
+{
+	return rate / 100u - dt_samples_get(DT_THIN_SAMPLES_WB, rate);
+}
+
+/* The phase at which each far burst of dt_line_run, the voiced and the noise
+ * burst of css_annex_init, ends DT_TAIL_SAMPLES_WB into a frame. */
+static unsigned dt_tail_phase_get(unsigned rate)
+{
+	unsigned frame = rate / 100u;
+	unsigned burst = path_samples_get(CSS_ANNEX_VOICED_MS, rate) +
+			 path_samples_get(CSS_ANNEX_NOISE_MS, rate);
+
+	return (dt_samples_get(DT_TAIL_SAMPLES_WB, rate) + frame -
+		burst % frame) % frame;
+}
+
+/* G.168 test 3A at -10 dBm0 with a thin onset and a tail phase: each leg reads
+ * l_res_dbm0 at L_Sgen,act or under. It holds DT_HELD_MAX or fewer of the 1120
+ * frames of the double talk. */
+static void dt3a_phase_test(unsigned rate)
+{
+	struct dt_line_result r;
+	unsigned phase;
+
+	phase = dt_thin_phase_get(rate);
+	dt_line_run(rate, -10.0, 15.0, 0u, phase, &r);
+	case_rate(rate, "lec converges in G.168 test 3A with the far onset a "
+		  "few samples before a frame end");
+	printf("# %u Hz, far onset at sample %u of the frame: %u frames "
+	       "held\n", rate, phase, r.held);
+	dt_line_print(rate, "test 3A, thin onset", &r);
+	CHECK(r.l_res_dbm0 <= r.l_sgen_act);
+	CHECK(r.held <= DT_HELD_MAX);
+	phase = dt_tail_phase_get(rate);
+	dt_line_run(rate, -10.0, 15.0, 0u, phase, &r);
+	case_rate(rate, "lec converges in G.168 test 3A with the burst end a "
+		  "few samples into a frame");
+	printf("# %u Hz, far onset at sample %u of the frame: %u frames "
+	       "held\n", rate, phase, r.held);
+	dt_line_print(rate, "test 3A, tail frame", &r);
+	CHECK(r.l_res_dbm0 <= r.l_sgen_act);
+	CHECK(r.held <= DT_HELD_MAX);
+}
+
+/* The bounds of dt3b_test on the rise over the line of G.168 Figure 11: 10 dB
+ * at X 0 and DT3B_RISE_6_DB at X 6 to 30. The latch wait, the rollback output
+ * and the drop hold keep them. */
+#define DT3B_RISE_0_DB		10.0
+#define DT3B_RISE_6_DB		3.0
+/* G.168 Figure 11: L_RES <= DT3B_FIG11_SLOPE * L_Rin,act + DT3B_FIG11_AT_0. */
+#define DT3B_FIG11_SLOPE	(25.0 / 30.0)
+#define DT3B_FIG11_AT_0		-30.0
+
+static const double dt3b_x_db[3] = { 0.0, 6.0, 15.0 };
+static const double dt3b_bound_db[3] = { DT3B_RISE_0_DB, DT3B_RISE_6_DB,
+					 DT3B_RISE_6_DB };
+
+/*
+ * G.168 test 3B at L_Rin -10 dBm0, after 16 periods of the far end alone.
+ * The near end stands X 0, 6 and 15 dB under the far end. The rise of each
+ * leg must stand at its bound of dt3b_bound_db or under, and each leg must
+ * start no trial.
+ */
+static void dt3b_test(unsigned rate)
+{
+	unsigned i;
+
+	case_rate(rate, "lec bounds the residual of G.168 test 3B in double "
+		  "talk after convergence");
+	for (i = 0; i < 3u; i++) {
+		struct dt_line_result r;
+		double line;
+		double rise;
+		char what[48];
+
+		dt_line_run(rate, -10.0, dt3b_x_db[i], DT_PERIODS,
+			    dt_phase_get(rate), &r);
+		line = DT3B_FIG11_SLOPE * r.l_rin_act + DT3B_FIG11_AT_0;
+		rise = r.worst_dbm0 - line;
+		snprintf(what, sizeof(what), "test 3B at X %.0f dB",
+			 dt3b_x_db[i]);
+		dt_line_print(rate, what, &r);
+		printf("# %u Hz, X %.0f dB: rise %.2f dB over Figure 11\n",
+		       rate, dt3b_x_db[i], rise);
+		CHECK(rise <= dt3b_bound_db[i]);
+		CHECK_UINT(r.trials, 0);
+	}
+}
+
+/* The drop hold line: dt_line_run at -10 dBm0, converged. Then come a talker
+ * x_db under the far end, a copy DROP_COPY_MS late, or a change from m6 to m1
+ * with an optional near break. */
+#define DROP_COPY_MS		2.0
+#define DROP_COPY_FRAMES	3u
+#define DROP_CHANGE_FRAMES	4u
+#define DROP_MISFIT_BREAK_FRAME	11u
+#define DROP_MISFIT_BREAK_DBM0	-6.0
+#define DROP_AFTER_PERIODS	8u
+#define DROP_TAIL_FRAMES	70u
+#define DROP_NONE		0xffffffffu
+
+enum drop_event {
+	DROP_TALKER,
+	DROP_COPY,
+	DROP_CHANGE,
+	DROP_CHANGE_BREAK,
+};
+
+/* The held frames, the hold's start and end, the talker's stop, and the meter
+ * and tail levels. */
+struct drop_line_result {
+	unsigned start;
+	unsigned end;
+	unsigned held;
+	unsigned stop;
+	unsigned trials;
+	double worst_dbm0;
+	double tail_dbm0;
+	double l_rin_act;
+};
+
+static void drop_line_run(unsigned rate, enum drop_event kind, double x_db,
+			  unsigned event, bool nlp, struct drop_line_result *r)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct css_annex far_src;
+	struct css_annex near_src;
+	struct echo_path path;
+	struct echo_path changed;
+	bool copy = kind == DROP_COPY;
+	bool talker = kind == DROP_TALKER;
+	bool change = kind == DROP_CHANGE || kind == DROP_CHANGE_BREAK;
+	struct udsp_ec *ec = udsp_ec_nlms.create_rate(0, rate);
+	uint32_t hiss_state = 0x51ab0dd5u;
+	uint32_t burst_state = 0x13572468u;
+	unsigned frame = rate / 100u;
+	unsigned delay = path_samples_get(DROP_COPY_MS, rate);
+	unsigned long period = (unsigned long)DT_PERIOD_FRAMES * frame;
+	unsigned long t0 = (unsigned long)DT_LEAD_FRAMES * frame +
+			   dt_phase_get(rate);
+	unsigned long dt0 = t0 + DT_PERIODS * period;
+	unsigned long near_at = dt0 + path_samples_get(PHASE2_DELAY_MS, rate);
+	unsigned long near_end = near_at + event * period;
+	unsigned long on = talker ? near_at :
+			   dt0 + (copy ? DROP_COPY_FRAMES : DROP_CHANGE_FRAMES) *
+				 frame;
+	unsigned long t1 = talker ? near_end + DROP_AFTER_PERIODS * period :
+			   on + event * period;
+	unsigned frames = (unsigned)(t1 / frame) + 1u;
+	unsigned first = (unsigned)(on / frame);
+	double gain = pow(10.0, -(DT_ERL_DB + x_db) / 20.0);
+	double a = exp(-1000.0 / (PHASE1_METER_MS * rate));
+	double meter = 0.0;
+	double worst = 0.0;
+	double tail = 0.0;
+	int16_t *far_hist = calloc(delay + frame, sizeof(*far_hist));
+	unsigned f;
+	unsigned i;
+
+	memset(r, 0, sizeof(*r));
+	r->start = DROP_NONE;
+	r->end = DROP_NONE;
+	r->stop = (unsigned)(near_end / frame) - first;
+	r->l_rin_act = -10.0 + DT_ACT_SINGLE_DB;
+	css_annex_init(&far_src, rate, -10.0, 0x0c55a11eu);
+	css_annex_dt_init(&near_src, rate, r->l_rin_act - x_db -
+			  DT_ACT_DOUBLE_DB, 0x5eed0005u);
+	udsp_ec_nlms_ref_loss_set(ec, PHASE2_LOSS_HALF_DB);
+	udsp_ec_nlms.nlp(ec, nlp);
+	path_annex_d_init(&path, rate, change ? ANNEX_D_M6 : ANNEX_D_M1,
+			  DT_ERL_DB, PHASE2_DELAY_MS);
+	path_annex_d_init(&changed, rate, ANNEX_D_M1, DT_ERL_DB + x_db,
+			  PHASE2_DELAY_MS);
+	for (f = 0; f < frames && far_hist; f++) {
+		int16_t far[UDSP_FRAME_MAX];
+		int16_t ref[UDSP_FRAME_MAX];
+		int16_t echo[UDSP_FRAME_MAX];
+		int16_t echo_changed[UDSP_FRAME_MAX];
+		int16_t hiss[UDSP_FRAME_MAX];
+		int16_t near[UDSP_FRAME_MAX];
+		int16_t burst[UDSP_FRAME_MAX];
+		int16_t mic[UDSP_FRAME_MAX];
+
+		for (i = 0; i < frame; i++) {
+			unsigned long n = (unsigned long)f * frame + i;
+
+			far[i] = dt_sample_get(&far_src, n, t0, t1);
+			near[i] = talker ? dt_sample_get(&near_src, n, near_at,
+							 near_end) : 0;
+		}
+		if (kind == DROP_CHANGE_BREAK &&
+		    f == first + DROP_MISFIT_BREAK_FRAME) {
+			noise_fill(burst, frame, DROP_MISFIT_BREAK_DBM0,
+				   &burst_state);
+			for (i = 0; i < frame; i++)
+				near[i] = burst[i];
+		}
+		memmove(far_hist, far_hist + frame, delay * sizeof(*far_hist));
+		memcpy(far_hist + delay, far, frame * sizeof(*far));
+		level_loss_apply(ref, far, frame, PHASE2_LOSS_HALF_DB);
+		path_run(&path, far, echo);
+		path_run(&changed, far, echo_changed);
+		noise_fill(hiss, frame, DT_HISS_DBM0, &hiss_state);
+		for (i = 0; i < frame; i++) {
+			unsigned long n = (unsigned long)f * frame + i;
+			double c = copy && n >= on ? gain * far_hist[i] : 0.0;
+			double e = change && n >= on ? echo_changed[i] :
+						       echo[i];
+
+			mic[i] = sample_clamp(e + hiss[i] + near[i] + c);
+		}
+		udsp_ec_nlms.run(ec, mic, ref);
+		udsp_ec_nlms_frame_get(ec, &reading);
+		if (f >= first && reading.drop_hold) {
+			r->held++;
+			if (r->start == DROP_NONE)
+				r->start = f - first;
+		} else if (f >= first && r->start != DROP_NONE &&
+			   r->end == DROP_NONE) {
+			r->end = f - first;
+		}
+		for (i = 0; i < frame; i++) {
+			double e = (double)mic[i] - near[i];
+
+			meter = a * meter + (1.0 - a) * e * e;
+			if (f >= first && meter > worst)
+				worst = meter;
+			if (f >= first + DROP_TAIL_FRAMES - 10u &&
+			    f < first + DROP_TAIL_FRAMES)
+				tail += e * e;
+		}
+	}
+	udsp_ec_nlms_info_get(ec, &info);
+	r->trials = info.probes;
+	r->worst_dbm0 = rms_dbm0_get(sqrt(worst));
+	r->tail_dbm0 = rms_dbm0_get(sqrt(tail / (10.0 * frame)));
+	free(far_hist);
+	udsp_ec_nlms.destroy(ec);
+}
+
+/* The periods of the talker and the frame bounds of drop_talker_test. */
+#define DROP_TALK_PERIODS	8u
+#define DROP_START_FRAMES	140u
+#define DROP_CLEAN_FRAMES	150u
+
+/*
+ * The talker of G.168 test 3B at X 15 dB: the drop hold starts within
+ * DROP_START_FRAMES of the talker and holds to its end. The rise stays at
+ * DT3B_RISE_6_DB or under, clean pause runs end the hold within
+ * DROP_CLEAN_FRAMES after the talker, and no trial starts.
+ */
+static void drop_talker_test(unsigned rate)
+{
+	struct drop_line_result r;
+	double rise;
+
+	case_rate(rate, "lec drop hold keeps a talker under the echo out of the "
+		  "filter and ends after it");
+	drop_line_run(rate, DROP_TALKER, 15.0, DROP_TALK_PERIODS, false, &r);
+	rise = r.worst_dbm0 - (DT3B_FIG11_SLOPE * r.l_rin_act +
+			       DT3B_FIG11_AT_0);
+	printf("# X 15 dB talker for %u frames: hold from frame %d to frame "
+	       "%d, %u held; rise %.2f dB over Figure 11; %u trials\n",
+	       r.stop, (int)r.start, (int)r.end, r.held, rise, r.trials);
+	CHECK(r.start <= DROP_START_FRAMES);
+	CHECK(r.end != DROP_NONE && r.end >= r.stop);
+	CHECK(r.end != DROP_NONE && r.end - r.stop <= DROP_CLEAN_FRAMES);
+	CHECK(rise <= DT3B_RISE_6_DB);
+	CHECK_UINT(r.trials, 0);
+}
+
+/* The periods of the copy and the bounds of drop_copy_test. */
+#define DROP_COPY_PERIODS	4u
+#define DROP_COPY_HOLD_FRAMES	30u
+#define DROP_COPY_UNDER_DB	20.0
+
+/*
+ * A copy of the far end DROP_COPY_MS late and 10 dB under the echo, inside the
+ * tail but not in the filter. The drop hold starts on it and ends within
+ * DROP_COPY_HOLD_FRAMES on the reference coherence; the output then stands
+ * DROP_COPY_UNDER_DB or more under the copy.
+ */
+static void drop_copy_test(unsigned rate)
+{
+	struct drop_line_result r;
+	double copy_dbm0 = -10.0 + DT_ACT_SINGLE_DB - DT_ERL_DB - 10.0;
+
+	case_rate(rate, "lec drop hold ends on a copy of the far end inside the "
+		  "tail");
+	drop_line_run(rate, DROP_COPY, 10.0, DROP_COPY_PERIODS, true, &r);
+	printf("# copy 10 dB under the echo: hold from frame %d to frame %d, "
+	       "%u held; output %.2f dBm0 at %u frames, against the copy at "
+	       "%.2f dBm0; %u trials\n", (int)r.start, (int)r.end, r.held,
+	       r.tail_dbm0, DROP_TAIL_FRAMES, copy_dbm0, r.trials);
+	CHECK(r.start != DROP_NONE);
+	CHECK(r.end != DROP_NONE && r.end <= DROP_COPY_HOLD_FRAMES);
+	CHECK(r.tail_dbm0 <= copy_dbm0 - DROP_COPY_UNDER_DB);
+}
+
+/* The quieter path and the frame bound of drop_misfit_test. */
+#define DROP_MISFIT_DB		3.0
+#define DROP_MISFIT_PERIODS	4u
+#define DROP_MISFIT_HOLD_FRAMES	13u
+
+/*
+ * A line converged on the dispersive m6 whose echo turns into m1 quieter: the
+ * change starts the drop hold. Its residual spreads over the lags of m6 under
+ * the coherence bar, and the misfit end stops the hold within
+ * DROP_MISFIT_HOLD_FRAMES.
+ */
+static void drop_misfit_test(unsigned rate)
+{
+	struct drop_line_result r;
+
+	case_rate(rate, "lec drop hold ends on a changed path that the estimate "
+		  "misfits");
+	drop_line_run(rate, DROP_CHANGE, DROP_MISFIT_DB, DROP_MISFIT_PERIODS,
+		      false, &r);
+	printf("# m6 to m1 %.0f dB quieter: hold from frame %d to frame %d, "
+	       "%u held; output %.2f dBm0 at %u frames; %u trials\n",
+	       DROP_MISFIT_DB, (int)r.start, (int)r.end, r.held, r.tail_dbm0,
+	       DROP_TAIL_FRAMES, r.trials);
+	CHECK(r.start != DROP_NONE);
+	CHECK(r.end != DROP_NONE && r.end <= DROP_MISFIT_HOLD_FRAMES);
+}
+
+/* The misfit run of dsp/lec.c (LEC_DROP_HOLD_MISFIT_FRAMES) and the frame
+ * bound of drop_misfit_break_test. */
+#define DROP_MISFIT_RUN_FRAMES		8u
+#define DROP_MISFIT_BREAK_HOLD_FRAMES	22u
+
+/*
+ * The line of drop_misfit_test with a one-frame near burst after the change. On
+ * the burst the estimate holds under a quarter of the microphone, so the misfit
+ * run starts over; the hold ends no sooner than DROP_MISFIT_RUN_FRAMES after it
+ * and within DROP_MISFIT_BREAK_HOLD_FRAMES.
+ */
+static void drop_misfit_break_test(unsigned rate)
+{
+	struct drop_line_result r;
+
+	case_rate(rate, "lec drop hold counts the misfit frames in a row");
+	drop_line_run(rate, DROP_CHANGE_BREAK, DROP_MISFIT_DB,
+		      DROP_MISFIT_PERIODS, false, &r);
+	printf("# m6 to m1 %.0f dB quieter, near burst on frame %u: hold from "
+	       "frame %d to frame %d, %u held; %u trials\n", DROP_MISFIT_DB,
+	       DROP_MISFIT_BREAK_FRAME, (int)r.start, (int)r.end, r.held,
+	       r.trials);
+	CHECK(r.start != DROP_NONE);
+	CHECK(r.end != DROP_NONE && r.end >= DROP_MISFIT_BREAK_FRAME +
+					     DROP_MISFIT_RUN_FRAMES);
+	CHECK(r.end != DROP_NONE && r.end <= DROP_MISFIT_BREAK_HOLD_FRAMES);
+}
+
+/* The line of onset_mic_test: white far bursts through m1 about 16 dB over a
+ * white near noise, so the trust does not hold. The classic arm reads a near
+ * end on an onset frame as echo; a near burst then plays on one onset frame. */
+#define MICGATE_FAR_DBM0	-10.0
+#define MICGATE_ERL_DB		6.0
+#define MICGATE_FLOOR_DBM0	-32.0
+#define MICGATE_ON_FRAMES	30u
+#define MICGATE_OFF_FRAMES	20u
+#define MICGATE_QUIET_PERIODS	2u
+#define MICGATE_BURSTS		12u
+/* LEC_GEIGEL_FLOOR_HEADROOM and LEC_GEIGEL_SOFT_RATIO of dsp/lec.c: 3 and
+ * 12 dB over the floor, as powers. */
+#define MICGATE_HEADROOM	2.0
+#define MICGATE_SOFT_RATIO	16.0
+
+/* What onset_mic_test reads on the onset frame of the near burst. */
+struct micgate_result {
+	double over_db;
+	double move;
+	unsigned active;
+	unsigned window_run;
+	unsigned peak;
+	bool fired;
+	bool trusted;
+	bool floor_valid;
+};
+
+/* One line of onset_mic_test with its near burst over_db over the floor. */
+static void micgate_line_run(unsigned rate, double over_db,
+			     struct micgate_result *r)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info before;
+	struct udsp_ec_nlms_info info;
+	struct echo_path path;
+	struct udsp_ec *ec = udsp_ec_nlms.create_rate(0, rate);
+	uint32_t far_state = 0x00012345u;
+	uint32_t noise_state = 0x51ab0dd5u;
+	uint32_t near_state = 0x0badcafeu;
+	unsigned period = MICGATE_ON_FRAMES + MICGATE_OFF_FRAMES;
+	unsigned test = MICGATE_BURSTS * period;
+	unsigned frame = rate / 100u;
+	unsigned f;
+	unsigned i;
+
+	memset(r, 0, sizeof(*r));
+	udsp_ec_nlms_ref_loss_set(ec, PHASE2_LOSS_HALF_DB);
+	udsp_ec_nlms.nlp(ec, false);
+	path_annex_d_init(&path, rate, ANNEX_D_M1, MICGATE_ERL_DB,
+			  PHASE2_DELAY_MS);
+	for (f = 0; f <= test; f++) {
+		int16_t far[UDSP_FRAME_MAX] = { 0 };
+		int16_t near[UDSP_FRAME_MAX] = { 0 };
+		int16_t ref[UDSP_FRAME_MAX];
+		int16_t echo[UDSP_FRAME_MAX];
+		int16_t noise[UDSP_FRAME_MAX];
+		int16_t mic[UDSP_FRAME_MAX];
+
+		if (f >= MICGATE_QUIET_PERIODS * period &&
+		    f % period < MICGATE_ON_FRAMES)
+			noise_fill(far, frame, MICGATE_FAR_DBM0, &far_state);
+		level_loss_apply(ref, far, frame, PHASE2_LOSS_HALF_DB);
+		path_run(&path, far, echo);
+		noise_fill(noise, frame, MICGATE_FLOOR_DBM0, &noise_state);
+		if (f == test)
+			noise_fill(near, frame, MICGATE_FLOOR_DBM0 + over_db,
+				   &near_state);
+		for (i = 0; i < frame; i++)
+			mic[i] = sample_clamp((double)echo[i] + noise[i] +
+					      near[i]);
+		udsp_ec_nlms_info_get(ec, &before);
+		udsp_ec_nlms.run(ec, mic, ref);
+		udsp_ec_nlms_info_get(ec, &info);
+		udsp_ec_nlms_frame_get(ec, &reading);
+		if (f < test) {
+			r->active += reading.ref_power >= reading.ref_bar;
+			continue;
+		}
+		r->floor_valid = reading.noise_power > 0.0f;
+		r->over_db = r->floor_valid ?
+			     10.0 * log10(reading.mic_power /
+					  reading.noise_power) : 0.0;
+		r->move = (double)info.coef_energy - before.coef_energy;
+		r->window_run = reading.window_run;
+		r->peak = before.coef_peak_tap;
+		r->fired = reading.dt_fired;
+		r->trusted = reading.trusted;
+	}
+	udsp_ec_nlms.destroy(ec);
+}
+
+/* The bounds of onset_mic_test on the move of the coefficient energy over the
+ * onset frame. They stand between the move of the plain denominator and that
+ * under the step floor. */
+#define MICGATE_PLAIN_DB	8.0
+#define MICGATE_FLOOR_DB	14.0
+#define MICGATE_PLAIN_MOVE	2.0e-4
+#define MICGATE_FLOOR_MOVE	1.0e-4
+
+/*
+ * The microphone condition of the step floor of an onset frame
+ * (onset_floor_get). A near burst between 3 and 12 dB over the floor takes the
+ * plain denominator and moves the energy by MICGATE_PLAIN_MOVE or more. One 12
+ * dB or more over it moves it by MICGATE_FLOOR_MOVE or less.
+ */
+static void onset_mic_test(unsigned rate)
+{
+	static const double over_db[2] = { MICGATE_PLAIN_DB, MICGATE_FLOOR_DB };
+	unsigned i;
+
+	case_rate(rate, "lec takes the plain step on an onset frame near the "
+		  "floor and the onset floor 12 dB over it");
+	for (i = 0; i < 2u; i++) {
+		struct micgate_result r;
+		bool plain = i == 0u;
+
+		micgate_line_run(rate, over_db[i], &r);
+		printf("# %u Hz, near burst %.0f dB over the floor: microphone "
+		       "%.1f dB over the tracked floor, coefficient energy "
+		       "move %+.2e; window run %u, peak tap %u, %u active "
+		       "frames before it, fired %d, trusted %d\n", rate,
+		       over_db[i], r.over_db, r.move, r.window_run, r.peak,
+		       r.active, r.fired, r.trusted);
+		CHECK(r.active >= NEAR_START_BOOT_FRAMES);
+		CHECK(r.floor_valid);
+		CHECK(r.window_run == 1u);
+		CHECK(r.peak >= rate / 100u);
+		CHECK(!r.fired && !r.trusted);
+		if (plain) {
+			CHECK(r.over_db > 10.0 * log10(MICGATE_HEADROOM) &&
+			      r.over_db < 10.0 * log10(MICGATE_SOFT_RATIO));
+			CHECK(r.move >= MICGATE_PLAIN_MOVE);
+		} else {
+			CHECK(r.over_db >= 10.0 * log10(MICGATE_SOFT_RATIO));
+			CHECK(fabs(r.move) <= MICGATE_FLOOR_MOVE);
+		}
+	}
+}
+
+/*
+ * The line of onset_peak_test: each bootstrap onset frame also carries the
+ * reference ONSET_PEAK_LAG samples late, a near end that the plain step learns
+ * on the first taps. With early_echo every later active frame carries the copy.
+ */
+#define ONSET_PEAK_FROM		30u
+#define ONSET_PEAK_GAIN		1.4
+#define ONSET_PEAK_LAG		1u
+#define ONSET_PEAK_NEAR_DB	14.0
+#define ONSET_PEAK_QUIET_DBM0	-18.0
+#define ONSET_PEAK_TRUST_FLOOR_DBM0	-60.0
+#define ONSET_PEAK_TRUST_NEAR_DB	30.0
+/* A bound on the frames of a line: the trust holds by frame 500. */
+#define ONSET_PEAK_MAX_FRAMES	3000u
+
+struct onset_peak_line {
+	double floor_dbm0;
+	double inject_dbm0;
+	double near_db;
+	bool early_echo;
+};
+
+/* What onset_peak_test reads on the bootstrap onset frames that carry the
+ * reference, and on the onset frame with the near noise. */
+struct onset_peak_result {
+	double inject_over_db;
+	double over_db;
+	double energy;
+	double move;
+	unsigned injected;
+	unsigned injected_fired;
+	unsigned first_peak;
+	unsigned active;
+	unsigned window_run;
+	unsigned peak;
+	bool fired;
+	bool trusted;
+};
+
+/* The far frame of onset_peak_test at frame f: level_dbm0 on the frames of
+ * a burst, silence in a pause. Returns whether f is an onset frame. */
+static bool onset_peak_far_fill(unsigned f, unsigned frame, int16_t *far,
+				double level_dbm0, uint32_t *state)
+{
+	unsigned period = MICGATE_ON_FRAMES + MICGATE_OFF_FRAMES;
+	bool on = f >= MICGATE_QUIET_PERIODS * period &&
+		  f % period < MICGATE_ON_FRAMES;
+
+	memset(far, 0, frame * sizeof(*far));
+	if (on)
+		noise_fill(far, frame, level_dbm0, state);
+	return on && f % period == 0u;
+}
+
+/* One line of onset_peak_test, up to the onset frame with the near noise. */
+static void onset_peak_line_run(unsigned rate,
+				const struct onset_peak_line *line,
+				struct onset_peak_result *r)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info before;
+	struct udsp_ec_nlms_info info;
+	struct echo_path path;
+	struct udsp_ec *ec = udsp_ec_nlms.create_rate(0, rate);
+	uint32_t far_state = 0x00012345u;
+	uint32_t noise_state = 0x51ab0dd5u;
+	uint32_t near_state = 0x0badcafeu;
+	unsigned period = MICGATE_ON_FRAMES + MICGATE_OFF_FRAMES;
+	unsigned frame = rate / 100u;
+	unsigned active = 0;
+	bool trusted = false;
+	bool frozen = false;
+	bool done = false;
+	unsigned f;
+	unsigned i;
+
+	memset(r, 0, sizeof(*r));
+	udsp_ec_nlms_ref_loss_set(ec, PHASE2_LOSS_HALF_DB);
+	udsp_ec_nlms.nlp(ec, true);
+	path_annex_d_init(&path, rate, ANNEX_D_M1, MICGATE_ERL_DB,
+			  PHASE2_DELAY_MS);
+	for (f = 0; !done && f < ONSET_PEAK_MAX_FRAMES; f++) {
+		int16_t far[UDSP_FRAME_MAX];
+		int16_t near[UDSP_FRAME_MAX] = { 0 };
+		int16_t ref[UDSP_FRAME_MAX];
+		int16_t echo[UDSP_FRAME_MAX];
+		int16_t noise[UDSP_FRAME_MAX];
+		int16_t mic[UDSP_FRAME_MAX];
+		bool boot = active < NEAR_START_BOOT_FRAMES;
+		bool onset = f % period == 0u;
+		bool inject = onset && boot && active >= ONSET_PEAK_FROM;
+		bool copy;
+
+		onset = onset_peak_far_fill(f, frame, far, inject ?
+					    line->inject_dbm0 :
+					    MICGATE_FAR_DBM0, &far_state);
+		inject = inject && onset;
+		copy = inject || (line->early_echo && !boot &&
+				  (f % period) < MICGATE_ON_FRAMES);
+		done = onset && !boot && (!line->early_echo || trusted);
+		noise_fill(noise, frame, line->floor_dbm0, &noise_state);
+		level_loss_apply(ref, far, frame, PHASE2_LOSS_HALF_DB);
+		path_run(&path, far, echo);
+		if (done)
+			noise_fill(near, frame,
+				   line->floor_dbm0 + line->near_db,
+				   &near_state);
+		for (i = 0; i < frame; i++) {
+			double v = (double)echo[i] + noise[i] + near[i];
+
+			if (copy && i >= ONSET_PEAK_LAG)
+				v += ONSET_PEAK_GAIN * ref[i - ONSET_PEAK_LAG];
+			mic[i] = sample_clamp(v);
+		}
+		if (onset && frozen) {
+			udsp_ec_nlms.freeze(ec, false);
+			frozen = false;
+		}
+		udsp_ec_nlms_info_get(ec, &before);
+		udsp_ec_nlms.run(ec, mic, ref);
+		udsp_ec_nlms_info_get(ec, &info);
+		udsp_ec_nlms_frame_get(ec, &reading);
+		trusted = trusted || reading.trusted;
+		if (inject) {
+			double over = 10.0 * log10(reading.mic_power /
+						   reading.noise_power);
+
+			if (!r->injected || over > r->inject_over_db)
+				r->inject_over_db = over;
+			if (!r->injected)
+				r->first_peak = before.coef_peak_tap;
+			r->injected++;
+			r->injected_fired += reading.dt_fired;
+			udsp_ec_nlms.freeze(ec, true);
+			frozen = true;
+		}
+		if (!done) {
+			active += reading.ref_power >= reading.ref_bar;
+			continue;
+		}
+		r->active = active;
+		r->over_db = 10.0 * log10(reading.mic_power /
+					  reading.noise_power);
+		r->energy = before.coef_energy;
+		r->move = (double)info.coef_energy - before.coef_energy;
+		r->window_run = reading.window_run;
+		r->peak = before.coef_peak_tap;
+		r->fired = reading.dt_fired;
+		r->trusted = reading.trusted;
+	}
+	udsp_ec_nlms.destroy(ec);
+}
+/* The bounds of onset_peak_test on the move of the coefficient energy over the
+ * onset frame with near noise, on each leg. They stand between the moves under
+ * the step floor and under the plain step. */
+#define ONSET_PEAK_MOVE		0.15
+#define ONSET_PEAK_TRUST_MOVE	0.01
+
+/* The legs of onset_peak_test: near end (bootstrap onsets carry it, set the
+ * onset peak, and the floor holds after) and quiet onset (no near end, no
+ * peak). The trust leg's echo in the frame trains the filter to the trust. */
+static const struct onset_peak_line onset_peak_lines[3] = {
+	{ MICGATE_FLOOR_DBM0, MICGATE_FAR_DBM0, ONSET_PEAK_NEAR_DB, false },
+	{ MICGATE_FLOOR_DBM0, ONSET_PEAK_QUIET_DBM0, ONSET_PEAK_NEAR_DB,
+	  false },
+	{ ONSET_PEAK_TRUST_FLOOR_DBM0, MICGATE_FAR_DBM0,
+	  ONSET_PEAK_TRUST_NEAR_DB, true },
+};
+
+static const char *const onset_peak_names[3] = {
+	"near end", "quiet onset", "trust",
+};
+
+/*
+ * The onset peak (onset_peak_update): after the bootstrap the near-end leg
+ * takes the floor and moves the energy by ONSET_PEAK_MOVE or less. The
+ * quiet-onset leg takes the plain step, and the trust leg moves by
+ * ONSET_PEAK_TRUST_MOVE or more.
+ */
+static void onset_peak_test(unsigned rate)
+{
+	unsigned frame = rate / 100u;
+	unsigned i;
+
+	case_rate(rate, "lec keeps the onset floor on a peak that plain onset "
+		  "steps put under the frame");
+	for (i = 0; i < 3u; i++) {
+		struct onset_peak_result r;
+		double soft_db = 10.0 * log10(MICGATE_SOFT_RATIO);
+		double share;
+
+		onset_peak_line_run(rate, &onset_peak_lines[i], &r);
+		share = r.energy > 0.0 ? fabs(r.move) / r.energy : 0.0;
+		printf("# %u Hz, %s: %u bootstrap onset frames carry the "
+		       "reference, up to %.1f dB over the floor, %u of them "
+		       "fire, peak tap %u on the first; then: peak tap %u, "
+		       "microphone %.1f dB over the floor, coefficient energy "
+		       "%.4f, move %+.2e (%.2f percent); window run %u, %u "
+		       "active frames before it, fired %d, trusted %d\n", rate,
+		       onset_peak_names[i], r.injected, r.inject_over_db,
+		       r.injected_fired, r.first_peak, r.peak, r.over_db,
+		       r.energy, r.move, 100.0 * share, r.window_run,
+		       r.active, r.fired, r.trusted);
+		CHECK(r.injected_fired < r.injected);
+		CHECK(r.first_peak >= frame);
+		CHECK(r.active >= NEAR_START_BOOT_FRAMES);
+		CHECK(r.window_run == 1u);
+		CHECK(r.peak < frame);
+		CHECK(r.over_db >= soft_db);
+		CHECK(!r.fired);
+		if (i == 0u) {
+			CHECK(r.inject_over_db >= soft_db);
+			CHECK(!r.trusted);
+			CHECK(share <= ONSET_PEAK_MOVE);
+		} else if (i == 1u) {
+			CHECK(r.inject_over_db < soft_db);
+			CHECK(!r.trusted);
+			CHECK(share > ONSET_PEAK_MOVE);
+		} else {
+			CHECK(r.trusted);
+			CHECK(share >= ONSET_PEAK_TRUST_MOVE);
+		}
+	}
+}
+
+/* The clear and toggle line, the processor on: the bootstrap of onset_peak_test
+ * sets the onset peak. A silent far end and a frozen filter follow, then
+ * peak-tap toggles, an optional reset and a near onset. */
+/* The count of dsp/lec.c (LEC_ONSET_PEAK_CLEAR_FRAMES). */
+#define ONSET_CLEAR_FRAMES	8u
+#define ONSET_CLEAR_FROM_WB	60u
+#define ONSET_CLEAR_LEAD	20u
+#define ONSET_CLEAR_OUT_FRAMES	10u
+#define ONSET_CLEAR_OUT_MAX	12u
+#define ONSET_CLEAR_SPLIT	20u
+#define ONSET_CLEAR_RETURN_MAX	4u
+
+struct onset_clear_line {
+	unsigned runs[2];
+	unsigned toggles;
+	unsigned gap;
+	bool split;
+	bool reset;
+};
+
+/* What onset_clear_line_run reads: the frames in a row that ended with the peak
+ * tap past the frame length on each toggle, and the toggles that returned. Then
+ * the near onset and the loudest residual meter reading after it. */
+struct onset_clear_result {
+	unsigned runs[2];
+	unsigned toggles;
+	unsigned active;
+	unsigned since_far;
+	unsigned window_run;
+	unsigned peak;
+	double over_db;
+	double energy;
+	double move;
+	double l_res_dbm0;
+	bool fired;
+	bool trusted;
+};
+
+enum onset_clear_step {
+	CLEAR_BOOT,
+	CLEAR_WAIT,
+	CLEAR_OUT,
+	CLEAR_HOLD,
+	CLEAR_RETURN,
+	CLEAR_NEAR,
+	CLEAR_DONE,
+};
+
+/* The microphone of a frame of the line: the echo, the line noise, the near
+ * noise and, with copy, the reference ONSET_PEAK_LAG samples late at
+ * ONSET_PEAK_GAIN. */
+static void onset_clear_mic_fill(int16_t *mic, const int16_t *echo,
+				 const int16_t *noise, const int16_t *near,
+				 const int16_t *ref, unsigned frame, bool copy)
+{
+	unsigned i;
+
+	for (i = 0; i < frame; i++) {
+		double v = (double)echo[i] + noise[i] + near[i];
+
+		if (copy && i >= ONSET_PEAK_LAG)
+			v += ONSET_PEAK_GAIN * ref[i - ONSET_PEAK_LAG];
+		mic[i] = sample_clamp(v);
+	}
+}
+
+/* One line of onset_peak_clear_test or onset_peak_toggle_test, to the end
+ * of the meter after the near onset. */
+static void onset_clear_line_run(unsigned rate,
+				 const struct onset_clear_line *line,
+				 struct onset_clear_result *r)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info before;
+	struct udsp_ec_nlms_info info;
+	struct echo_path path;
+	struct udsp_ec *ec = udsp_ec_nlms.create_rate(0, rate);
+	uint32_t far_state = 0x00012345u;
+	uint32_t noise_state = 0x51ab0dd5u;
+	uint32_t near_state = 0x0badcafeu;
+	unsigned period = MICGATE_ON_FRAMES + MICGATE_OFF_FRAMES;
+	unsigned frame = rate / 100u;
+	unsigned from = rate == UDSP_SAMPLE_RATE ? ONSET_PEAK_FROM :
+						 ONSET_CLEAR_FROM_WB;
+	enum onset_clear_step step = CLEAR_BOOT;
+	double a = exp(-1000.0 / (PHASE1_METER_MS * rate));
+	double meter = 0.0;
+	double loudest = 0.0;
+	unsigned active = 0;
+	unsigned next = 0;
+	unsigned out = 0;
+	unsigned at = 0;
+	unsigned back = 0;
+	unsigned last_far = 0;
+	unsigned near_at = 0;
+	bool second = false;
+	bool frozen = false;
+	unsigned f;
+	unsigned i;
+
+	memset(r, 0, sizeof(*r));
+	udsp_ec_nlms_ref_loss_set(ec, PHASE2_LOSS_HALF_DB);
+	udsp_ec_nlms.nlp(ec, true);
+	path_annex_d_init(&path, rate, ANNEX_D_M1, MICGATE_ERL_DB,
+			  PHASE2_DELAY_MS);
+	for (f = 0; step != CLEAR_DONE && f < ONSET_PEAK_MAX_FRAMES; f++) {
+		int16_t far[UDSP_FRAME_MAX] = { 0 };
+		int16_t near[UDSP_FRAME_MAX] = { 0 };
+		int16_t ref[UDSP_FRAME_MAX];
+		int16_t echo[UDSP_FRAME_MAX];
+		int16_t noise[UDSP_FRAME_MAX];
+		int16_t mic[UDSP_FRAME_MAX];
+		double far_dbm0 = MICGATE_FAR_DBM0;
+		bool on = false;
+		bool copy = false;
+		bool adapt = false;
+		bool inject = false;
+
+		if (step == CLEAR_BOOT && active >= NEAR_START_BOOT_FRAMES) {
+			if (line->reset && !second) {
+				udsp_ec_nlms_reset(ec);
+				udsp_ec_nlms.freeze(ec, true);
+				frozen = true;
+				second = true;
+				active = 0;
+			} else {
+				step = CLEAR_WAIT;
+				next = f + ONSET_CLEAR_LEAD;
+			}
+		}
+		if (step == CLEAR_WAIT && f == next)
+			step = r->toggles < line->toggles ? CLEAR_OUT :
+							    CLEAR_NEAR;
+		if (step == CLEAR_HOLD && f == at)
+			step = CLEAR_RETURN;
+		if (step == CLEAR_NEAR && !near_at)
+			near_at = f;
+		switch (step) {
+		case CLEAR_BOOT:
+			on = f >= MICGATE_QUIET_PERIODS * period &&
+			     f % period < MICGATE_ON_FRAMES;
+			inject = on && f % period == 0u &&
+				 active >= (second ? 0u : from);
+			copy = inject;
+			if (inject && second)
+				far_dbm0 = ONSET_PEAK_QUIET_DBM0;
+			adapt = !frozen || (on && f % period == 0u);
+			break;
+		case CLEAR_OUT:
+			on = f == next;
+			adapt = on;
+			break;
+		case CLEAR_HOLD:
+			on = f + 1u == at;
+			break;
+		case CLEAR_RETURN:
+			on = true;
+			copy = true;
+			adapt = true;
+			break;
+		case CLEAR_NEAR:
+			on = f - near_at < MICGATE_ON_FRAMES;
+			adapt = true;
+			break;
+		default:
+			break;
+		}
+		if (on)
+			noise_fill(far, frame, far_dbm0, &far_state);
+		noise_fill(noise, frame, MICGATE_FLOOR_DBM0, &noise_state);
+		level_loss_apply(ref, far, frame, PHASE2_LOSS_HALF_DB);
+		path_run(&path, far, echo);
+		if (step == CLEAR_NEAR && f == near_at)
+			noise_fill(near, frame,
+				   MICGATE_FLOOR_DBM0 + ONSET_PEAK_NEAR_DB,
+				   &near_state);
+		onset_clear_mic_fill(mic, echo, noise, near, ref, frame, copy);
+		if (adapt == frozen) {
+			udsp_ec_nlms.freeze(ec, !adapt);
+			frozen = !adapt;
+		}
+		udsp_ec_nlms_info_get(ec, &before);
+		udsp_ec_nlms.run(ec, mic, ref);
+		udsp_ec_nlms_info_get(ec, &info);
+		udsp_ec_nlms_frame_get(ec, &reading);
+		if (step == CLEAR_BOOT) {
+			if (inject) {
+				udsp_ec_nlms.freeze(ec, true);
+				frozen = true;
+			}
+			active += reading.ref_power >= reading.ref_bar;
+			continue;
+		}
+		switch (step) {
+		case CLEAR_OUT:
+			if (info.coef_peak_tap >= frame) {
+				at = f + line->runs[r->toggles];
+				step = CLEAR_HOLD;
+			} else if (f == next && ++out < ONSET_CLEAR_OUT_MAX) {
+				next = f + ONSET_CLEAR_OUT_FRAMES;
+			} else if (f == next) {
+				step = CLEAR_DONE;
+			}
+			break;
+		case CLEAR_RETURN:
+			back++;
+			if (info.coef_peak_tap < frame) {
+				r->runs[r->toggles] = f - at +
+					line->runs[r->toggles];
+				r->toggles++;
+				back = 0;
+				out = 0;
+				step = CLEAR_WAIT;
+				next = r->toggles < line->toggles ?
+				       f + ONSET_CLEAR_SPLIT :
+				       last_far + line->gap;
+			} else if (back >= ONSET_CLEAR_RETURN_MAX) {
+				step = CLEAR_DONE;
+			}
+			break;
+		case CLEAR_NEAR:
+			if (f == near_at) {
+				r->active = active;
+				r->since_far = line->toggles ? f - last_far : 0u;
+				r->over_db = 10.0 * log10(reading.mic_power /
+							  reading.noise_power);
+				r->energy = before.coef_energy;
+				r->move = (double)info.coef_energy -
+					  before.coef_energy;
+				r->window_run = reading.window_run;
+				r->peak = before.coef_peak_tap;
+				r->fired = reading.dt_fired;
+				r->trusted = reading.trusted;
+				break;
+			}
+			for (i = 0; i < frame; i++) {
+				double e = (double)mic[i] - noise[i];
+
+				meter = a * meter + (1.0 - a) * e * e;
+				if (meter > loudest)
+					loudest = meter;
+			}
+			if (f - near_at >= MICGATE_ON_FRAMES + MICGATE_OFF_FRAMES)
+				step = CLEAR_DONE;
+			break;
+		default:
+			break;
+		}
+		if (info.coef_peak_tap >= frame && step != CLEAR_NEAR)
+			last_far = f;
+	}
+	r->l_res_dbm0 = rms_dbm0_get(sqrt(loudest));
+	udsp_ec_nlms.destroy(ec);
+}
+
+/* The bound on the move of the coefficient energy over the near onset after
+ * toggles. It stands between the move under the floor and the plain step once
+ * the onset peak clears. The reset leg reads against ONSET_PEAK_MOVE. */
+#define ONSET_CLEAR_MOVE	0.05
+
+static void onset_clear_print(unsigned rate, const char *what,
+			      const struct onset_clear_line *line,
+			      const struct onset_clear_result *r)
+{
+	double share = r->energy > 0.0 ? fabs(r->move) / r->energy : 0.0;
+
+	printf("# %u Hz, %s: %u of %u toggles, runs at or past the frame %u "
+	       "and %u, near onset %u frames after the last; peak tap %u, "
+	       "microphone %.1f dB over the floor, coefficient energy %.4f, "
+	       "move %+.2e (%.2f percent); window run %u, %u active frames "
+	       "before it, fired %d, trusted %d; l_res %.2f dBm0\n", rate,
+	       what, r->toggles, line->toggles, r->runs[0], r->runs[1],
+	       r->since_far, r->peak, r->over_db, r->energy, r->move,
+	       100.0 * share, r->window_run, r->active, r->fired, r->trusted,
+	       r->l_res_dbm0);
+}
+
+/* The conditions of the near onset that every leg checks first: the toggles
+ * ran, gap frames came before, and the onset meets the other floor conditions
+ * on an untrusted filter. Returns the move as a fraction of the energy. */
+static double onset_clear_check(unsigned rate,
+				const struct onset_clear_line *line,
+				const struct onset_clear_result *r)
+{
+	unsigned i;
+
+	CHECK(r->toggles == line->toggles);
+	if (line->toggles)
+		CHECK(r->since_far == line->gap);
+	for (i = 0; i < line->toggles; i++) {
+		if (line->split)
+			CHECK(r->runs[i] < ONSET_CLEAR_FRAMES);
+		else
+			CHECK(r->runs[i] == line->runs[i]);
+	}
+	if (line->split)
+		CHECK(r->runs[0] + r->runs[1] >= ONSET_CLEAR_FRAMES);
+	CHECK(r->active >= NEAR_START_BOOT_FRAMES);
+	CHECK(r->window_run == 1u);
+	CHECK(r->peak < rate / 100u);
+	CHECK(r->over_db >= 10.0 * log10(MICGATE_SOFT_RATIO));
+	CHECK(!r->fired);
+	CHECK(!r->trusted);
+	return r->energy > 0.0 ? fabs(r->move) / r->energy : 0.0;
+}
+
+/* The legs of onset_peak_clear_test: 7 frames past the frame length, under
+ * LEC_ONSET_PEAK_CLEAR_FRAMES, keep the onset peak, and 8 clear it. A split run
+ * restarts the count, and a reset clears it while the quiet copies set none. */
+static const struct onset_clear_line onset_clear_lines[4] = {
+	{ { 7u, 0u }, 1u, 22u, false, false },
+	{ { 8u, 0u }, 1u, 22u, false, false },
+	{ { 7u, 1u }, 2u, 22u, true, false },
+	{ { 0u, 0u }, 0u, 0u, false, true },
+};
+
+static const char *const onset_clear_names[4] = {
+	"7 frames", "8 frames", "split", "reset",
+};
+
+/*
+ * The clear of the onset peak on an untrusted filter: the floor holds the move
+ * over the near onset to ONSET_CLEAR_MOVE on the 7-frame and split legs. The
+ * plain step moves it more on the 8-frame leg, and more than ONSET_PEAK_MOVE on
+ * the reset leg.
+ */
+static void onset_peak_clear_test(unsigned rate)
+{
+	unsigned i;
+
+	case_rate(rate, "lec clears the onset peak of an untrusted filter after "
+		  "8 frames in a row past the frame");
+	for (i = 0; i < 4u; i++) {
+		struct onset_clear_result r;
+		double share;
+
+		onset_clear_line_run(rate, &onset_clear_lines[i], &r);
+		onset_clear_print(rate, onset_clear_names[i],
+				  &onset_clear_lines[i], &r);
+		share = onset_clear_check(rate, &onset_clear_lines[i], &r);
+		if (i == 0u || i == 2u)
+			CHECK(share <= ONSET_CLEAR_MOVE);
+		else if (i == 1u)
+			CHECK(share > ONSET_CLEAR_MOVE);
+		else
+			CHECK(share > ONSET_PEAK_MOVE);
+	}
+}
+
+/* The legs of onset_peak_toggle_test: a plain step also removes what the
+ * bootstrap put on the first taps, so the floor check carries the verdict. The
+ * meter bounds the residual echo that the floor leaves. */
+static const struct onset_clear_line onset_toggle_lines[2] = {
+	{ { 1u, 0u }, 1u, 24u, false, false },
+	{ { 2u, 0u }, 1u, 21u, false, false },
+};
+
+/*
+ * The shape of a bench capture of G.168 test 3A. After the bootstrap sets the
+ * onset peak, the peak tap visits the echo tap for 1 or 2 frames before a near
+ * onset. That onset still takes the floor (ONSET_CLEAR_MOVE), and the residual
+ * of its burst stays under L_Sgen,act.
+ */
+static void onset_peak_toggle_test(unsigned rate)
+{
+	static const char *const names[2] = { "1 frame", "2 frames" };
+	double line_dbm0 = MICGATE_FLOOR_DBM0 + ONSET_PEAK_NEAR_DB;
+	unsigned i;
+
+	case_rate(rate, "lec keeps the onset peak through a toggle of the peak "
+		  "tap to the echo tap");
+	for (i = 0; i < 2u; i++) {
+		struct onset_clear_result r;
+
+		onset_clear_line_run(rate, &onset_toggle_lines[i], &r);
+		onset_clear_print(rate, names[i], &onset_toggle_lines[i], &r);
+		CHECK(onset_clear_check(rate, &onset_toggle_lines[i], &r) <=
+		      ONSET_CLEAR_MOVE);
+		CHECK(r.l_res_dbm0 <= line_dbm0);
+	}
+}
+
+/* The line of onset_start_test, G.168 test 2C(c) with the processor off: the
+ * idle hiss, then a Hoth-shaped background at ONSET_START_SGEN_DBM0 before the
+ * composite source through m1. */
+#define ONSET_START_IDLE_FRAMES	30u
+#define ONSET_START_LEAD_FRAMES	20u
+#define ONSET_START_FAR_FRAMES	(2u * FRAMES_PER_SECOND)
+#define ONSET_START_SGEN_DBM0	-30.0
+#define ONSET_START_ERL_DB	6.0
+#define ONSET_START_X_MAX_DB	17.0
+#define ONSET_START_X_OFFSET_DB	6.0
+#define ONSET_START_ONSETS	3u
+#define ONSET_START_SEEDS	4u
+
+/* The seeds of the Hoth-shaped noise of onset_start_test, which bound the onset
+ * moves with the floor under ONSET_PEAK_MOVE. */
+static const uint32_t onset_start_seeds[ONSET_START_SEEDS] = {
+	0x2c0c2c0cu, 0x01234567u, 0x9e3779b9u, 0x7f4a7c15u,
+};
+
+/* onsets, share and low_peak read the bootstrap's near onsets; conv_db is the
+ * combined loss at 1 s, against the objective X. */
+struct onset_start_result {
+	unsigned onsets;
+	unsigned low_peak;
+	double share;
+	double conv_db;
+};
+
+/* The near background of a frame of the line of onset_start_test. */
+static void onset_start_near_fill(struct room_noise *room,
+				  struct udsp_resamp *up, unsigned rate,
+				  int16_t *near)
+{
+	int16_t near8[UDSP_FRAME_SAMPLES];
+
+	room_noise_fill(near8, UDSP_FRAME_SAMPLES, room);
+	if (rate == UDSP_SAMPLE_RATE_WB)
+		udsp_resamp_up2(up, near8, UDSP_FRAME_SAMPLES, near);
+	else
+		memcpy(near, near8, sizeof(near8));
+}
+
+/* One onset frame of the bootstrap of the line of onset_start_test, read
+ * against the floor conditions of onset_floor_get but the bootstrap. */
+static void onset_start_onset_read(struct onset_start_result *r,
+				   const struct udsp_ec_nlms_info *before,
+				   const struct udsp_ec_nlms_info *info,
+				   const struct udsp_ec_nlms_frame *reading,
+				   unsigned frame)
+{
+	double over;
+	double share;
+
+	if (reading->window_run != 1u || before->coef_peak_tap < frame)
+		return;
+	over = reading->mic_power / reading->noise_power;
+	if (over < MICGATE_SOFT_RATIO)
+		return;
+	share = fabs((double)info->coef_energy - before->coef_energy) /
+		before->coef_energy;
+	if (!r->onsets || share > r->share)
+		r->share = share;
+	if (!r->onsets || info->coef_peak_tap < r->low_peak)
+		r->low_peak = info->coef_peak_tap;
+	r->onsets++;
+}
+
+static void onset_start_line_run(unsigned rate, uint32_t seed,
+				 struct onset_start_result *r)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info before;
+	struct udsp_ec_nlms_info info;
+	struct room_noise room;
+	struct udsp_resamp up;
+	struct css_annex css;
+	struct echo_path path;
+	struct udsp_ec *ec = udsp_ec_nlms.create_rate(0, rate);
+	uint32_t hiss_state = 0x51ab0dd5u;
+	unsigned far0 = ONSET_START_IDLE_FRAMES + ONSET_START_LEAD_FRAMES;
+	unsigned long from;
+	unsigned long to;
+	unsigned long n = 0;
+	double a = exp(-1000.0 / (PHASE1_METER_MS * rate));
+	double meter = 0.0;
+	double loudest = 0.0;
+	unsigned active = 0;
+	unsigned f;
+	unsigned i;
+
+	memset(r, 0, sizeof(*r));
+	css_annex_init(&css, rate, PHASE2_FAR_DBM0, 0x0c55a11eu);
+	room_noise_init(&room, ROOM_HOTH, ONSET_START_SGEN_DBM0, seed);
+	udsp_resamp_reset(&up);
+	udsp_ec_nlms_ref_loss_set(ec, PHASE2_LOSS_HALF_DB);
+	udsp_ec_nlms.nlp(ec, false);
+	path_annex_d_init(&path, rate, ANNEX_D_M1, ONSET_START_ERL_DB,
+			  PHASE2_DELAY_MS);
+	from = (unsigned long)far0 * path.frame + rate +
+	       path_samples_get(PHASE2_DELAY_MS, rate);
+	to = from + (unsigned long)rate * 7u / 10u;
+	for (f = 0; f < far0 + ONSET_START_FAR_FRAMES; f++) {
+		int16_t far[UDSP_FRAME_MAX] = { 0 };
+		int16_t near[UDSP_FRAME_MAX] = { 0 };
+		int16_t ref[UDSP_FRAME_MAX];
+		int16_t echo[UDSP_FRAME_MAX];
+		int16_t hiss[UDSP_FRAME_MAX];
+		int16_t mic[UDSP_FRAME_MAX];
+
+		if (f >= far0)
+			css_annex_fill(far, path.frame, &css);
+		if (f >= ONSET_START_IDLE_FRAMES)
+			onset_start_near_fill(&room, &up, rate, near);
+		level_loss_apply(ref, far, path.frame, PHASE2_LOSS_HALF_DB);
+		path_run(&path, far, echo);
+		noise_fill(hiss, path.frame, PHASE2_HISS_DBM0, &hiss_state);
+		for (i = 0; i < path.frame; i++)
+			mic[i] = sample_clamp((double)echo[i] + hiss[i] +
+					      near[i]);
+		udsp_ec_nlms_info_get(ec, &before);
+		udsp_ec_nlms.run(ec, mic, ref);
+		udsp_ec_nlms_info_get(ec, &info);
+		udsp_ec_nlms_frame_get(ec, &reading);
+		if (active < NEAR_START_BOOT_FRAMES)
+			onset_start_onset_read(r, &before, &info, &reading,
+					       path.frame);
+		active += reading.ref_power >= reading.ref_bar;
+		for (i = 0; i < path.frame; i++, n++) {
+			meter = a * meter + (1.0 - a) * mic[i] * mic[i];
+			if (n >= from && n < to && meter > loudest)
+				loudest = meter;
+		}
+	}
+	r->conv_db = PHASE2_FAR_DBM0 + DT_ACT_SINGLE_DB -
+		     rms_dbm0_get(sqrt(loudest));
+	udsp_ec_nlms.destroy(ec);
+}
+
+/*
+ * The onset floor from the first active frame with the processor off. On each
+ * seed, ONSET_START_ONSETS or more bootstrap onsets with the near end take the
+ * floor and end with the peak past the frame. The combined loss at 1 s reaches
+ * X.
+ */
+static void onset_start_test(unsigned rate)
+{
+	double x_db = fmin(ONSET_START_X_MAX_DB,
+			   PHASE2_FAR_DBM0 + DT_ACT_SINGLE_DB -
+			   ONSET_START_SGEN_DBM0 - ONSET_START_X_OFFSET_DB);
+	unsigned k;
+
+	case_rate(rate, "lec holds the onset floor from the first active frame "
+		  "with the processor off");
+	for (k = 0; k < ONSET_START_SEEDS; k++) {
+		struct onset_start_result r;
+
+		onset_start_line_run(rate, onset_start_seeds[k], &r);
+		printf("# %u Hz, Hoth seed %u: %u bootstrap onset frames with "
+		       "the near end past the frame, move up to %.2f percent, "
+		       "least peak tap after them %u; combined loss %.2f dB at "
+		       "1 s against X %.2f dB\n", rate, k, r.onsets,
+		       100.0 * r.share, r.low_peak, r.conv_db, x_db);
+		CHECK(r.onsets >= ONSET_START_ONSETS);
+		CHECK(r.share <= ONSET_PEAK_MOVE);
+		CHECK(r.low_peak >= rate / 100u);
+		CHECK(r.conv_db >= x_db);
+	}
+}
+
+/* The line of onset_zero_test: test 2C(c) on a quiet line, with the
+ * processor off. The idle hiss runs 2 s. The Hoth-shaped noise of
+ * onset_start_test starts ONSET_START_LEAD_FRAMES before the composite
+ * source through m1. At 16 kHz the source is raised from 8 kHz, as the
+ * reference of a line that a codec fills. A burst then starts over several
+ * small samples. phase delays the source within the frame. A reset or the
+ * watchdog can zero the filter before the idle hiss (enum onset_zero_start).
+ */
+#define ONSET_ZERO_HISS_DBM0	-80.0
+#define ONSET_ZERO_IDLE_FRAMES	(2u * FRAMES_PER_SECOND)
+#define ONSET_ZERO_PRE_FRAMES	(3u * FRAMES_PER_SECOND)
+#define ONSET_ZERO_PHASES	8u
+#define ONSET_ZERO_SEEDS	2u
+#define ONSET_ZERO_ENERGY	2.0
+#define ONSET_ZERO_CLEAR_FRAMES	8u
+/* The white far end of the watchdog start, and the bound of that start. The
+ * far end keeps the echo of a hybrid that amplifies under the clipping. */
+#define ONSET_ZERO_WATCH_FAR_DBM0	-20.0
+#define ONSET_ZERO_WATCH_MAX_FRAMES	(30u * FRAMES_PER_SECOND)
+
+/* The start of the filter of the line: a new filter, a filter that a reset
+ * zeroes after ONSET_ZERO_PRE_FRAMES of the far end alone, or a filter that
+ * the watchdog zeroes (onset_zero_watch_run). */
+enum onset_zero_start {
+	ONSET_ZERO_NEW,
+	ONSET_ZERO_RESET,
+	ONSET_ZERO_WATCHDOG,
+	ONSET_ZERO_STARTS
+};
+
+/* zero_onsets and zero_energy read the near onsets on a peak under the frame
+ * from the first far frame, the plain steps of a zeroed filter. conv_db is
+ * the combined loss at 1 s, as in onset_start_test. cleared, zeroed and
+ * watch_frames report the watchdog start. */
+struct onset_zero_result {
+	unsigned zero_onsets;
+	double zero_energy;
+	double conv_db;
+	bool cleared;
+	bool zeroed;
+	unsigned watch_frames;
+};
+
+/* The far end of a frame of the lines of onset_zero_test and
+ * onset_zero_boot_test, phase samples late. */
+struct onset_zero_far {
+	struct css_annex css;
+	struct udsp_resamp up;
+	int16_t line[UDSP_FRAME_MAX];
+	unsigned phase;
+};
+
+static void onset_zero_far_init(struct onset_zero_far *s, unsigned rate,
+				unsigned phase)
+{
+	memset(s, 0, sizeof(*s));
+	css_annex_init(&s->css, rate == UDSP_SAMPLE_RATE_WB ?
+		       UDSP_SAMPLE_RATE : rate, PHASE2_FAR_DBM0, 0x0c55a11eu);
+	udsp_resamp_reset(&s->up);
+	s->phase = phase;
+}
+
+static void onset_zero_far_fill(struct onset_zero_far *s, unsigned rate,
+				int16_t *far)
+{
+	unsigned frame = rate / 100u;
+	int16_t now[UDSP_FRAME_MAX];
+
+	if (rate == UDSP_SAMPLE_RATE_WB) {
+		int16_t far8[UDSP_FRAME_SAMPLES];
+
+		css_annex_fill(far8, UDSP_FRAME_SAMPLES, &s->css);
+		udsp_resamp_up2(&s->up, far8, UDSP_FRAME_SAMPLES, now);
+	} else {
+		css_annex_fill(now, frame, &s->css);
+	}
+	memcpy(far, s->line + frame - s->phase, s->phase * sizeof(*far));
+	memcpy(far + s->phase, now, (frame - s->phase) * sizeof(*far));
+	memcpy(s->line, now, frame * sizeof(*now));
+}
+
+/* One near onset on a peak under the frame, read against the conditions of
+ * onset_near_get. */
+static void onset_zero_read(struct onset_zero_result *r,
+			    const struct udsp_ec_nlms_info *before,
+			    const struct udsp_ec_nlms_info *info,
+			    const struct udsp_ec_nlms_frame *reading,
+			    unsigned frame)
+{
+	if (reading->window_run != 1u || before->coef_peak_tap >= frame ||
+	    reading->mic_power < reading->noise_power * MICGATE_SOFT_RATIO)
+		return;
+	if (info->coef_energy > r->zero_energy)
+		r->zero_energy = info->coef_energy;
+	r->zero_onsets++;
+}
+
+/*
+ * The watchdog start of the line, before its idle hiss. A white far end, at
+ * 16 kHz raised from 8 kHz, converges the filter on the hybrid. The peak tap
+ * then stands past the frame for ONSET_ZERO_CLEAR_FRAMES frames in a row. From
+ * there the hybrid grows louder by RAMP_STEP_DB each time the ERLE settles, as
+ * in divergence_peak_test. The watchdog then zeroes the filter outside a
+ * trial, and the hybrid returns to its response. cleared reads the peak run,
+ * zeroed a zeroing with no trial in the start, and watch_frames the frame of
+ * the zeroing.
+ */
+static void onset_zero_watch_run(struct udsp_ec *ec, struct echo_path *path,
+				 uint32_t *hiss_state,
+				 struct onset_zero_result *r)
+{
+	struct udsp_ec_nlms_info before;
+	struct udsp_ec_nlms_info info;
+	struct udsp_resamp up;
+	float h[LEC_PATH_TAPS_MAX];
+	uint32_t far_state = 0x0c0ffee2u;
+	double gain_db = 0.0;
+	double gain;
+	unsigned far_run = 0;
+	unsigned dwell = 0;
+	unsigned f;
+	unsigned i;
+
+	memcpy(h, path->h, sizeof(h));
+	udsp_resamp_reset(&up);
+	udsp_ec_nlms_info_get(ec, &before);
+	for (f = 0; f < ONSET_ZERO_WATCH_MAX_FRAMES; f++) {
+		int16_t far8[UDSP_FRAME_SAMPLES];
+		int16_t far[UDSP_FRAME_MAX];
+		int16_t ref[UDSP_FRAME_MAX];
+		int16_t echo[UDSP_FRAME_MAX];
+		int16_t hiss[UDSP_FRAME_MAX];
+		int16_t mic[UDSP_FRAME_MAX];
+
+		noise_fill(far8, UDSP_FRAME_SAMPLES, ONSET_ZERO_WATCH_FAR_DBM0,
+			   &far_state);
+		if (path->frame == UDSP_FRAME_SAMPLES)
+			memcpy(far, far8, sizeof(far8));
+		else
+			udsp_resamp_up2(&up, far8, UDSP_FRAME_SAMPLES, far);
+		level_loss_apply(ref, far, path->frame, PHASE2_LOSS_HALF_DB);
+		path_run(path, far, echo);
+		noise_fill(hiss, path->frame, ONSET_ZERO_HISS_DBM0, hiss_state);
+		for (i = 0; i < path->frame; i++)
+			mic[i] = sample_clamp((double)echo[i] + hiss[i]);
+		udsp_ec_nlms.run(ec, mic, ref);
+		udsp_ec_nlms_info_get(ec, &info);
+		if (info.diverge_resets != before.diverge_resets) {
+			r->zeroed = info.probes == before.probes &&
+				    info.coef_energy == 0.0f;
+			break;
+		}
+		far_run = info.coef_peak_tap >= path->frame ? far_run + 1u : 0u;
+		r->cleared = r->cleared || far_run >= ONSET_ZERO_CLEAR_FRAMES;
+		if (!r->cleared || ++dwell < RAMP_DWELL_FRAMES ||
+		    info.erle_db < RAMP_SETTLED_DB)
+			continue;
+		gain_db += RAMP_STEP_DB;
+		gain = pow(10.0, gain_db / 20.0);
+		for (i = 0; i < path->taps; i++)
+			path->h[i] = (float)(h[i] * gain);
+		dwell = 0;
+	}
+	r->watch_frames = f;
+	memcpy(path->h, h, sizeof(h));
+}
+
+static void onset_zero_line_run(unsigned rate, uint32_t seed, unsigned phase,
+				enum onset_zero_start start,
+				struct onset_zero_result *r)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info before;
+	struct udsp_ec_nlms_info info;
+	struct room_noise room;
+	struct udsp_resamp up;
+	struct onset_zero_far src;
+	struct onset_zero_far pre_src;
+	struct echo_path path;
+	struct udsp_ec *ec = udsp_ec_nlms.create_rate(0, rate);
+	uint32_t hiss_state = 0x51ab0dd5u;
+	unsigned pre = start == ONSET_ZERO_RESET ? ONSET_ZERO_PRE_FRAMES : 0u;
+	unsigned near0 = pre + ONSET_ZERO_IDLE_FRAMES;
+	unsigned far0 = near0 + ONSET_START_LEAD_FRAMES;
+	unsigned long from;
+	unsigned long to;
+	unsigned long n = 0;
+	double a = exp(-1000.0 / (PHASE1_METER_MS * rate));
+	double meter = 0.0;
+	double loudest = 0.0;
+	unsigned f;
+	unsigned i;
+
+	memset(r, 0, sizeof(*r));
+	onset_zero_far_init(&src, rate, phase);
+	onset_zero_far_init(&pre_src, rate, 0u);
+	room_noise_init(&room, ROOM_HOTH, ONSET_START_SGEN_DBM0, seed);
+	udsp_resamp_reset(&up);
+	udsp_ec_nlms_ref_loss_set(ec, PHASE2_LOSS_HALF_DB);
+	udsp_ec_nlms.nlp(ec, false);
+	path_annex_d_init(&path, rate, ANNEX_D_M1, ONSET_START_ERL_DB,
+			  PHASE2_DELAY_MS);
+	if (start == ONSET_ZERO_WATCHDOG)
+		onset_zero_watch_run(ec, &path, &hiss_state, r);
+	from = (unsigned long)far0 * path.frame + phase + rate +
+	       path_samples_get(PHASE2_DELAY_MS, rate);
+	to = from + (unsigned long)rate * 7u / 10u;
+	for (f = 0; f < far0 + ONSET_START_FAR_FRAMES; f++) {
+		int16_t far[UDSP_FRAME_MAX] = { 0 };
+		int16_t near[UDSP_FRAME_MAX] = { 0 };
+		int16_t ref[UDSP_FRAME_MAX];
+		int16_t echo[UDSP_FRAME_MAX];
+		int16_t hiss[UDSP_FRAME_MAX];
+		int16_t mic[UDSP_FRAME_MAX];
+
+		if (f < pre)
+			onset_zero_far_fill(&pre_src, rate, far);
+		else if (f >= far0)
+			onset_zero_far_fill(&src, rate, far);
+		if (f >= near0)
+			onset_start_near_fill(&room, &up, rate, near);
+		level_loss_apply(ref, far, path.frame, PHASE2_LOSS_HALF_DB);
+		path_run(&path, far, echo);
+		noise_fill(hiss, path.frame, ONSET_ZERO_HISS_DBM0, &hiss_state);
+		for (i = 0; i < path.frame; i++)
+			mic[i] = sample_clamp((double)echo[i] + hiss[i] +
+					      near[i]);
+		if (pre && f == pre)
+			udsp_ec_nlms_reset(ec);
+		udsp_ec_nlms_info_get(ec, &before);
+		udsp_ec_nlms.run(ec, mic, ref);
+		udsp_ec_nlms_info_get(ec, &info);
+		udsp_ec_nlms_frame_get(ec, &reading);
+		if (f >= far0)
+			onset_zero_read(r, &before, &info, &reading,
+					path.frame);
+		for (i = 0; i < path.frame; i++, n++) {
+			meter = a * meter + (1.0 - a) * mic[i] * mic[i];
+			if (n >= from && n < to && meter > loudest)
+				loudest = meter;
+		}
+	}
+	r->conv_db = PHASE2_FAR_DBM0 + DT_ACT_SINGLE_DB -
+		     rms_dbm0_get(sqrt(loudest));
+	udsp_ec_nlms.destroy(ec);
+}
+
+/*
+ * Plain onset steps of a zeroed filter under a near noise that starts before
+ * the far end. The tracked floor
+ * still reads the quiet hiss. The case runs a new filter and a filter that a
+ * reset zeroes after it converged. The watchdog zeroes a third filter after
+ * its peak stood past the frame. Each runs at every source phase. The steps
+ * keep the coefficient energy within ONSET_ZERO_ENERGY, and the combined loss
+ * at 1 s reaches X.
+ */
+static void onset_zero_test(unsigned rate)
+{
+	static const char *const names[ONSET_ZERO_STARTS] = {
+		"new", "reset", "watchdog"
+	};
+	double x_db = fmin(ONSET_START_X_MAX_DB,
+			   PHASE2_FAR_DBM0 + DT_ACT_SINGLE_DB -
+			   ONSET_START_SGEN_DBM0 - ONSET_START_X_OFFSET_DB);
+	unsigned frame = rate / 100u;
+	unsigned j;
+	unsigned k;
+	unsigned p;
+
+	case_rate(rate, "lec bounds the plain onset steps of a zeroed filter "
+		  "under a near noise on a quiet line");
+	for (j = 0; j < ONSET_ZERO_STARTS; j++) {
+		double energy = 0.0;
+		double conv = 0.0;
+		unsigned onsets = 0;
+		unsigned under = 0;
+		unsigned zeroed = 0;
+		unsigned watch = 0;
+
+		for (k = 0; k < ONSET_ZERO_SEEDS; k++)
+			for (p = 0; p < ONSET_ZERO_PHASES; p++) {
+				struct onset_zero_result r;
+
+				onset_zero_line_run(rate, onset_start_seeds[k],
+						    p * frame /
+						    ONSET_ZERO_PHASES,
+						    (enum onset_zero_start)j,
+						    &r);
+				if ((!k && !p) || r.zero_energy > energy)
+					energy = r.zero_energy;
+				if ((!k && !p) || r.conv_db < conv)
+					conv = r.conv_db;
+				onsets += r.zero_onsets;
+				under += r.conv_db < x_db;
+				zeroed += r.cleared && r.zeroed;
+				if (r.watch_frames > watch)
+					watch = r.watch_frames;
+			}
+		printf("# %u Hz, %s filter, %u source phases x %u Hoth seeds: "
+		       "%u plain onset steps, coefficient energy up to %.4f "
+		       "against %.1f; combined loss at 1 s %.2f dB at least "
+		       "against X %.2f dB, %u under\n", rate, names[j],
+		       ONSET_ZERO_PHASES, ONSET_ZERO_SEEDS, onsets, energy,
+		       ONSET_ZERO_ENERGY, conv, x_db, under);
+		if (j == ONSET_ZERO_WATCHDOG) {
+			printf("# %u Hz, watchdog filter: %u of %u runs zero "
+			       "the filter outside a trial after the peak "
+			       "stood past the frame, within %u frames\n", rate,
+			       zeroed, ONSET_ZERO_PHASES * ONSET_ZERO_SEEDS,
+			       watch);
+			CHECK_UINT(zeroed, ONSET_ZERO_PHASES *
+					   ONSET_ZERO_SEEDS);
+		}
+		CHECK(energy <= ONSET_ZERO_ENERGY);
+		CHECK(conv >= x_db);
+	}
+}
+
+/* The line of onset_zero_boot_test, with the processor on. The far end of
+ * onset_zero_test runs over the hiss of PHASE2. It runs alone until the peak
+ * tap stands past the frame for ONSET_ZERO_CLEAR_FRAMES frames in a row.
+ * A white near end at ONSET_ZERO_BOOT_NEAR_DBM0 then starts on the next far
+ * onset. */
+#define ONSET_ZERO_BOOT_NEAR_DBM0	-35.0
+#define ONSET_ZERO_BOOT_MAX_FRAMES	(4u * FRAMES_PER_SECOND)
+
+/* The least move share of the plain step on the first near onset, at 8 and
+ * 16 kHz. At 16 kHz the source raised from 8 kHz starts over small samples.
+ * The plain step then moves the filter by about its energy, and at 8 kHz by
+ * a few percent. The onset floor holds a move under 1 percent. */
+static const double onset_zero_boot_move[2] = { 0.03, 0.6 };
+
+/* The first near onset of the line of onset_zero_boot_test. share is its
+ * move of the coefficient energy over that energy, and peak its peak tap at
+ * the start. active counts the active frames before it. over_db is the
+ * microphone over the floor, and fired whether the detector fired. */
+struct onset_zero_boot_result {
+	double share;
+	unsigned peak;
+	unsigned active;
+	double over_db;
+	bool fired;
+	bool seen;
+};
+
+static void onset_zero_boot_run(unsigned rate,
+				struct onset_zero_boot_result *r)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info before;
+	struct udsp_ec_nlms_info info;
+	struct onset_zero_far src;
+	struct echo_path path;
+	struct udsp_ec *ec = udsp_ec_nlms.create_rate(0, rate);
+	uint32_t hiss_state = 0x51ab0dd5u;
+	uint32_t near_state = 0x0badcafeu;
+	unsigned far0 = ONSET_ZERO_IDLE_FRAMES;
+	unsigned far_run = 0;
+	unsigned active = 0;
+	bool cleared = false;
+	bool talk = false;
+	bool far_before = false;
+	unsigned f;
+	unsigned i;
+
+	memset(r, 0, sizeof(*r));
+	onset_zero_far_init(&src, rate, 0u);
+	udsp_ec_nlms_ref_loss_set(ec, PHASE2_LOSS_HALF_DB);
+	udsp_ec_nlms.nlp(ec, true);
+	path_annex_d_init(&path, rate, ANNEX_D_M1, ONSET_START_ERL_DB,
+			  PHASE2_DELAY_MS);
+	for (f = 0; f < far0 + ONSET_ZERO_BOOT_MAX_FRAMES && !r->seen; f++) {
+		int16_t far[UDSP_FRAME_MAX] = { 0 };
+		int16_t near[UDSP_FRAME_MAX] = { 0 };
+		int16_t ref[UDSP_FRAME_MAX];
+		int16_t echo[UDSP_FRAME_MAX];
+		int16_t hiss[UDSP_FRAME_MAX];
+		int16_t mic[UDSP_FRAME_MAX];
+		bool far_on = false;
+
+		if (f >= far0)
+			onset_zero_far_fill(&src, rate, far);
+		for (i = 0; i < path.frame; i++)
+			far_on = far_on || far[i] != 0;
+		if (cleared && far_on && !far_before)
+			talk = true;
+		far_before = far_on;
+		if (talk)
+			noise_fill(near, path.frame, ONSET_ZERO_BOOT_NEAR_DBM0,
+				   &near_state);
+		level_loss_apply(ref, far, path.frame, PHASE2_LOSS_HALF_DB);
+		path_run(&path, far, echo);
+		noise_fill(hiss, path.frame, PHASE2_HISS_DBM0, &hiss_state);
+		for (i = 0; i < path.frame; i++)
+			mic[i] = sample_clamp((double)echo[i] + hiss[i] +
+					      near[i]);
+		udsp_ec_nlms_info_get(ec, &before);
+		udsp_ec_nlms.run(ec, mic, ref);
+		udsp_ec_nlms_info_get(ec, &info);
+		udsp_ec_nlms_frame_get(ec, &reading);
+		if (talk && reading.window_run == 1u &&
+		    reading.mic_power >= reading.noise_power *
+					 MICGATE_SOFT_RATIO) {
+			r->share = before.coef_energy > 0.0f ?
+				   fabs((double)info.coef_energy -
+					before.coef_energy) /
+				   before.coef_energy : 0.0;
+			r->peak = before.coef_peak_tap;
+			r->active = active;
+			r->over_db = 10.0 * log10(reading.mic_power /
+						  reading.noise_power);
+			r->fired = reading.dt_fired;
+			r->seen = true;
+		}
+		far_run = info.coef_peak_tap >= path.frame ? far_run + 1u : 0u;
+		cleared = cleared || far_run >= ONSET_ZERO_CLEAR_FRAMES;
+		active += reading.ref_power >= reading.ref_bar;
+	}
+	udsp_ec_nlms.destroy(ec);
+}
+
+/*
+ * The plain step of the bootstrap with the processor on. The peak of a zeroed
+ * filter first stands past the frame for ONSET_ZERO_CLEAR_FRAMES frames in a
+ * row. The first near onset of the bootstrap is unfired and on a peak past the
+ * frame. It moves the filter by onset_zero_boot_move of its energy at least.
+ */
+static void onset_zero_boot_test(unsigned rate)
+{
+	struct onset_zero_boot_result r;
+
+	case_rate(rate, "lec keeps the plain onset step of the bootstrap once "
+		  "the peak of a zeroed filter stood past the frame");
+	onset_zero_boot_run(rate, &r);
+	printf("# %u Hz: first near onset after %u active frames, peak tap %u, "
+	       "microphone %.1f dB over the floor, fired %d, move %.2f "
+	       "percent against %.0f\n", rate, r.active, r.peak, r.over_db,
+	       r.fired, 100.0 * r.share,
+	       100.0 * onset_zero_boot_move[rate == UDSP_SAMPLE_RATE_WB]);
+	CHECK(r.seen);
+	CHECK(r.active < NEAR_START_BOOT_FRAMES);
+	CHECK(r.peak >= rate / 100u);
+	CHECK(!r.fired);
+	CHECK(r.share >= onset_zero_boot_move[rate == UDSP_SAMPLE_RATE_WB]);
+}
+
+/* The over-estimate escape (over_get): the ratio in dB, the run of active
+ * frames, and the frames within which the trust must hold. */
+#define OVER_RATIO_DB		4.0
+#define OVER_FRAMES		10u
+#define OVER_TRUST_FRAMES	30u
+
+/* The over line: a white far end, a flat 8 ms hybrid, a 48 ms tail, the
+ * processor off. After convergence a far pause and a hybrid over_db quieter put
+ * the live estimate over_db over the live microphone. */
+#define OVER_FAR_DBM0		-20.0
+#define OVER_CAL_FRAMES		20u
+#define OVER_PAUSE_FRAMES	100u
+#define OVER_TALK_DB		16.0
+#define OVER_RUN_FRAMES		60u
+#define OVER_SETTLE_FRAMES	350u
+#define OVER_NONE_DBM0		-200.0
+
+struct over_line {
+	struct udsp_ec *ec;
+	struct echo_path path;
+	struct echo_path base;
+	uint32_t state[3];
+	unsigned frame;
+	double far_dbm0;
+	double cal;
+	double live[2];
+	bool quiet;
+};
+
+/* The live estimate and microphone powers of the canceller, rebuilt from a
+ * frame reading with its smoothing (LEC_ERLE_ALPHA). */
+#define OVER_ALPHA		0.1
+
+static void over_live_add(double live[2],
+			  const struct udsp_ec_nlms_frame *reading)
+{
+	live[0] += (reading->estimate_power - live[0]) * OVER_ALPHA;
+	live[1] += (reading->mic_power - live[1]) * OVER_ALPHA;
+}
+
+/* Whether the rebuilt live estimate stands at OVER_RATIO_DB or more over the
+ * rebuilt live microphone. */
+static bool over_live_over(const double live[2])
+{
+	return live[0] >= live[1] * pow(10.0, OVER_RATIO_DB / 10.0);
+}
+
+/* One frame of the over line, with a talker at talk_dbm0 when it is over
+ * OVER_NONE_DBM0; active says whether the canceller read the frame as
+ * active (its reference at or over its bar). */
+static void over_frame_run(struct over_line *l, double talk_dbm0,
+			   struct udsp_ec_nlms_frame *reading,
+			   struct udsp_ec_nlms_info *info, bool *active)
+{
+	int16_t ref[UDSP_FRAME_MAX];
+	int16_t echo[UDSP_FRAME_MAX];
+	int16_t hiss[UDSP_FRAME_MAX];
+	int16_t talk[UDSP_FRAME_MAX];
+	int16_t mic[UDSP_FRAME_MAX];
+	unsigned i;
+
+	noise_fill(ref, l->frame, l->far_dbm0, &l->state[0]);
+	if (l->quiet)
+		memset(ref, 0, l->frame * sizeof(*ref));
+	path_run(&l->path, ref, echo);
+	noise_fill(hiss, l->frame, CHANGE_FLOOR_DBM0, &l->state[1]);
+	if (talk_dbm0 > OVER_NONE_DBM0)
+		noise_fill(talk, l->frame, talk_dbm0, &l->state[2]);
+	else
+		memset(talk, 0, l->frame * sizeof(*talk));
+	for (i = 0; i < l->frame; i++)
+		mic[i] = sample_clamp((double)echo[i] + hiss[i] + talk[i]);
+	udsp_ec_nlms.run(l->ec, mic, ref);
+	udsp_ec_nlms_frame_get(l->ec, reading);
+	udsp_ec_nlms_info_get(l->ec, info);
+	over_live_add(l->live, reading);
+	*active = reading->ref_power >= reading->ref_bar;
+}
+
+static double over_db_get(double num, double den)
+{
+	return num > 0.0 && den > 0.0 ? 10.0 * log10(num / den) : -200.0;
+}
+
+/* The hybrid of the line becomes the base of over_line_set, and cal the
+ * estimate over the microphone of the filter on it. Returns the trust of
+ * the last frame. */
+static bool over_line_cal(struct over_line *l)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	double est = 0.0;
+	double mic = 0.0;
+	bool active;
+	unsigned f;
+
+	l->base = l->path;
+	for (f = 0; f < OVER_CAL_FRAMES; f++) {
+		over_frame_run(l, OVER_NONE_DBM0, &reading, &info, &active);
+		est += reading.estimate_power;
+		mic += reading.mic_power;
+	}
+	l->cal = mic > 0.0 ? est / mic : 1.0;
+	return reading.trusted;
+}
+
+/* The converged line on a hybrid at erl_db with a far end at far_dbm0, its
+ * calibration, and the trust of its last frame. */
+static bool over_line_open(struct over_line *l, unsigned rate, double erl_db,
+			   double far_dbm0)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	bool active;
+	unsigned f;
+
+	memset(l, 0, sizeof(*l));
+	l->frame = rate / 100u;
+	l->far_dbm0 = far_dbm0;
+	l->state[0] = 0x0f1e2d3cu;
+	l->state[1] = 0x4b5a6978u;
+	l->state[2] = 0x8796a5b4u;
+	l->ec = udsp_ec_nlms.create_rate(48, rate);
+	udsp_ec_nlms.nlp(l->ec, false);
+	path_flat_init(&l->path, rate, 8, erl_db);
+	for (f = 0; f < CHANGE_CONVERGE_FRAMES; f++)
+		over_frame_run(l, OVER_NONE_DBM0, &reading, &info, &active);
+	return over_line_cal(l);
+}
+
+/* The over line of over_arm_test, converged and calibrated. */
+static bool over_line_start(struct over_line *l, unsigned rate)
+{
+	return over_line_open(l, rate, CHANGE_ERL_DB, OVER_FAR_DBM0);
+}
+
+/* The hybrid of the line db quieter than it stands. */
+static void over_path_step(struct over_line *l, double db)
+{
+	unsigned k;
+
+	for (k = 0; k < l->path.taps; k++)
+		l->path.h[k] = (float)(l->path.h[k] * pow(10.0, -db / 20.0));
+}
+
+/* The hybrid over_db quieter than the converged one, against cal. */
+static void over_line_set(struct over_line *l, double over_db)
+{
+	double g = sqrt(l->cal / pow(10.0, over_db / 10.0));
+	unsigned k;
+
+	for (k = 0; k < l->path.taps; k++)
+		l->path.h[k] = (float)(l->base.h[k] * g);
+}
+
+/* A far-end pause in which the hybrid turns over_db quieter. */
+static void over_line_pause(struct over_line *l, double over_db)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	bool active;
+	unsigned f;
+
+	l->quiet = true;
+	for (f = 0; f < OVER_PAUSE_FRAMES; f++)
+		over_frame_run(l, OVER_NONE_DBM0, &reading, &info, &active);
+	over_line_set(l, over_db);
+	l->quiet = false;
+}
+
+/*
+ * The figures of the over line: trials, the first trial's active frame and arm,
+ * and the rebuilt run before it. Then the energy before and at its start, the
+ * live ratio and the trust. With talk they add the end and the restored energy;
+ * with a step, the hybrid turns quieter after the start.
+ */
+struct over_result {
+	unsigned trials;
+	unsigned start;
+	unsigned arm;
+	unsigned run;
+	unsigned end;
+	double energy;
+	double scaled;
+	double live_db;
+	double restored;
+	bool trusted;
+};
+
+static void over_line_run(struct over_line *l, unsigned frames, bool talk,
+			  double step, struct over_result *r)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	double energy;
+	uint32_t probes;
+	unsigned active_n = 0;
+	unsigned start_f = 0;
+	unsigned f;
+	bool active;
+
+	memset(r, 0, sizeof(*r));
+	udsp_ec_nlms_info_get(l->ec, &info);
+	probes = info.probes;
+	energy = info.coef_energy;
+	for (f = 1; f <= frames; f++) {
+		bool talker = talk && start_f && f == start_f + 1u;
+
+		if (step > 0.0 && start_f && f == start_f + 1u)
+			over_path_step(l, step);
+
+		over_frame_run(l, talker ? l->far_dbm0 + OVER_TALK_DB :
+				   OVER_NONE_DBM0, &reading, &info, &active);
+		active_n += active;
+		if (f == 1u)
+			r->trusted = reading.trusted;
+		if (!start_f && active)
+			r->run = over_live_over(l->live) ? r->run + 1u : 0u;
+		if (!start_f && info.probes != probes) {
+			start_f = f;
+			r->start = active_n;
+			r->arm = reading.trial_arm;
+			r->energy = energy;
+			r->scaled = info.coef_energy;
+			r->live_db = over_db_get(l->live[1], l->live[0]);
+		}
+		if (talker) {
+			r->end = reading.trial_end;
+			r->restored = info.coef_energy;
+		}
+		energy = info.coef_energy;
+	}
+	r->trials = info.probes - probes;
+}
+
+/*
+ * The legs of over_arm_test, filter frozen: 3.9 dB starts no trial, and 4.1 dB
+ * starts one from scaled taps that a talker's refusal restores. The stand-down
+ * then holds 6 dB, and the run counts nothing in a trial; a lost trust or a
+ * reset filter starts none.
+ */
+static void over_print(unsigned rate, const char *what,
+		       const struct over_result *r)
+{
+	printf("# %u Hz, %s: %u trials, first %s on active frame %u after a "
+	       "run of %u; coefficient energy %+.2f dB on its start frame "
+	       "against %+.2f dB of live microphone over live estimate, "
+	       "%+.2f dB after the end %s; trusted on the first frame %d\n",
+	       rate, what, r->trials,
+	       r->start ? lecr_trial_arm_name(r->arm) : "none", r->start,
+	       r->run, over_db_get(r->scaled, r->energy), r->live_db,
+	       over_db_get(r->restored, r->energy),
+	       r->end ? lecr_trial_end_name(r->end) : "-", r->trusted);
+}
+
+/*
+ * The conditions of the over-estimate escape, filter frozen: over the ratio a
+ * trial of the path-change arm starts on the OVER_FRAMES-th active frame from
+ * scaled taps. A refusal restores them and stands the arm down. Under the
+ * ratio, in a trial or stand-down, or without a recent trust, none starts.
+ */
+static void over_arm_test(unsigned rate)
+{
+	struct over_line l;
+	struct over_result r;
+	double ratio = OVER_RATIO_DB;
+
+	case_rate(rate, "lec starts an escape trial from scaled taps on an "
+		  "estimate over the microphone");
+
+	CHECK(over_line_start(&l, rate));
+	udsp_ec_nlms.freeze(l.ec, true);
+	over_line_pause(&l, ratio - 0.1);
+	over_line_run(&l, OVER_RUN_FRAMES, false, 0.0, &r);
+	over_print(rate, "3.9 dB", &r);
+	CHECK(r.trusted);
+	CHECK_UINT(r.trials, 0);
+	udsp_ec_nlms.destroy(l.ec);
+
+	CHECK(over_line_start(&l, rate));
+	udsp_ec_nlms.freeze(l.ec, true);
+	over_line_pause(&l, ratio + 0.1);
+	over_line_run(&l, OVER_RUN_FRAMES, true, 0.0, &r);
+	over_print(rate, "4.1 dB", &r);
+	CHECK(r.trusted);
+	CHECK_UINT(r.trials, 1);
+	CHECK_UINT(r.run, OVER_FRAMES);
+	CHECK_UINT(r.arm, UDSP_EC_NLMS_TRIAL_ARM_PATH);
+	CHECK(fabs(over_db_get(r.scaled, r.energy) - r.live_db) <= 0.05);
+	CHECK(r.live_db <= -ratio);
+	CHECK_UINT(r.end, UDSP_EC_NLMS_TRIAL_END_TALKER);
+	CHECK(fabs(over_db_get(r.restored, r.energy)) <= 0.001);
+	udsp_ec_nlms.freeze(l.ec, false);
+	over_line_run(&l, OVER_SETTLE_FRAMES, false, 0.0, &r);
+	CHECK_UINT(r.trials, 0);
+	CHECK(over_line_cal(&l));
+	udsp_ec_nlms.freeze(l.ec, true);
+	over_line_pause(&l, 6.0);
+	over_line_run(&l, OVER_RUN_FRAMES, false, 0.0, &r);
+	over_print(rate, "stand-down, then 6 dB", &r);
+	CHECK(r.trusted);
+	CHECK_UINT(r.trials, 0);
+	udsp_ec_nlms.destroy(l.ec);
+
+	CHECK(over_line_start(&l, rate));
+	udsp_ec_nlms.freeze(l.ec, true);
+	over_line_pause(&l, 6.0);
+	over_line_run(&l, OVER_RUN_FRAMES, false, 10.0, &r);
+	over_print(rate, "6 dB, no re-arm", &r);
+	CHECK_UINT(r.trials, 1);
+	CHECK_UINT(r.start, OVER_FRAMES);
+	CHECK_UINT(r.run, OVER_FRAMES);
+	udsp_ec_nlms.destroy(l.ec);
+
+	CHECK(over_line_start(&l, rate));
+	udsp_ec_nlms.freeze(l.ec, true);
+	over_line_pause(&l, 2.0);
+	over_line_run(&l, 50u, false, 0.0, &r);
+	CHECK_UINT(r.trials, 0);
+	over_line_set(&l, 6.0);
+	over_line_run(&l, OVER_RUN_FRAMES, false, 0.0, &r);
+	over_print(rate, "2 then 6 dB", &r);
+	CHECK(!r.trusted);
+	CHECK_UINT(r.trials, 0);
+	udsp_ec_nlms.destroy(l.ec);
+
+	CHECK(over_line_start(&l, rate));
+	udsp_ec_nlms.freeze(l.ec, true);
+	over_line_pause(&l, 8.0);
+	over_line_run(&l, 5u, false, 0.0, &r);
+	CHECK_UINT(r.trials, 0);
+	udsp_ec_nlms_reset(l.ec);
+	over_line_run(&l, OVER_RUN_FRAMES, false, 0.0, &r);
+	over_print(rate, "8 dB, reset", &r);
+	CHECK_UINT(r.trials, 0);
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/* G.168 test 12 on the line of phase2_path_run: m1, model b, then m1 10 dB
+ * quieter than b and of another shape, 16 source periods each. */
+#define RETURN_PHASE_FRAMES	(16u * 70u)
+#define RETURN_FRAMES		(3u * FRAMES_PER_SECOND)
+
+/* The first trial after the return, its run, scale and settling with the
+ * processor off; with it on, the returned echo from 1 s. */
+struct return_result {
+	unsigned start;
+	unsigned arm;
+	unsigned end_kind;
+	unsigned run;
+	unsigned settled;
+	unsigned trials;
+	unsigned resets;
+	double scale_db;
+	double live_db;
+	double erle_db;
+	double l_ret_dbm0;
+	unsigned loud;
+};
+
+/* One frame of the line of phase2_frame_run on the source of
+ * css_annex_fill, with the output samples in out. */
+static void return_frame_run(struct udsp_ec *ec, struct echo_path *path,
+			     struct css_annex *css, uint32_t *state,
+			     struct phase2_sums *sum, int16_t *out)
+{
+	int16_t far[UDSP_FRAME_MAX];
+	int16_t ref[UDSP_FRAME_MAX];
+	int16_t echo[UDSP_FRAME_MAX];
+	int16_t hiss[UDSP_FRAME_MAX];
+	unsigned i;
+
+	css_annex_fill(far, path->frame, css);
+	level_loss_apply(ref, far, path->frame, PHASE2_LOSS_HALF_DB);
+	path_run(path, far, echo);
+	noise_fill(hiss, path->frame, PHASE2_HISS_DBM0, state);
+	for (i = 0; i < path->frame; i++)
+		out[i] = sample_clamp((double)echo[i] + hiss[i]);
+	udsp_ec_nlms.run(ec, out, ref);
+	for (i = 0; i < path->frame; i++) {
+		sum->echo += (double)echo[i] * echo[i];
+		sum->out += (double)out[i] * out[i];
+	}
+}
+
+/*
+ * A line of over_return_test: model and erl_b, the path of model b and its
+ * echo return loss; tail_ms, the tail of the canceller (0 for the default
+ * of the rate); delay_ms, the delay of the three paths; and the bounds of
+ * the line, settled_max for settled and erle_min for erle_db.
+ */
+struct return_line {
+	enum annex_d_model model;
+	double erl_b;
+	unsigned tail_ms;
+	unsigned delay_ms;
+	unsigned settled_max;
+	double erle_min;
+	const char *what;
+};
+
+static void return_path_run(unsigned rate, const struct return_line *line,
+			    bool nlp, struct return_result *r)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct phase2_sums sum = { 0 };
+	struct phase2_sums block = { 0 };
+	struct phase2_sums window = { 0 };
+	struct echo_path path;
+	struct echo_path next;
+	struct css_annex css;
+	struct udsp_ec *ec = udsp_ec_nlms.create_rate(line->tail_ms, rate);
+	uint32_t state = 0x51ab0dd5u;
+	unsigned long from = rate + path_samples_get(line->delay_ms, rate);
+	double a = exp(-1000.0 / (PHASE1_METER_MS * rate));
+	double live[2] = { 0.0, 0.0 };
+	double meter = 0.0;
+	double loudest = 0.0;
+	int16_t out[UDSP_FRAME_MAX];
+	double energy;
+	uint32_t probes;
+	unsigned f;
+	unsigned i;
+
+	memset(r, 0, sizeof(*r));
+	css_annex_init(&css, rate, PHASE2_FAR_DBM0, 0x0c55a11eu);
+	udsp_ec_nlms.nlp(ec, nlp);
+	udsp_ec_nlms_ref_loss_set(ec, PHASE2_LOSS_HALF_DB);
+	path_annex_d_init(&path, rate, ANNEX_D_M1,
+			  line->erl_b + PHASE2_DELTA_ERL_DB, line->delay_ms);
+	for (f = 0; f < 2u * RETURN_PHASE_FRAMES; f++) {
+		if (f == RETURN_PHASE_FRAMES) {
+			path_annex_d_init(&next, rate, line->model,
+					  line->erl_b, line->delay_ms);
+			path_history_carry(&next, &path);
+			path = next;
+		}
+		return_frame_run(ec, &path, &css, &state, &sum, out);
+		udsp_ec_nlms_frame_get(ec, &reading);
+		over_live_add(live, &reading);
+	}
+	udsp_ec_nlms_info_get(ec, &info);
+	probes = info.probes;
+	r->resets = info.diverge_resets;
+	energy = info.coef_energy;
+	path_annex_d_init(&next, rate, ANNEX_D_M1,
+			  line->erl_b + PHASE2_DELTA_ERL_DB, line->delay_ms);
+	path_history_carry(&next, &path);
+	path = next;
+	for (f = 1; f <= RETURN_FRAMES; f++) {
+		return_frame_run(ec, &path, &css, &state, &block, out);
+		udsp_ec_nlms_frame_get(ec, &reading);
+		udsp_ec_nlms_info_get(ec, &info);
+		over_live_add(live, &reading);
+		for (i = 0; i < path.frame; i++) {
+			meter = a * meter + (1.0 - a) * out[i] * out[i];
+			if ((unsigned long)(f - 1u) * path.frame + i >= from &&
+			    meter > loudest) {
+				loudest = meter;
+				r->loud = f;
+			}
+		}
+		if (!r->start && reading.ref_power >= reading.ref_bar)
+			r->run = over_live_over(live) ? r->run + 1u : 0u;
+		if (!r->start && info.probes != probes) {
+			r->start = f;
+			r->arm = reading.trial_arm;
+			r->scale_db = over_db_get(info.coef_energy, energy);
+			r->live_db = over_db_get(live[1], live[0]);
+		}
+		if (r->start && !r->end_kind)
+			r->end_kind = reading.trial_end;
+		energy = info.coef_energy;
+		if (f % PHASE2_BLOCK_FRAMES)
+			continue;
+		if (f > PHASE2_ANCHOR_FRAMES &&
+		    f <= PHASE2_ANCHOR_FRAMES + PHASE2_WINDOW_FRAMES) {
+			window.echo += block.echo;
+			window.out += block.out;
+		}
+		if (!r->settled &&
+		    phase2_db_get(block.echo, block.out) >= PHASE2_SETTLED_DB)
+			r->settled = f;
+		memset(&block, 0, sizeof(block));
+	}
+	udsp_ec_nlms_info_get(ec, &info);
+	r->trials = info.probes - probes;
+	r->resets = info.diverge_resets - r->resets;
+	r->erle_db = phase2_db_get(window.echo, window.out);
+	r->l_ret_dbm0 = rms_dbm0_get(sqrt(loudest));
+	udsp_ec_nlms.destroy(ec);
+}
+
+/* The bounds of over_return_test after the return: the first settled block
+ * within RETURN_SETTLED_FRAMES and RETURN_ERLE_DB from 1 s, both within 1 s on
+ * the short line. RETURN_LRET_DBM0 bounds the processor on. */
+#define RETURN_SETTLED_FRAMES	(2u * FRAMES_PER_SECOND)
+#define RETURN_ERLE_DB		12.0
+#define RETURN_LRET_DBM0	-45.0
+#define RETURN_SHORT_TAIL_MS	32u
+#define RETURN_SHORT_DELAY_MS	8u
+
+/*
+ * The third phase of G.168 test 12 on three lines and the short line: the
+ * trusted filter stands 10 dB over the line. The escape starts a kept
+ * path-change trial from scaled taps. The scale stands within 1 dB under the
+ * live ratio, as the plain update of the start frame comes first.
+ */
+static void over_return_test(unsigned rate)
+{
+	static const struct return_line legs[4] = {
+		{ ANNEX_D_M4, 6.0, 0u, PHASE2_DELAY_MS, RETURN_SETTLED_FRAMES,
+		  RETURN_ERLE_DB, "m4 at 6 dB" },
+		{ ANNEX_D_M7, 12.0, 0u, PHASE2_DELAY_MS, RETURN_SETTLED_FRAMES,
+		  RETURN_ERLE_DB, "m7 at 12 dB" },
+		{ ANNEX_D_M8, 12.0, 0u, PHASE2_DELAY_MS, RETURN_SETTLED_FRAMES,
+		  RETURN_ERLE_DB, "m8 at 12 dB" },
+		{ ANNEX_D_M4, 6.0, RETURN_SHORT_TAIL_MS, RETURN_SHORT_DELAY_MS,
+		  FRAMES_PER_SECOND, PHASE2_SETTLED_DB,
+		  "m4 at 6 dB, 32 ms tail, 8 ms delay" },
+	};
+	unsigned i;
+
+	case_rate(rate, "lec escapes the return of G.168 test 12 to a quieter "
+		  "path");
+	for (i = 0; i < 4u; i++) {
+		struct return_result r;
+		struct return_result on;
+
+		return_path_run(rate, &legs[i], false, &r);
+		return_path_run(rate, &legs[i], true, &on);
+		printf("# %u Hz, %s back to m1: trial of arm %s on frame %u "
+		       "after a run of %u active frames, ended %s; taps scaled "
+		       "by %+.2f dB of energy against %+.2f dB of live "
+		       "microphone over live estimate; 20 dB on frame %u, "
+		       "%.2f dB of ERLE at 1 s; %u trials, %u resets; with the "
+		       "processor, trial on frame %u, l_ret %.1f dBm0 on frame "
+		       "%u\n", rate,
+		       legs[i].what, lecr_trial_arm_name(r.arm), r.start, r.run,
+		       lecr_trial_end_name(r.end_kind), r.scale_db, r.live_db,
+		       r.settled, r.erle_db, r.trials, r.resets, on.start,
+		       on.l_ret_dbm0, on.loud);
+		CHECK_UINT(r.arm, UDSP_EC_NLMS_TRIAL_ARM_PATH);
+		CHECK_UINT(r.run, OVER_FRAMES);
+		CHECK(r.live_db <= -OVER_RATIO_DB);
+		CHECK(r.scale_db <= r.live_db + 0.05 &&
+		      r.scale_db >= r.live_db - 1.0);
+		CHECK_UINT(r.end_kind, UDSP_EC_NLMS_TRIAL_END_KEPT);
+		CHECK(r.settled > 0u && r.settled <= legs[i].settled_max);
+		CHECK(r.erle_db >= legs[i].erle_min);
+		CHECK_UINT(r.resets, 0);
+		CHECK_UINT(on.start, r.start);
+		CHECK(on.l_ret_dbm0 <= RETURN_LRET_DBM0);
+	}
+}
+
+/* The drop line of over_talker_test: the far end falls by OVER_DROP_DB after
+ * the pause and stays active. From OVER_DROP_TALK_FRAME the guard holds the
+ * quieter far end while the live estimate carries the louder frames. */
+#define OVER_DROP_FAR_DBM0	-10.0
+#define OVER_DROP_ERL_DB	6.0
+#define OVER_DROP_OVER_DB	10.0
+#define OVER_DROP_DB		30.0
+#define OVER_DROP_FRAME		4u
+#define OVER_DROP_TALK_FRAME	9u
+#define OVER_DROP_TALK_DB	14.0
+
+/*
+ * The figures of the drop line: trusted, the trust of the converged line;
+ * start, the active frame after the pause that starts the first trial (0
+ * for none), and trials, the trials started. With talk: talker, the talker
+ * verdict of the frame of the talker, and live_db, the rebuilt live
+ * estimate over the rebuilt live microphone of that frame.
+ */
+struct over_drop_result {
+	bool trusted;
+	unsigned start;
+	unsigned trials;
+	bool talker;
+	double live_db;
+};
+
+static void over_drop_run(unsigned rate, bool talk, struct over_drop_result *r)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct over_line l;
+	unsigned active_n = 0;
+	bool dropped = false;
+	uint32_t probes;
+	unsigned f;
+	bool active;
+
+	memset(r, 0, sizeof(*r));
+	r->trusted = over_line_open(&l, rate, OVER_DROP_ERL_DB,
+				    OVER_DROP_FAR_DBM0);
+	udsp_ec_nlms.freeze(l.ec, true);
+	over_line_pause(&l, OVER_DROP_OVER_DB);
+	udsp_ec_nlms_info_get(l.ec, &info);
+	probes = info.probes;
+	for (f = 0; f < OVER_RUN_FRAMES; f++) {
+		bool talker = talk && active_n + 1u == OVER_DROP_TALK_FRAME;
+
+		if (!dropped && active_n + 1u == OVER_DROP_FRAME) {
+			l.far_dbm0 -= OVER_DROP_DB;
+			dropped = true;
+		}
+		over_frame_run(&l, talker ? l.far_dbm0 + OVER_DROP_TALK_DB :
+				   OVER_NONE_DBM0, &reading, &info, &active);
+		active_n += active;
+		if (talker) {
+			r->talker = reading.talker;
+			r->live_db = over_db_get(l.live[0], l.live[1]);
+		}
+		if (!r->start && info.probes != probes)
+			r->start = active_n;
+	}
+	r->trials = info.probes - probes;
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/*
+ * The talker condition of the over-estimate run: without the talker the trial
+ * starts on the OVER_FRAMES-th active frame after the pause. A talker on
+ * OVER_DROP_TALK_FRAME restarts the run, so the trial starts OVER_FRAMES active
+ * frames after it.
+ */
+static void over_talker_test(unsigned rate)
+{
+	struct over_drop_result r;
+
+	case_rate(rate, "lec starts the over-estimate run over on a talker");
+	over_drop_run(rate, false, &r);
+	printf("# %u Hz, no talker: %u trials, first on active frame %u\n",
+	       rate, r.trials, r.start);
+	CHECK(r.trusted);
+	CHECK_UINT(r.start, OVER_FRAMES);
+	over_drop_run(rate, true, &r);
+	printf("# %u Hz, talker on active frame %u: talker %d, live estimate "
+	       "%+.2f dB over live microphone; %u trials, first on active "
+	       "frame %u\n", rate, OVER_DROP_TALK_FRAME, r.talker, r.live_db,
+	       r.trials, r.start);
+	CHECK(r.trusted);
+	CHECK(r.talker);
+	CHECK(r.live_db >= OVER_RATIO_DB);
+	CHECK_UINT(r.start, OVER_DROP_TALK_FRAME + OVER_FRAMES);
+}
+
+/* The trial edge of over_edge_test: the over line, the trial kept after its
+ * budget, then a pause in which the hybrid turns OVER_EDGE_STEP_DB quieter. The
+ * line then stands over the ratio from the first active frame after it. */
+#define OVER_EDGE_DB		8.0
+#define OVER_EDGE_STEP_DB	6.0
+#define OVER_EDGE_FRAMES	(2u * TRIAL_BUDGET)
+
+/*
+ * The figures of over_edge_test: trusted, the trust of the converged line;
+ * start, the active frame after the first pause that starts the trial, and
+ * end and end_kind, the active frame of its end and the end; next, the
+ * figures of over_line_run after the second pause.
+ */
+struct over_edge_result {
+	bool trusted;
+	unsigned start;
+	unsigned end;
+	unsigned end_kind;
+	struct over_result next;
+};
+
+static void over_edge_run(unsigned rate, struct over_edge_result *r)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct over_line l;
+	unsigned active_n = 0;
+	uint32_t probes;
+	unsigned f;
+	bool active;
+
+	memset(r, 0, sizeof(*r));
+	r->trusted = over_line_start(&l, rate);
+	udsp_ec_nlms.freeze(l.ec, true);
+	over_line_pause(&l, OVER_EDGE_DB);
+	udsp_ec_nlms_info_get(l.ec, &info);
+	probes = info.probes;
+	for (f = 0; f < OVER_EDGE_FRAMES && !r->end_kind; f++) {
+		over_frame_run(&l, OVER_NONE_DBM0, &reading, &info, &active);
+		active_n += active;
+		if (!r->start && info.probes != probes) {
+			r->start = active_n;
+			udsp_ec_nlms.freeze(l.ec, false);
+		} else if (r->start && reading.trial_end) {
+			r->end = active_n;
+			r->end_kind = reading.trial_end;
+		}
+	}
+	udsp_ec_nlms.freeze(l.ec, true);
+	l.quiet = true;
+	for (f = 0; f < OVER_PAUSE_FRAMES; f++)
+		over_frame_run(&l, OVER_NONE_DBM0, &reading, &info, &active);
+	l.quiet = false;
+	over_path_step(&l, OVER_EDGE_STEP_DB);
+	over_line_run(&l, OVER_RUN_FRAMES, false, 0.0, &r->next);
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/*
+ * The over-estimate run across a trial edge. The run starts over at the
+ * start of a trial and at its end (runs_clear). After a kept trial, the
+ * next trial therefore waits for OVER_FRAMES fresh active frames over the
+ * ratio. The trust of the kept trial still holds after the pause, so the
+ * gate holds for the next run.
+ */
+static void over_edge_test(unsigned rate)
+{
+	struct over_edge_result r;
+
+	case_rate(rate, "lec counts the over-estimate run afresh after a kept "
+		  "trial");
+	over_edge_run(rate, &r);
+	printf("# %u Hz: trial on active frame %u, ended %s on active frame "
+	       "%u; after the pause, %u trials, first on active frame %u "
+	       "after a run of %u, trusted on the first frame %d\n", rate,
+	       r.start, r.end_kind ? lecr_trial_end_name(r.end_kind) : "-",
+	       r.end, r.next.trials, r.next.start, r.next.run,
+	       r.next.trusted);
+	CHECK(r.trusted);
+	CHECK_UINT(r.start, OVER_FRAMES);
+	CHECK_UINT(r.end_kind, UDSP_EC_NLMS_TRIAL_END_KEPT);
+	CHECK_UINT(r.end, OVER_FRAMES + TRIAL_BUDGET);
+	CHECK(r.next.trusted);
+	CHECK_UINT(r.next.trials, 1);
+	CHECK_UINT(r.next.arm, UDSP_EC_NLMS_TRIAL_ARM_PATH);
+	CHECK_UINT(r.next.start, OVER_FRAMES);
+	CHECK_UINT(r.next.run, OVER_FRAMES);
+}
+
+/*
+ * The growth line of over_watchdog_test: the hybrid grows until the watchdog
+ * zeroes the filter, which relearns and freezes. A quieter step then puts the
+ * live estimate over the ratio within LEC_OVER_TRUST_FRAMES of the last trust.
+ */
+#define OVER_GROW_FAR_DBM0	-40.0
+#define OVER_GROW_DB		0.0025
+#define OVER_GROW_FRAMES	(100u * FRAMES_PER_SECOND)
+#define OVER_RELEARN_FRAMES	10u
+#define OVER_STEP_FAR_DBM0	-10.0
+#define OVER_STEP_DB		15.0
+
+/*
+ * The figures of over_watchdog_test: the zeroing frame, the trials of the
+ * growth and the last trust before it. Then the first frame and length of the
+ * rebuilt run after it, the trials after it, and the coefficient energy of the
+ * reset frame.
+ */
+struct over_watchdog_result {
+	unsigned reset;
+	unsigned grow_trials;
+	unsigned trusted;
+	unsigned first;
+	unsigned run;
+	unsigned next;
+	double coef;
+};
+
+/* The growth of the line up to the reset of the watchdog. */
+static void over_grow_run(struct over_line *l,
+			  struct over_watchdog_result *r)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	uint32_t probes;
+	uint32_t resets;
+	unsigned f;
+	bool active;
+
+	udsp_ec_nlms_info_get(l->ec, &info);
+	probes = info.probes;
+	resets = info.diverge_resets;
+	for (f = 1; f <= OVER_GROW_FRAMES && !r->reset; f++) {
+		over_path_step(l, -OVER_GROW_DB);
+		over_frame_run(l, OVER_NONE_DBM0, &reading, &info, &active);
+		if (reading.trusted)
+			r->trusted = f;
+		if (info.diverge_resets != resets) {
+			r->reset = f;
+			r->coef = info.coef_energy;
+			/* The watchdog seeds the live microphone with the
+			 * frame and zeroes the live estimate. */
+			l->live[0] = 0.0;
+			l->live[1] = reading.mic_power;
+		}
+	}
+	r->grow_trials = info.probes - probes;
+}
+
+static void over_watchdog_run(unsigned rate, struct over_watchdog_result *r)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct echo_path back;
+	struct over_line l;
+	uint32_t probes;
+	unsigned f;
+	bool active;
+
+	memset(r, 0, sizeof(*r));
+	over_line_open(&l, rate, CHANGE_ERL_DB, OVER_GROW_FAR_DBM0);
+	over_grow_run(&l, r);
+	back = l.base;
+	path_history_carry(&back, &l.path);
+	l.path = back;
+	udsp_ec_nlms_info_get(l.ec, &info);
+	probes = info.probes;
+	for (f = 1; r->reset && f <= OVER_RELEARN_FRAMES + OVER_RUN_FRAMES;
+	     f++) {
+		if (f == OVER_RELEARN_FRAMES + 1u) {
+			udsp_ec_nlms.freeze(l.ec, true);
+			l.far_dbm0 = OVER_STEP_FAR_DBM0;
+			over_path_step(&l, OVER_STEP_DB);
+		}
+		over_frame_run(&l, OVER_NONE_DBM0, &reading, &info, &active);
+		if (!active)
+			continue;
+		r->run = over_live_over(l.live) ? r->run + 1u : 0u;
+		if (r->run == 1u && !r->first)
+			r->first = f;
+	}
+	r->next = info.probes - probes;
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/*
+ * The watchdog and the trust gate of the over-estimate run. The zeroing starts
+ * the state of the run over and reads the trust as lost (over_restart). The
+ * trust of the relearned filter waits for its own count. A run of that filter
+ * within LEC_OVER_TRUST_FRAMES frames of the zeroed one's last trust therefore
+ * starts no trial.
+ */
+static void over_watchdog_test(unsigned rate)
+{
+	struct over_watchdog_result r;
+
+	case_rate(rate, "lec reads the trust as lost after the watchdog");
+	over_watchdog_run(rate, &r);
+	printf("# %u Hz: watchdog on frame %u of the growth, %u trials in it, "
+	       "coefficient energy %.4f after it; trust last held on frame "
+	       "%u; a run over the ratio from frame %u after the reset, %u "
+	       "frames long at the end; %u trials after the reset\n", rate,
+	       r.reset, r.grow_trials, r.coef, r.trusted, r.first, r.run,
+	       r.next);
+	CHECK(r.reset > 0u);
+	CHECK_UINT(r.grow_trials, 0);
+	CHECK(r.coef == 0.0);
+	CHECK(r.first > 0u &&
+	      r.reset + r.first - r.trusted <= OVER_TRUST_FRAMES);
+	CHECK(r.run >= OVER_FRAMES);
+	CHECK_UINT(r.next, 0);
+}
+
+/* The floor_keep line: white far bursts with pauses of pause_extra plus one
+ * quiet frames, and m1 then m4 behind FLOOR_KEEP_DELAY_MS. A line noise rises
+ * rise_db at the change and late_db later, under an optional near signal. */
+#define FLOOR_KEEP_PERIOD_FRAMES	50u
+#define FLOOR_KEEP_DELAY_MS		8u
+#define FLOOR_KEEP_FRAMES		(14u * FRAMES_PER_SECOND)
+#define FLOOR_KEEP_LATE_FRAMES		(2u * FRAMES_PER_SECOND)
+#define FLOOR_KEEP_TALK_FRAMES		700u
+#define FLOOR_KEEP_RISE_DB		8.0
+#define FLOOR_KEEP_TALK_DB		6.0
+#define FLOOR_KEEP_BACK_DB		1.0
+
+/*
+ * The stationary near signals of the floor_keep line, each at a constant
+ * level: a held vowel in the color of word 0 or word 1 of word_fill
+ * (lec_paths.h), white noise, or the Hoth noise of room_noise_fill.
+ */
+enum floor_keep_held {
+	FLOOR_HELD_NONE,
+	FLOOR_HELD_VOWEL0,
+	FLOOR_HELD_VOWEL1,
+	FLOOR_HELD_WHITE,
+	FLOOR_HELD_HOTH,
+};
+
+struct floor_keep_line {
+	unsigned pause_extra;
+	double rise_db;
+	double late_db;
+	unsigned late_after;
+	double talk_db;
+	enum floor_keep_held held;
+	double held_db;
+	unsigned held_at;
+	unsigned held_frames;
+	double pause_db;
+	unsigned frames;
+};
+
+struct floor_held_source {
+	enum floor_keep_held kind;
+	uint32_t state;
+	double level_dbm0;
+	double m1;
+	double m2;
+	struct room_noise room;
+};
+
+static void floor_held_init(struct floor_held_source *h,
+			    enum floor_keep_held kind, double level_dbm0)
+{
+	memset(h, 0, sizeof(*h));
+	h->kind = kind;
+	h->state = 0x13579bdfu;
+	h->level_dbm0 = level_dbm0;
+	if (kind == FLOOR_HELD_HOTH)
+		room_noise_init(&h->room, ROOM_HOTH, level_dbm0, 0x2468ace1u);
+}
+
+/* One frame of the held signal. A vowel frame is the colored noise of
+ * word_fill rescaled to the level, without the syllabic envelope. */
+static void floor_held_fill(struct floor_held_source *h, int16_t *dst,
+			    unsigned frame)
+{
+	static const double colour[2][2] = { { 1.2, -0.6 }, { 1.7, -0.9 } };
+	const double *tap = colour[h->kind == FLOOR_HELD_VOWEL1];
+	double energy = 0.0;
+	double scale;
+	unsigned k;
+
+	if (h->kind == FLOOR_HELD_HOTH) {
+		room_noise_fill(dst, frame, &h->room);
+		return;
+	}
+	noise_fill(dst, frame, h->level_dbm0, &h->state);
+	if (h->kind == FLOOR_HELD_WHITE)
+		return;
+	for (k = 0; k < frame; k++) {
+		double y = 0.3 * dst[k] + tap[0] * h->m1 + tap[1] * h->m2;
+
+		h->m2 = h->m1;
+		h->m1 = y;
+		dst[k] = sample_clamp(y);
+		energy += y * y;
+	}
+	scale = energy > 0.0 ?
+		dbm0_rms_get(h->level_dbm0) / sqrt(energy / frame) : 0.0;
+	for (k = 0; k < frame; k++)
+		dst[k] = sample_clamp((double)dst[k] * scale);
+}
+
+/* The keep, the rise, the floor levels, waits, frames without a floor, fires
+ * and the fall. */
+struct floor_keep_result {
+	unsigned keep;
+	unsigned arm;
+	unsigned rise;
+	unsigned late_waits;
+	unsigned nofloor;
+	unsigned fired;
+	double loudest_db;
+	double end_db;
+	double jump_db;
+	unsigned fall;
+	bool fell;
+};
+
+/* One frame of the floor_keep line: a burst frame or a pause frame of the
+ * far end through path, the line noise and the talker frame near. */
+static void floor_keep_frame(struct udsp_ec *ec, struct echo_path *path,
+			     uint32_t state[2], bool burst, double hiss_dbm0,
+			     const int16_t *near)
+{
+	int16_t far[UDSP_FRAME_MAX];
+	int16_t ref[UDSP_FRAME_MAX];
+	int16_t echo[UDSP_FRAME_MAX];
+	int16_t hiss[UDSP_FRAME_MAX];
+	int16_t mic[UDSP_FRAME_MAX];
+	unsigned i;
+
+	if (burst)
+		noise_fill(far, path->frame, PHASE2_FAR_DBM0, &state[0]);
+	else
+		memset(far, 0, sizeof(far));
+	level_loss_apply(ref, far, path->frame, PHASE2_LOSS_HALF_DB);
+	path_run(path, far, echo);
+	noise_fill(hiss, path->frame, hiss_dbm0, &state[1]);
+	for (i = 0; i < path->frame; i++)
+		mic[i] = sample_clamp((double)echo[i] + hiss[i] +
+				      (near ? near[i] : 0));
+	udsp_ec_nlms.run(ec, mic, ref);
+}
+
+static void floor_keep_run(unsigned rate, const struct floor_keep_line *l,
+			   struct floor_keep_result *r)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct floor_held_source held;
+	struct dense_talker talker;
+	struct echo_path path;
+	struct echo_path next;
+	struct udsp_ec *ec = udsp_ec_nlms.create_rate(0, rate);
+	uint32_t state[2] = { 0x2a5e1c0du, 0x51ab0dd5u };
+	uint32_t pause_state = 0x3c6ef372u;
+	int16_t near[UDSP_FRAME_MAX];
+	unsigned frame = rate / 100u;
+	unsigned pause;
+	unsigned reads = 0;
+	unsigned f;
+	uint32_t waits = 0;
+	float last = 127.0f;
+	float before;
+
+	memset(r, 0, sizeof(*r));
+	floor_held_init(&held, l->held, PHASE2_HISS_DBM0 + l->held_db);
+	udsp_ec_nlms_info_get(ec, &info);
+	pause = (info.taps + frame - 1u) / frame + l->pause_extra;
+	dense_talker_init(&talker, rate, PHASE2_HISS_DBM0 + l->talk_db,
+			  NEAR_START_SEED);
+	udsp_ec_nlms_ref_loss_set(ec, PHASE2_LOSS_HALF_DB);
+	udsp_ec_nlms.nlp(ec, true);
+	path_annex_d_init(&path, rate, ANNEX_D_M1,
+			  phase2_erl_db[0] + PHASE2_DELTA_ERL_DB,
+			  FLOOR_KEEP_DELAY_MS);
+	for (f = 0; f < PHASE2_CONVERGE_FRAMES; f++)
+		floor_keep_frame(ec, &path, state,
+				 f % FLOOR_KEEP_PERIOD_FRAMES <
+				 FLOOR_KEEP_PERIOD_FRAMES - pause,
+				 PHASE2_HISS_DBM0, NULL);
+	udsp_ec_nlms_info_get(ec, &info);
+	before = info.noise_dbov;
+	path_annex_d_init(&next, rate, phase2_models[0], phase2_erl_db[0],
+			  FLOOR_KEEP_DELAY_MS);
+	path_history_carry(&next, &path);
+	for (f = 0; f < l->frames; f++) {
+		unsigned g = PHASE2_CONVERGE_FRAMES + f;
+		bool talking = l->talk_db > 0.0 && r->keep && f >= r->keep &&
+			       f < r->keep + FLOOR_KEEP_TALK_FRAMES;
+		unsigned from = r->keep + l->held_at;
+		bool holding = l->held && r->keep && f >= from &&
+			       (!l->held_frames || f < from + l->held_frames);
+		bool after = l->held && l->held_frames && r->keep &&
+			     f >= from + l->held_frames;
+		bool late = l->late_after && r->keep &&
+			    f >= r->keep + l->late_after;
+		bool burst = g % FLOOR_KEEP_PERIOD_FRAMES <
+			     FLOOR_KEEP_PERIOD_FRAMES - pause;
+		bool pausing = l->pause_db > 0.0 && !burst;
+
+		if (talking)
+			dense_talker_fill(&talker, near, frame);
+		if (holding)
+			floor_held_fill(&held, near, frame);
+		if (pausing)
+			noise_fill(near, frame, PHASE2_HISS_DBM0 + l->pause_db,
+				   &pause_state);
+		floor_keep_frame(ec, &next, state, burst,
+				 PHASE2_HISS_DBM0 + l->rise_db +
+				 (late ? l->late_db : 0.0),
+				 talking || holding || pausing ? near : NULL);
+		udsp_ec_nlms_info_get(ec, &info);
+		udsp_ec_nlms_frame_get(ec, &reading);
+		if (!r->keep &&
+		    reading.trial_arm != UDSP_EC_NLMS_TRIAL_ARM_NONE)
+			r->arm = reading.trial_arm;
+		if (!r->keep &&
+		    reading.trial_end == UDSP_EC_NLMS_TRIAL_END_KEPT)
+			r->keep = f + 1u;
+		if (r->keep && f >= r->keep) {
+			r->nofloor += info.noise_dbov >= 127.0f;
+			r->fired += reading.dt_fired;
+			if (before - info.noise_dbov > r->loudest_db)
+				r->loudest_db = before - info.noise_dbov;
+			if (!r->rise && before - info.noise_dbov >= 3.0f)
+				r->rise = f + 1u - r->keep;
+			if (last < 127.0f && info.noise_dbov < 127.0f &&
+			    last - info.noise_dbov > r->jump_db)
+				r->jump_db = last - info.noise_dbov;
+		}
+		if (after && !r->fell) {
+			reads += reading.window_run == 0u;
+			if (info.noise_dbov < 127.0f &&
+			    fabsf(before - info.noise_dbov) <=
+			    FLOOR_KEEP_BACK_DB) {
+				r->fell = true;
+				r->fall = reads;
+			}
+		}
+		last = info.noise_dbov;
+		if (f >= l->frames - FLOOR_KEEP_LATE_FRAMES)
+			r->late_waits += info.nlp_wait_frames - waits;
+		waits = info.nlp_wait_frames;
+	}
+	r->end_db = before - info.noise_dbov;
+	udsp_ec_nlms.destroy(ec);
+}
+
+static void floor_keep_print(unsigned rate, const char *what,
+			     const struct floor_keep_result *r)
+{
+	printf("# %u Hz, %s: kept trial of arm %s on frame %u after the "
+	       "change; the floor rises %u frames after the keep, loudest "
+	       "%.1f dB and at the end %.1f dB over the floor before the "
+	       "change; %u engage waits in the last 2 s\n", rate, what,
+	       lecr_trial_arm_name(r->arm), r->keep, r->rise, r->loudest_db,
+	       r->end_db, r->late_waits);
+}
+
+/* The bound of floor_keep_test on the frames from the keep to the rise:
+ * LEC_NOISE_RISE_AGE_KEPT of dsp/lec.c. */
+#define FLOOR_KEEP_RISE_MAX		700u
+
+/*
+ * A background that rises FLOOR_KEEP_RISE_DB with a louder path, 8 readings a
+ * second: the change ends in a kept escape trial. The floor rises within
+ * FLOOR_KEEP_RISE_MAX frames of the keep and ends within 2 dB of the rise,
+ * never 2 dB over it; no frame of the last 2 s waits.
+ */
+static void floor_keep_test(unsigned rate)
+{
+	static const struct floor_keep_line line = {
+		.pause_extra = 3u, .rise_db = FLOOR_KEEP_RISE_DB,
+		.frames = FLOOR_KEEP_FRAMES,
+	};
+	struct floor_keep_result r;
+
+	floor_keep_run(rate, &line, &r);
+	case_rate(rate, "lec takes the louder background of a kept echo path "
+		  "change as its floor");
+	floor_keep_print(rate, "background 8 dB up at the change", &r);
+	CHECK(r.keep > 0u);
+	CHECK(r.arm == UDSP_EC_NLMS_TRIAL_ARM_PATH ||
+	      r.arm == UDSP_EC_NLMS_TRIAL_ARM_COHERE);
+	CHECK(r.rise > 0u && r.rise <= FLOOR_KEEP_RISE_MAX);
+	CHECK(r.end_db >= FLOOR_KEEP_RISE_DB - 2.0);
+	CHECK(r.loudest_db <= FLOOR_KEEP_RISE_DB + 2.0);
+	CHECK_UINT(r.late_waits, 0);
+}
+
+/* The bound of floor_keep_flat_test and floor_keep_talker_test on the
+ * loudest floor after the keep, over the floor before the change. */
+#define FLOOR_KEEP_FLAT_DB		1.0
+
+/*
+ * The line of floor_keep_test with a background that does not rise. The
+ * floor after the keep must stand FLOOR_KEEP_FLAT_DB or less over the floor
+ * before the change, and must not rise.
+ */
+static void floor_keep_flat_test(unsigned rate)
+{
+	static const struct floor_keep_line line = {
+		.pause_extra = 3u, .frames = FLOOR_KEEP_FRAMES,
+	};
+	struct floor_keep_result r;
+
+	floor_keep_run(rate, &line, &r);
+	case_rate(rate, "lec keeps its floor after a kept echo path change "
+		  "over the same background");
+	floor_keep_print(rate, "background unchanged", &r);
+	CHECK(r.keep > 0u);
+	CHECK_UINT(r.rise, 0);
+	CHECK(r.loudest_db <= FLOOR_KEEP_FLAT_DB);
+}
+
+/*
+ * The line of floor_keep_flat_test with a dense talker FLOOR_KEEP_TALK_DB
+ * over the line noise for FLOOR_KEEP_TALK_FRAMES from the keep. No rise run
+ * holds a reading at the keep, so the window stays closed. The floor must
+ * not rise onto the talker: it must stand FLOOR_KEEP_FLAT_DB or less over
+ * the floor before the change.
+ */
+static void floor_keep_talker_test(unsigned rate)
+{
+	static const struct floor_keep_line line = {
+		.pause_extra = 3u, .talk_db = FLOOR_KEEP_TALK_DB,
+		.frames = FLOOR_KEEP_FRAMES,
+	};
+	struct floor_keep_result r;
+
+	floor_keep_run(rate, &line, &r);
+	case_rate(rate, "lec keeps its floor under a quiet near talker after "
+		  "a kept echo path change");
+	floor_keep_print(rate, "talker 6 dB over the line noise", &r);
+	CHECK(r.keep > 0u);
+	CHECK_UINT(r.rise, 0);
+	CHECK(r.loudest_db <= FLOOR_KEEP_FLAT_DB);
+}
+
+/*
+ * With pauses of 3 quiet frames, no rise run of 50 completes in the window, but
+ * the agreement run completes past LEC_NOISE_RISE_AGE. The floor takes the rise
+ * within FLOOR_KEEP_RISE_MAX of the keep, as the window bounds the age of both
+ * runs.
+ */
+static void floor_keep_window_test(unsigned rate)
+{
+	static const struct floor_keep_line line = {
+		.pause_extra = 2u, .rise_db = FLOOR_KEEP_RISE_DB,
+		.frames = FLOOR_KEEP_FRAMES,
+	};
+	struct floor_keep_result r;
+
+	floor_keep_run(rate, &line, &r);
+	case_rate(rate, "lec re-acquires its floor on sparse pauses within "
+		  "the window after a kept echo path change");
+	floor_keep_print(rate, "background 8 dB up, sparser pauses", &r);
+	CHECK(r.keep > 0u);
+	CHECK(r.rise > 0u && r.rise <= FLOOR_KEEP_RISE_MAX);
+	CHECK(r.end_db >= FLOOR_KEEP_RISE_DB - 2.0);
+	CHECK(r.loudest_db <= FLOOR_KEEP_RISE_DB + 2.0);
+}
+
+/*
+ * The line of floor_keep_test with a dense talker FLOOR_KEEP_TALK_DB over
+ * the louder line noise for FLOOR_KEEP_TALK_FRAMES from the keep. The rise
+ * at the change opens the window, and the talker talks through all of it.
+ * The floor must not climb onto the talker: it must never stand more than
+ * 2 dB over the rise of the background.
+ */
+static void floor_keep_open_talker_test(unsigned rate)
+{
+	static const struct floor_keep_line line = {
+		.pause_extra = 3u, .rise_db = FLOOR_KEEP_RISE_DB,
+		.talk_db = FLOOR_KEEP_RISE_DB + FLOOR_KEEP_TALK_DB,
+		.frames = FLOOR_KEEP_FRAMES,
+	};
+	struct floor_keep_result r;
+
+	floor_keep_run(rate, &line, &r);
+	case_rate(rate, "lec keeps its floor off a quiet near talker in an "
+		  "open re-acquisition window");
+	floor_keep_print(rate, "background 8 dB up, talker 6 dB over it", &r);
+	CHECK(r.keep > 0u);
+	CHECK(r.loudest_db <= FLOOR_KEEP_RISE_DB + 2.0);
+}
+
+/* The level of the pause content of floor_keep_pause_test over the line
+ * noise. */
+#define FLOOR_KEEP_PAUSE_DB		8.0
+
+/*
+ * The line of floor_keep_flat_test with white noise FLOOR_KEEP_PAUSE_DB over
+ * the line noise on the far pauses alone, as an echo beyond the window gives.
+ * The pauses open the window, and the filter output of the far bursts
+ * falsifies their runs. After the keep, no frame must lose the floor or fire
+ * the detector, and the floor must not rise.
+ */
+static void floor_keep_pause_test(unsigned rate)
+{
+	static const struct floor_keep_line line = {
+		.pause_extra = 3u, .pause_db = FLOOR_KEEP_PAUSE_DB,
+		.frames = FLOOR_KEEP_FRAMES,
+	};
+	struct floor_keep_result r;
+
+	floor_keep_run(rate, &line, &r);
+	case_rate(rate, "lec keeps its floor through pause content that the "
+		  "far bursts falsify after a kept echo path change");
+	floor_keep_print(rate, "pause content 8 dB over the line noise", &r);
+	printf("# %u Hz: %u frames without a floor and %u fired frames after "
+	       "the keep\n", rate, r.nofloor, r.fired);
+	CHECK(r.keep > 0u);
+	CHECK_UINT(r.nofloor, 0);
+	CHECK_UINT(r.fired, 0);
+	CHECK_UINT(r.rise, 0);
+}
+
+/* The second rise of floor_keep_expiry_test after the keep, past the
+ * window of LEC_NOISE_RISE_AGE_KEPT (700 frames), and the length of its
+ * line. */
+#define FLOOR_KEEP_LATE_RISE_FRAMES	800u
+#define FLOOR_KEEP_EXPIRY_FRAMES	(20u * FRAMES_PER_SECOND)
+
+/* A second rise after the window closes, on pauses whose agreement run
+ * completes within LEC_NOISE_RISE_AGE: the floor takes both rises; on the
+ * pauses of floor_keep_window_test it takes the first only. */
+static void floor_keep_expiry_test(unsigned rate)
+{
+	static const struct floor_keep_line lines[2] = {
+		{
+			.pause_extra = 3u, .rise_db = FLOOR_KEEP_RISE_DB,
+			.late_db = FLOOR_KEEP_RISE_DB,
+			.late_after = FLOOR_KEEP_LATE_RISE_FRAMES,
+			.frames = FLOOR_KEEP_EXPIRY_FRAMES,
+		},
+		{
+			.pause_extra = 2u, .rise_db = FLOOR_KEEP_RISE_DB,
+			.late_db = FLOOR_KEEP_RISE_DB,
+			.late_after = FLOOR_KEEP_LATE_RISE_FRAMES,
+			.frames = FLOOR_KEEP_EXPIRY_FRAMES,
+		},
+	};
+	struct floor_keep_result r[2];
+
+	floor_keep_run(rate, &lines[0], &r[0]);
+	floor_keep_run(rate, &lines[1], &r[1]);
+	case_rate(rate, "lec closes the re-acquisition window of its floor "
+		  "after a kept echo path change");
+	floor_keep_print(rate, "background 8 dB up at the change and 8 dB "
+			 "more 8 s after the keep", &r[0]);
+	floor_keep_print(rate, "the same on sparser pauses", &r[1]);
+	CHECK(r[0].keep > 0u);
+	CHECK(r[0].rise > 0u && r[0].rise <= FLOOR_KEEP_RISE_MAX);
+	CHECK(r[0].end_db >= 2.0 * FLOOR_KEEP_RISE_DB - 2.0);
+	CHECK(r[0].loudest_db <= 2.0 * FLOOR_KEEP_RISE_DB + 2.0);
+	CHECK(r[1].keep > 0u);
+	CHECK(r[1].rise > 0u && r[1].rise <= FLOOR_KEEP_RISE_MAX);
+	CHECK(r[1].loudest_db <= FLOOR_KEEP_RISE_DB + 2.0);
+}
+
+/* The held signal of floor_keep_held_test and the length of its lines. */
+#define FLOOR_KEEP_HELD_FRAMES		(6u * FRAMES_PER_SECOND)
+#define FLOOR_KEEP_HELD_LINE_FRAMES	(12u * FRAMES_PER_SECOND)
+/* The rise bound of an agreement run, LEC_NOISE_AGREE_RISE_DB of dsp/lec.c;
+ * the creep over it, LEC_NOISE_RISE_DB; and the readings after the signal
+ * within which the floor falls back. */
+#define FLOOR_KEEP_HELD_STEP_DB		8.0
+#define FLOOR_KEEP_HELD_CREEP_DB	3.0
+#define FLOOR_KEEP_HELD_FALL		20u
+
+/*
+ * A stationary near signal 4 to 40 dB over the line noise starts 0 to 75 frames
+ * after the keep. The floor rises at most FLOOR_KEEP_HELD_STEP_DB in a step and
+ * FLOOR_KEEP_HELD_CREEP_DB more in all, and falls back within
+ * FLOOR_KEEP_HELD_FALL readings after the signal.
+ */
+static void floor_keep_held_test(unsigned rate)
+{
+	static const char *const names[4] = {
+		"held vowel 0", "held vowel 1", "white noise", "Hoth noise",
+	};
+	static const double levels[6] = { 4.0, 6.0, 10.0, 20.0, 30.0, 40.0 };
+	static const unsigned ats[4] = { 0u, 25u, 50u, 75u };
+	struct floor_keep_line line = {
+		.pause_extra = 3u, .held_frames = FLOOR_KEEP_HELD_FRAMES,
+		.frames = FLOOR_KEEP_HELD_LINE_FRAMES,
+	};
+	struct floor_keep_result r;
+	unsigned legs = 0, keeps = 0, rises = 0, fell = 0;
+	unsigned k, n, a, worst = 0, fall = 0;
+	double loudest = 0.0, jump = 0.0;
+
+	for (k = 0; k < 4u; k++)
+		for (n = 0; n < 6u; n++)
+			for (a = 0; a < 4u; a++) {
+				line.held = (enum floor_keep_held)(k + 1u);
+				line.held_db = levels[n];
+				line.held_at = ats[a];
+				floor_keep_run(rate, &line, &r);
+				legs++;
+				keeps += r.keep > 0u;
+				rises += r.rise > 0u;
+				fell += r.fell;
+				if (r.fall > fall)
+					fall = r.fall;
+				if (r.jump_db > jump)
+					jump = r.jump_db;
+				if (legs == 1u || r.loudest_db > loudest) {
+					loudest = r.loudest_db;
+					worst = (k * 6u + n) * 4u + a;
+				}
+			}
+	case_rate(rate, "lec raises its floor by at most 8 dB per agreement "
+		  "run under a stationary near signal after a kept echo path "
+		  "change");
+	printf("# %u Hz: %u lines, %u kept trials, %u floor rises; largest "
+	       "step %.2f dB; loudest floor %.1f dB over the floor before the "
+	       "change (%s %.0f dB over the line noise, %u frames after the "
+	       "keep); back within 1 dB on %u lines, within %u readings after "
+	       "the signal\n", rate, legs, keeps, rises, jump, loudest,
+	       names[worst / 24u], levels[worst / 4u % 6u], ats[worst % 4u],
+	       fell, fall);
+	CHECK_UINT(keeps, legs);
+	CHECK(jump <= FLOOR_KEEP_HELD_STEP_DB + 0.001);
+	CHECK(loudest <= FLOOR_KEEP_HELD_STEP_DB + FLOOR_KEEP_HELD_CREEP_DB);
+	CHECK_UINT(fell, legs);
+	CHECK(fall <= FLOOR_KEEP_HELD_FALL);
+}
+
+/* The line of tone_tail_test, G.168 test 10A: a fresh instance, the 2100 Hz
+ * tone through mu-law and m1, then silence. A TONE_TAIL_METER_MS rectangular
+ * meter reads Region II; tail_acts counts the acting frames after the tone. */
+#define TONE_TAIL_HZ		2100.0
+#define TONE_TAIL_DBM0		-13.0
+#define TONE_TAIL_ERL_DB	6.0
+#define TONE_TAIL_LEAD_FRAMES	20u
+#define TONE_TAIL_FRAMES	350u
+#define TONE_TAIL_GAP_FRAMES	8u
+#define TONE_TAIL_METER_MS	35u
+#define TONE_TAIL_REGION2_DBM0	-37.0
+
+struct tone_tail_result {
+	double region_dbm0;
+	unsigned tail_acts;
+	unsigned window;
+};
+
+static void tone_tail_line_run(unsigned rate, struct tone_tail_result *r)
+{
+	struct udsp_ec_nlms_info info;
+	struct echo_path path;
+	struct udsp_ec *ec = udsp_ec_nlms.create_rate(0, rate);
+	unsigned frame = rate / 100u;
+	unsigned meter_n = TONE_TAIL_METER_MS * rate / 1000u;
+	double *meter = calloc(meter_n, sizeof(*meter));
+	uint32_t state = 0x51ab0dd5u;
+	unsigned long phase = 0;
+	unsigned end = TONE_TAIL_LEAD_FRAMES + TONE_TAIL_FRAMES;
+	unsigned window = window_frames_get(ec);
+	unsigned long from = (unsigned long)TONE_TAIL_LEAD_FRAMES * frame +
+			     rate * 15u / 100u +
+			     path_samples_get(PHASE2_DELAY_MS, rate);
+	unsigned long to = (unsigned long)(end + TONE_TAIL_GAP_FRAMES) * frame;
+	unsigned long n = 0;
+	double sum = 0.0;
+	double loudest = 0.0;
+	unsigned f;
+
+	memset(r, 0, sizeof(*r));
+	r->window = window;
+	udsp_ec_nlms_ref_loss_set(ec, PHASE2_LOSS_HALF_DB);
+	path_annex_d_init(&path, rate, ANNEX_D_M1, TONE_TAIL_ERL_DB,
+			  PHASE2_DELAY_MS);
+	for (f = 0; f < end + (window > TONE_TAIL_GAP_FRAMES ? window :
+					      TONE_TAIL_GAP_FRAMES); f++) {
+		int16_t far[UDSP_FRAME_MAX];
+		int16_t ref[UDSP_FRAME_MAX];
+		int16_t echo[UDSP_FRAME_MAX];
+		int16_t hiss[UDSP_FRAME_MAX];
+		int16_t out[UDSP_FRAME_MAX];
+		unsigned i;
+
+		memset(far, 0, sizeof(far));
+		if (f >= TONE_TAIL_LEAD_FRAMES && f < end) {
+			tone_fill(far, frame, TONE_TAIL_DBM0, TONE_TAIL_HZ,
+				  &phase, rate);
+			for (i = 0; i < frame; i++)
+				far[i] = tone_ulaw_get(far[i]);
+		}
+		level_loss_apply(ref, far, frame, PHASE2_LOSS_HALF_DB);
+		path_run(&path, far, echo);
+		noise_fill(hiss, frame, PHASE2_HISS_DBM0, &state);
+		for (i = 0; i < frame; i++)
+			out[i] = sample_clamp((double)echo[i] + hiss[i]);
+		udsp_ec_nlms.run(ec, out, ref);
+		udsp_ec_nlms_info_get(ec, &info);
+		if (f >= end && f < end + window && info.nlp_active)
+			r->tail_acts++;
+		for (i = 0; i < frame; i++, n++) {
+			double x = (double)out[i] * out[i];
+
+			sum += x - meter[n % meter_n];
+			meter[n % meter_n] = x;
+			if (n >= from && n < to && sum / meter_n > loudest)
+				loudest = sum / meter_n;
+		}
+	}
+	r->region_dbm0 = rms_dbm0_get(sqrt(loudest));
+	free(meter);
+	udsp_ec_nlms.destroy(ec);
+}
+
+/*
+ * The tone tail hold (LEC_TONE_TAIL_BACK): Region II reads
+ * TONE_TAIL_REGION2_DBM0 or less, the limit of G.168 test 10A, as the processor
+ * acts through the tone's echo tail. The hold starts after a tone alone, so the
+ * releases for a near talker stand.
+ */
+static void tone_tail_test(unsigned rate)
+{
+	struct tone_tail_result r;
+
+	tone_tail_line_run(rate, &r);
+	case_rate(rate, "lec processor holds the echo tail of a far tone");
+	printf("# answer tone: Region II peak %.1f dBm0; the processor acts on "
+	       "%u of the %u window frames after the tone\n", r.region_dbm0,
+	       r.tail_acts, r.window);
+	CHECK(r.region_dbm0 <= TONE_TAIL_REGION2_DBM0);
+}
+
+/* The line of the escape trial cases: G.168 test 2A with the processor on, m1
+ * converged on the composite source, then the model at its ERL. */
+#define ESCAPE_TRIAL_FRAMES		(4u * FRAMES_PER_SECOND)
+#define ESCAPE_TRIAL_SKIP_FRAMES	5u
+#define ESCAPE_TRIAL_TALK_FRAMES	150u
+#define ESCAPE_TRIAL_L_ACT_DB		1.49
+
+/* loss_db takes the combined loss at 1 s, act the first acting frame after
+ * ESCAPE_TRIAL_SKIP_FRAMES, r the talker's energies and frames when it
+ * talks. */
+static void escape_trial_leg(unsigned rate, unsigned m, double x_db,
+			     unsigned k, uint32_t seed, bool nlp, bool talk,
+			     struct near_start_result *r, double *loss_db,
+			     unsigned *act)
+{
+	struct udsp_ec_nlms_info info;
+	struct udsp_ec_nlms_frame reading;
+	struct dense_talker talker;
+	struct css_annex css;
+	struct echo_path path, next;
+	struct udsp_ec *ec = udsp_ec_nlms.create_rate(0, rate);
+	uint32_t state[2] = { 0x2a5e1c0du, 0x51ab0dd5u };
+	double a = exp(-1000.0 / (PHASE1_METER_MS * rate));
+	double meter = 0.0, loudest = 0.0;
+	double erl = phase2_erl_db[m];
+	unsigned long from = (unsigned long)rate +
+			     path_samples_get(PHASE2_DELAY_MS, rate);
+	unsigned long to = from + (unsigned long)rate * 7u / 10u;
+	int16_t near[UDSP_FRAME_MAX];
+	int16_t out[UDSP_FRAME_MAX];
+	unsigned f, i;
+
+	memset(r, 0, sizeof(*r));
+	*act = 0;
+	css_annex_init(&css, rate, PHASE2_FAR_DBM0, 0x0c55a11eu);
+	dense_talker_init(&talker, rate, PHASE2_FAR_DBM0 - erl - x_db, seed);
+	udsp_ec_nlms_ref_loss_set(ec, PHASE2_LOSS_HALF_DB);
+	udsp_ec_nlms.nlp(ec, nlp);
+	path_annex_d_init(&path, rate, ANNEX_D_M1, erl + PHASE2_DELTA_ERL_DB,
+			  PHASE2_DELAY_MS);
+	for (f = 0; f < PHASE2_CONVERGE_FRAMES; f++)
+		phase1_frame_run(ec, &path, &css, state, NULL, out);
+	path_annex_d_init(&next, rate, phase2_models[m], erl, PHASE2_DELAY_MS);
+	path_history_carry(&next, &path);
+	for (f = 0; f < ESCAPE_TRIAL_FRAMES; f++) {
+		bool talking = false;
+
+		memset(near, 0, sizeof(near));
+		if (talk && f >= k && f < k + ESCAPE_TRIAL_TALK_FRAMES) {
+			dense_talker_fill(&talker, near, next.frame);
+			for (i = 0; i < next.frame; i++)
+				talking |= near[i] != 0;
+		}
+		phase1_frame_run(ec, &next, &css, state, near, out);
+		udsp_ec_nlms_info_get(ec, &info);
+		udsp_ec_nlms_frame_get(ec, &reading);
+		if (!*act && info.nlp_active && f > ESCAPE_TRIAL_SKIP_FRAMES)
+			*act = f;
+		r->frames += talking;
+		r->fired += talking && reading.dt_fired;
+		r->acted += talking && info.nlp_active;
+		for (i = 0; talking && i < next.frame; i++) {
+			r->near += (double)near[i] * near[i];
+			r->product += (double)out[i] * near[i];
+		}
+		for (i = 0; i < next.frame; i++) {
+			unsigned long n = (unsigned long)f * next.frame + i;
+
+			meter = a * meter + (1.0 - a) * out[i] * out[i];
+			if (n >= from && n < to && meter > loudest)
+				loudest = meter;
+		}
+	}
+	*loss_db = PHASE2_FAR_DBM0 + ESCAPE_TRIAL_L_ACT_DB -
+		   rms_dbm0_get(sqrt(loudest));
+	udsp_ec_nlms.destroy(ec);
+}
+
+/*
+ * ESCAPE_TRIAL_LOSS_DB: the least combined loss at 1 s of a leg of
+ * escape_trial_line_test. ESCAPE_TRIAL_ACT_FRAMES: the latest first act of
+ * a leg.
+ */
+#define ESCAPE_TRIAL_LOSS_DB		42.0
+#define ESCAPE_TRIAL_ACT_FRAMES		75u
+
+/*
+ * The legs of escape_trial_line_test: m4 and m8 at both rates, and m6 at
+ * 8 kHz. On this line m6 at 16 kHz starts no escape trial, so the rule has no
+ * frame to act on there.
+ */
+static const unsigned escape_trial_models[3] = { 0u, 1u, 3u };
+
+/*
+ * The escape trial (escape_trial_get) with no talker: each leg reads
+ * ESCAPE_TRIAL_LOSS_DB or more of combined loss at 1 s. The processor first
+ * acts by ESCAPE_TRIAL_ACT_FRAMES, where without the rule it waits on the long
+ * hangover or the engage run.
+ */
+static void escape_trial_line_test(unsigned rate)
+{
+	unsigned mi;
+	bool ok = true;
+
+	case_rate(rate, "lec acts on the evidence of an escape trial after a "
+			"louder echo path");
+	for (mi = 0; mi < 3u; mi++) {
+		unsigned m = escape_trial_models[mi];
+		struct near_start_result r;
+		double loss;
+		unsigned act;
+
+		if (rate == UDSP_SAMPLE_RATE_WB && m == 1u)
+			continue;
+		escape_trial_leg(rate, m, 13.0, 0u, 0x0badcafeu, true, false,
+				 &r, &loss, &act);
+		printf("# %s: combined loss %.1f dB at 1 s, first act on frame "
+		       "%u after the change\n",
+		       annex_d_tables[phase2_models[m]].name, loss, act);
+		ok &= loss >= ESCAPE_TRIAL_LOSS_DB;
+		ok &= act > 0u && act <= ESCAPE_TRIAL_ACT_FRAMES;
+	}
+	CHECK(ok);
+}
+
+/*
+ * ESCAPE_TRIAL_TAKE_DB: the most near speech that the processor can take
+ * from a talker of escape_trial_talker_test.
+ */
+#define ESCAPE_TRIAL_TAKE_DB		1.0
+
+/*
+ * A near talker during the escape trial of the line of escape_trial_leg. The
+ * dense talker stands 10 or 16 dB under the changed echo, on two seeds, at m4
+ * and m8. It starts at the change or 30 frames after it. The processor must
+ * take ESCAPE_TRIAL_TAKE_DB of the talker or less: the near gain of the leg
+ * with the processor off, less its gain with the processor on.
+ */
+static void escape_trial_talker_test(unsigned rate)
+{
+	static const unsigned models[2] = { 0u, 3u };
+	static const double xs[2] = { 10.0, 16.0 };
+	static const unsigned ks[2] = { 0u, 30u };
+	static const uint32_t seeds[2] = { 0x0badcafeu, 0xe6543829u };
+	double worst = -200.0;
+	unsigned mi, xi, ki, si, acted = 0;
+
+	case_rate(rate, "lec keeps a near talker through an escape trial");
+	for (mi = 0; mi < 2u; mi++)
+		for (xi = 0; xi < 2u; xi++)
+			for (ki = 0; ki < 2u; ki++)
+				for (si = 0; si < 2u; si++) {
+					struct near_start_result on, off;
+					double loss, take;
+					unsigned act;
+
+					escape_trial_leg(rate, models[mi],
+							 xs[xi], ks[ki],
+							 seeds[si], true, true,
+							 &on, &loss, &act);
+					escape_trial_leg(rate, models[mi],
+							 xs[xi], ks[ki],
+							 seeds[si], false, true,
+							 &off, &loss, &act);
+					take = near_gain_db_get(off.product,
+								off.near) -
+					       near_gain_db_get(on.product,
+								on.near);
+					if (take > worst)
+						worst = take;
+					acted += on.acted;
+				}
+	printf("# 16 legs: the processor takes up to %.2f dB of the talker, "
+	       "and acts on %u talker frames in all\n", worst, acted);
+	CHECK(worst <= ESCAPE_TRIAL_TAKE_DB);
+}
+
+/* The lines of escape_trial_start_test: m8, and a bare line whose quiet filter
+ * stands over ESCAPE_START_COEF_RATIO under the gain's floor. There an inverted
+ * path reads -1 and starts a bare coherence trial. */
+#define ESCAPE_START_ERL_DB		45.0
+#define ESCAPE_START_COEF_RATIO		10.0f
+#define ESCAPE_START_FRAMES		20u
+
+/*
+ * The first trial after the change: its arm, whether its taps are bare and
+ * their energy over the learned gain, and its start frame's reading and
+ * hangover. Then the short and long hangovers after fired frames over the next
+ * ESCAPE_START_FRAMES - 1 frames.
+ */
+struct escape_start_result {
+	unsigned arm;
+	bool bare;
+	double taps_db;
+	bool fired;
+	unsigned hold_left;
+	unsigned next_hold;
+	unsigned short_holds;
+	unsigned long_holds;
+};
+
+static void escape_start_run(unsigned rate, bool bare,
+			     struct escape_start_result *r)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct css_annex css;
+	struct echo_path path, next;
+	struct udsp_ec *ec = udsp_ec_nlms.create_rate(0, rate);
+	uint32_t state[2] = { 0x2a5e1c0du, 0x51ab0dd5u };
+	int16_t out[UDSP_FRAME_MAX];
+	unsigned after = 0, f, k;
+	bool fired = false;
+
+	memset(r, 0, sizeof(*r));
+	css_annex_init(&css, rate, PHASE2_FAR_DBM0, 0x0c55a11eu);
+	udsp_ec_nlms_ref_loss_set(ec, PHASE2_LOSS_HALF_DB);
+	udsp_ec_nlms.nlp(ec, true);
+	if (bare) {
+		path_annex_d_init(&path, rate, ANNEX_D_M1, ESCAPE_START_ERL_DB,
+				  PHASE2_DELAY_MS);
+		path_annex_d_init(&next, rate, ANNEX_D_M1, phase2_erl_db[0],
+				  PHASE2_DELAY_MS);
+		for (k = 0; k < next.taps; k++)
+			next.h[k] = -next.h[k];
+	} else {
+		path_annex_d_init(&path, rate, ANNEX_D_M1,
+				  phase2_erl_db[3] + PHASE2_DELTA_ERL_DB,
+				  PHASE2_DELAY_MS);
+		path_annex_d_init(&next, rate, phase2_models[3],
+				  phase2_erl_db[3], PHASE2_DELAY_MS);
+	}
+	for (f = 0; f < PHASE2_CONVERGE_FRAMES; f++)
+		phase1_frame_run(ec, &path, &css, state, NULL, out);
+	path_history_carry(&next, &path);
+	for (f = 0; f < ESCAPE_TRIAL_FRAMES && after < ESCAPE_START_FRAMES;
+	     f++) {
+		phase1_frame_run(ec, &next, &css, state, NULL, out);
+		udsp_ec_nlms_frame_get(ec, &reading);
+		if (r->arm != UDSP_EC_NLMS_TRIAL_ARM_NONE) {
+			if (!after)
+				r->next_hold = reading.hold_left;
+			else if (fired)
+				r->short_holds += reading.hold_left == 4u;
+			if (after && fired)
+				r->long_holds += reading.hold_left == 24u;
+			after++;
+		} else if (reading.trial_arm != UDSP_EC_NLMS_TRIAL_ARM_NONE) {
+			udsp_ec_nlms_info_get(ec, &info);
+			r->arm = reading.trial_arm;
+			r->bare = info.coef_energy * ESCAPE_START_COEF_RATIO <
+				  info.echo_gain;
+			r->taps_db = 10.0 * log10((double)info.coef_energy /
+						  (double)info.echo_gain);
+			r->fired = reading.dt_fired;
+			r->hold_left = reading.hold_left;
+		}
+		fired = reading.dt_fired;
+	}
+	udsp_ec_nlms.destroy(ec);
+}
+
+/*
+ * The start frame of an escape trial, which the detector reads before the trial
+ * reads its evidence. A fired start frame inside a running hangover takes the
+ * long hangover. After it, a fired frame of the eligible trial takes the short
+ * one, and one of the bare trial the long one.
+ */
+static void escape_trial_start_test(unsigned rate)
+{
+	unsigned leg;
+
+	case_rate(rate, "lec escape trial reads its evidence after its start "
+			"frame");
+	for (leg = 0; leg < 2u; leg++) {
+		struct escape_start_result r;
+		bool bare = leg == 1u;
+
+		escape_start_run(rate, bare, &r);
+		printf("# %s trial: arm %s, taps at %+.1f dB against the "
+		       "learned gain, start frame fired %d inside a hold of "
+		       "%u, next frame holds %u; after it %u short and %u "
+		       "long holds\n", bare ? "bare" : "eligible",
+		       lecr_trial_arm_name(r.arm), r.taps_db, r.fired,
+		       r.hold_left, r.next_hold, r.short_holds, r.long_holds);
+		CHECK_UINT(r.arm, UDSP_EC_NLMS_TRIAL_ARM_COHERE);
+		CHECK(r.bare == bare);
+		CHECK(r.fired);
+		CHECK(r.hold_left > 0u);
+		CHECK_UINT(r.next_hold, 24);
+		if (bare) {
+			CHECK_UINT(r.short_holds, 0);
+			CHECK(r.long_holds > 0u);
+		} else {
+			CHECK(r.short_holds > 0u);
+			CHECK_UINT(r.long_holds, 0);
+		}
+	}
+}
+
+/* The line of the pause and feed cases: escape_trial_leg with m4, near noise in
+ * given pauses, on each frame or one, or frames fed through
+ * udsp_ec_nlms_ref_feed. */
+#define ESCAPE_PAUSE_MAX		16u
+
+struct escape_pause_plan {
+	double near_db;
+	unsigned first;
+	unsigned last;
+	bool single;
+	bool feed;
+};
+
+/* The loss and act, the pauses, the loudest first and later quiet frames, and
+ * each frame's verdict. */
+struct escape_pause_result {
+	double loss_db;
+	unsigned act;
+	unsigned pause[ESCAPE_PAUSE_MAX];
+	unsigned pauses;
+	unsigned fed;
+	double first_db;
+	double quiet_db;
+	uint8_t verdict[ESCAPE_TRIAL_FRAMES];
+	bool acted[ESCAPE_TRIAL_FRAMES];
+};
+
+/* One frame of the line of escape_pause_leg through udsp_ec_nlms_ref_feed:
+ * the far end and its echo path move on, and the canceller takes the
+ * reference alone. */
+static void escape_feed_frame(struct udsp_ec *ec, struct echo_path *path,
+			      struct css_annex *css, uint32_t state[2])
+{
+	int16_t far[UDSP_FRAME_MAX];
+	int16_t ref[UDSP_FRAME_MAX];
+	int16_t echo[UDSP_FRAME_MAX];
+	int16_t hiss[UDSP_FRAME_MAX];
+
+	css_annex_fill(far, path->frame, css);
+	level_loss_apply(ref, far, path->frame, PHASE2_LOSS_HALF_DB);
+	path_run(path, far, echo);
+	noise_fill(hiss, path->frame, PHASE2_HISS_DBM0, &state[1]);
+	udsp_ec_nlms_ref_feed(ec, ref);
+}
+
+static void escape_pause_leg(unsigned rate,
+			     const struct escape_pause_plan *plan,
+			     struct escape_pause_result *r)
+{
+	struct udsp_ec_nlms_info info;
+	struct udsp_ec_nlms_frame reading;
+	struct css_annex css;
+	struct echo_path path, next;
+	struct udsp_ec *ec = udsp_ec_nlms.create_rate(0, rate);
+	uint32_t state[2] = { 0x2a5e1c0du, 0x51ab0dd5u };
+	uint32_t near_state = 0x7e57ab1eu;
+	double a = exp(-1000.0 / (PHASE1_METER_MS * rate));
+	double meter = 0.0, loudest = 0.0;
+	double erl = phase2_erl_db[0];
+	unsigned long from = (unsigned long)rate +
+			     path_samples_get(PHASE2_DELAY_MS, rate);
+	unsigned long to = from + (unsigned long)rate * 7u / 10u;
+	int16_t near[UDSP_FRAME_MAX];
+	int16_t out[UDSP_FRAME_MAX];
+	bool in_pause = false, was_quiet = false, filled = false;
+	bool feeding = false;
+	unsigned f, i;
+
+	memset(r, 0, sizeof(*r));
+	r->first_db = -200.0;
+	r->quiet_db = -200.0;
+	css_annex_init(&css, rate, PHASE2_FAR_DBM0, 0x0c55a11eu);
+	udsp_ec_nlms_ref_loss_set(ec, PHASE2_LOSS_HALF_DB);
+	udsp_ec_nlms.nlp(ec, true);
+	path_annex_d_init(&path, rate, ANNEX_D_M1, erl + PHASE2_DELTA_ERL_DB,
+			  PHASE2_DELAY_MS);
+	for (f = 0; f < PHASE2_CONVERGE_FRAMES; f++)
+		phase1_frame_run(ec, &path, &css, state, NULL, out);
+	path_annex_d_init(&next, rate, phase2_models[0], erl, PHASE2_DELAY_MS);
+	path_history_carry(&next, &path);
+	for (f = 0; f < ESCAPE_TRIAL_FRAMES; f++) {
+		unsigned long at = css.pos % css.half_n;
+		bool pause = at >= css.voiced_n + css.noise_n;
+		bool quiet;
+
+		if (pause && !in_pause && r->pauses < ESCAPE_PAUSE_MAX) {
+			r->pause[r->pauses++] = f;
+			filled = false;
+		}
+		if (plan->feed && in_pause && !pause &&
+		    r->pauses == plan->first + 1u)
+			feeding = true;
+		if (feeding && pause && r->pauses == plan->first + 2u &&
+		    at + 3u * next.frame >= css.half_n)
+			feeding = false;
+		in_pause = pause;
+		if (feeding) {
+			escape_feed_frame(ec, &next, &css, state);
+			r->verdict[f] = LECR_VERDICT_OFF;
+			r->fed++;
+			was_quiet = false;
+			continue;
+		}
+		memset(near, 0, sizeof(near));
+		if (pause && plan->near_db > 0.0 && r->pauses > plan->first &&
+		    r->pauses <= plan->last + 1u &&
+		    (!plan->single || (was_quiet && !filled))) {
+			noise_fill(near, next.frame,
+				   PHASE2_HISS_DBM0 + plan->near_db,
+				   &near_state);
+			filled = true;
+		}
+		phase1_frame_run(ec, &next, &css, state, near, out);
+		udsp_ec_nlms_info_get(ec, &info);
+		udsp_ec_nlms_frame_get(ec, &reading);
+		quiet = reading.nlp_verdict == LECR_VERDICT_QUIET;
+		if (quiet && reading.noise_power > 0.0f) {
+			double db = 10.0 * log10(reading.mic_power /
+						 reading.noise_power);
+			double *keep = was_quiet ? &r->quiet_db : &r->first_db;
+
+			if (db > *keep)
+				*keep = db;
+		}
+		was_quiet = quiet;
+		r->verdict[f] = reading.nlp_verdict;
+		r->acted[f] = info.nlp_active;
+		if (!r->act && info.nlp_active && f > ESCAPE_TRIAL_SKIP_FRAMES)
+			r->act = f;
+		for (i = 0; i < next.frame; i++) {
+			unsigned long n = (unsigned long)f * next.frame + i;
+
+			meter = a * meter + (1.0 - a) * out[i] * out[i];
+			if (n >= from && n < to && meter > loudest)
+				loudest = meter;
+		}
+	}
+	r->loss_db = PHASE2_FAR_DBM0 + ESCAPE_TRIAL_L_ACT_DB -
+		     rms_dbm0_get(sqrt(loudest));
+	udsp_ec_nlms.destroy(ec);
+}
+
+/*
+ * The frames of a leg of escape_pause_leg, [*start, *end). They run from the
+ * end of the quiet frames of the pause that starts on frame from. They end at
+ * the first quiet frame at or after frame to.
+ */
+static void escape_pause_span(const struct escape_pause_result *r,
+			      unsigned from, unsigned to, unsigned *start,
+			      unsigned *end)
+{
+	unsigned f = from;
+
+	while (f < ESCAPE_TRIAL_FRAMES && r->verdict[f] != LECR_VERDICT_QUIET)
+		f++;
+	while (f < ESCAPE_TRIAL_FRAMES && r->verdict[f] == LECR_VERDICT_QUIET)
+		f++;
+	*start = f;
+	f = to > f ? to : f;
+	while (f < ESCAPE_TRIAL_FRAMES && r->verdict[f] != LECR_VERDICT_QUIET)
+		f++;
+	*end = f;
+}
+
+/*
+ * The acted frames and the dt verdicts of a leg of escape_pause_leg over
+ * [start, end).
+ */
+static void escape_pause_count(const struct escape_pause_result *r,
+			       unsigned start, unsigned end, unsigned *acted,
+			       unsigned *dt)
+{
+	unsigned f;
+
+	*acted = 0;
+	*dt = 0;
+	for (f = start; f < end; f++) {
+		*acted += r->acted[f];
+		*dt += r->verdict[f] == LECR_VERDICT_DT;
+	}
+}
+
+/* The first pause of a leg of escape_pause_leg that starts after frame act,
+ * or the count of its pauses. */
+static unsigned escape_pause_after(const struct escape_pause_result *r,
+				   unsigned act)
+{
+	unsigned p;
+
+	for (p = 0; p < r->pauses && r->pause[p] <= act; p++)
+		;
+	return p;
+}
+
+/*
+ * ESCAPE_PAUSE_BAR_DB: the bar of LEC_PAUSE_NEAR_RATIO in dsp/lec.c.
+ * ESCAPE_PAUSE_UNDER_DB: a near noise in each pause, over the line noise and
+ * under that bar. ESCAPE_PAUSE_NEAR_DB: a near noise in one pause, over it.
+ */
+#define ESCAPE_PAUSE_BAR_DB		18.0
+#define ESCAPE_PAUSE_UNDER_DB		14.0
+#define ESCAPE_PAUSE_NEAR_DB		30.0
+
+/*
+ * The near end of the far pauses in an escape trial (LEC_PAUSE_NEAR_RATIO).
+ * With no near end, or noise ESCAPE_PAUSE_UNDER_DB over the line noise, the
+ * processor acts by ESCAPE_TRIAL_ACT_FRAMES at the loss. With
+ * ESCAPE_PAUSE_NEAR_DB in one pause, each frame to the next pause reads dt.
+ */
+static void escape_trial_pause_test(unsigned rate)
+{
+	static struct escape_pause_result line, under, near, one;
+	struct escape_pause_plan plan = { 0.0, 0u, 0u, false, false };
+	unsigned p, start, end, next_start, next_end;
+	unsigned line_acts, line_dt, near_acts, held, one_acts, one_held;
+	unsigned again, again_dt;
+
+	case_rate(rate, "lec withdraws the pass of an escape trial on a near "
+			"end in a far pause");
+	escape_pause_leg(rate, &plan, &line);
+	plan.near_db = ESCAPE_PAUSE_UNDER_DB;
+	plan.last = ESCAPE_PAUSE_MAX;
+	escape_pause_leg(rate, &plan, &under);
+	p = escape_pause_after(&line, line.act);
+	plan.near_db = ESCAPE_PAUSE_NEAR_DB;
+	plan.first = p;
+	plan.last = p;
+	escape_pause_leg(rate, &plan, &near);
+	plan.single = true;
+	escape_pause_leg(rate, &plan, &one);
+	printf("# line: combined loss %.1f dB at 1 s, first act on frame %u; "
+	       "first quiet frames up to %.1f dB over the floor, later quiet "
+	       "frames up to %.1f dB\n", line.loss_db, line.act, line.first_db,
+	       line.quiet_db);
+	printf("# under the bar: combined loss %.1f dB at 1 s, first act on "
+	       "frame %u; later quiet frames up to %.1f dB over the floor\n",
+	       under.loss_db, under.act, under.quiet_db);
+	CHECK(p + 2u < line.pauses);
+	if (p + 2u >= line.pauses)
+		return;
+	escape_pause_span(&near, near.pause[p], near.pause[p + 1u], &start,
+			  &end);
+	escape_pause_span(&near, near.pause[p + 1u], near.pause[p + 2u],
+			  &next_start, &next_end);
+	escape_pause_count(&line, start, end, &line_acts, &line_dt);
+	escape_pause_count(&near, start, end, &near_acts, &held);
+	escape_pause_count(&one, start, end, &one_acts, &one_held);
+	escape_pause_count(&near, next_start, next_end, &again, &again_dt);
+	printf("# near in the pause of frame %u: later quiet frames up to "
+	       "%.1f dB over the floor; frames %u to %u: %u dt verdicts, %u "
+	       "acted (line %u); frames %u to %u: %u acted\n", near.pause[p],
+	       near.quiet_db, start, end - 1u, held, near_acts, line_acts,
+	       next_start, next_end - 1u, again);
+	printf("# near on one frame of that pause: up to %.1f dB over the "
+	       "floor; frames %u to %u: %u dt verdicts, %u acted\n",
+	       one.quiet_db, start, end - 1u, one_held, one_acts);
+	if (rate == UDSP_SAMPLE_RATE)
+		CHECK(line.first_db >= ESCAPE_PAUSE_BAR_DB);
+	CHECK(line.act > 0u && line.act <= ESCAPE_TRIAL_ACT_FRAMES);
+	CHECK(line.loss_db >= ESCAPE_TRIAL_LOSS_DB);
+	CHECK(under.act > 0u && under.act <= ESCAPE_TRIAL_ACT_FRAMES);
+	CHECK(under.loss_db >= ESCAPE_TRIAL_LOSS_DB);
+	CHECK(end > start && line_acts > 0u);
+	CHECK_UINT(held, end - start);
+	CHECK_UINT(near_acts, 0);
+	CHECK(again > 0u);
+	CHECK(one.quiet_db >= ESCAPE_PAUSE_BAR_DB);
+	CHECK_UINT(one_held, end - start);
+	CHECK_UINT(one_acts, 0);
+}
+
+/*
+ * The near end of the far-end pauses across reference feeds (dsp/lec.c,
+ * udsp_ec_nlms_ref_feed). After a pause that reads a near end, the far burst
+ * and the next pause go through udsp_ec_nlms_ref_feed. The last quiet frames of
+ * that pause run with no near end. On the next burst the processor must
+ * act, and the dt verdict must not occur.
+ */
+static void escape_trial_feed_test(unsigned rate)
+{
+	static struct escape_pause_result line, feed;
+	struct escape_pause_plan plan = { 0.0, 0u, 0u, false, false };
+	unsigned p, start, end, acts, dt;
+
+	case_rate(rate, "lec reads a fresh far pause after reference feeds in "
+			"an escape trial");
+	escape_pause_leg(rate, &plan, &line);
+	p = escape_pause_after(&line, line.act);
+	plan.near_db = ESCAPE_PAUSE_NEAR_DB;
+	plan.first = p;
+	plan.last = p;
+	plan.feed = true;
+	escape_pause_leg(rate, &plan, &feed);
+	CHECK(p + 2u < feed.pauses);
+	if (p + 2u >= feed.pauses)
+		return;
+	escape_pause_span(&feed, feed.pause[p + 1u], feed.pause[p + 2u],
+			  &start, &end);
+	escape_pause_count(&feed, start, end, &acts, &dt);
+	printf("# near in the pause of frame %u: later quiet frames up to "
+	       "%.1f dB over the floor; %u frames fed; frames %u to %u: %u "
+	       "acted, %u dt verdicts\n", feed.pause[p], feed.quiet_db,
+	       feed.fed, start, end - 1u, acts, dt);
+	CHECK(feed.quiet_db >= ESCAPE_PAUSE_BAR_DB);
+	CHECK(feed.fed > 0u);
+	CHECK(end > start && acts > 0u);
+	CHECK_UINT(dt, 0);
+}
+
+/* The microphone over the tracked floor from which a tail frame over the
+ * bound refuses the resume, LEC_NLP_TAIL_FLOOR_RATIO of dsp/lec.c. */
+#define MISS_TAIL_FLOOR_RATIO	16.0
+
+/* The patterns of tail_peak_test, each after a pause of the line floor: a
+ * frame over the bound first, second and third in its pause, and a frame 12
+ * dB over the floor first and second. */
+enum {
+	TAIL_LEG_FIRST,
+	TAIL_LEG_SECOND,
+	TAIL_LEG_THIRD,
+	TAIL_LEG_LOUD_FIRST,
+	TAIL_LEG_LOUD_SECOND,
+	TAIL_LEGS
+};
+
+static const char *const tail_patterns[TAIL_LEGS] = {
+	"p---", "-p--", "--p-", "P---", "-P--",
+};
+
+/* The legs of every phase on the quiet-miss line with its echo product
+ * MISS_RES_DEEP_DB under the echo. */
+static void tail_phases_run(unsigned rate,
+			    struct miss_leg legs[MISS_PHASES][TAIL_LEGS])
+{
+	unsigned frame = rate / 100u;
+	unsigned k;
+	unsigned n;
+
+	for (k = 0; k < MISS_PHASES; k++) {
+		struct miss_leg floor;
+		struct miss_line l;
+
+		miss_line_init(&l, rate, k * frame / MISS_PHASES,
+			       MISS_RES_DEEP_DB);
+		miss_line_settle(&l);
+		for (n = 0; n < TAIL_LEGS; n++) {
+			miss_leg_run(&l, miss_patterns[MISS_LEG_FLOOR], &floor);
+			miss_leg_run(&l, tail_patterns[n], &legs[k][n]);
+		}
+		udsp_ec_nlms.destroy(l.ec);
+	}
+}
+
+/* The figures of leg over every phase: the frame over the bound against the
+ * bar and the floor, the first acting frame and the waits. */
+static void tail_legs_print(struct miss_leg legs[MISS_PHASES][TAIL_LEGS],
+			    unsigned leg)
+{
+	double lo = 200.0;
+	double hi = -200.0;
+	double flo = 200.0;
+	double fhi = -200.0;
+	double erle = 200.0;
+	unsigned first = 0;
+	unsigned waits = 0;
+	unsigned k;
+
+	for (k = 0; k < MISS_PHASES; k++) {
+		const struct miss_leg *g = &legs[k][leg];
+
+		lo = g->lo_peak < lo ? g->lo_peak : lo;
+		hi = g->hi_peak > hi ? g->hi_peak : hi;
+		flo = g->lo_peak_floor < flo ? g->lo_peak_floor : flo;
+		fhi = g->hi_peak_floor > fhi ? g->hi_peak_floor : fhi;
+		erle = g->onset_erle_db < erle ? g->onset_erle_db : erle;
+		first = g->first > first ? g->first : first;
+		waits = g->waits > waits ? g->waits : waits;
+	}
+	printf("# pause %s over %u phases: the frame %.2f to %.2f dB over the "
+	       "bar and %.2f to %.2f dB over the floor; the burst acts from "
+	       "its frame %u at most, %u wait frames at most; ERLE tracker "
+	       "from %.2f dB\n", tail_patterns[leg], MISS_PHASES, lo, hi, flo,
+	       fhi, first, waits, erle);
+}
+
+/* The checks of the frame of a leg: over the bound, under or over the floor
+ * bound. */
+static void tail_frame_check(const struct miss_leg *g, bool loud)
+{
+	CHECK_UINT(g->quiet, MISS_QUIET_FRAMES);
+	CHECK(g->lo_peak > 10.0 * log10(MISS_PEAK_RATIO));
+	CHECK(g->onset_erle_db >= MISS_RESUME_DB);
+	if (loud)
+		CHECK(g->lo_peak_floor > 10.0 * log10(MISS_TAIL_FLOOR_RATIO));
+	else
+		CHECK(g->hi_peak_floor < 10.0 * log10(MISS_TAIL_FLOOR_RATIO));
+}
+
+/* The checks of a leg whose burst waits: it acts on its 8th frame after 7
+ * wait frames and passes the filter output on the first. */
+static void tail_wait_check(const struct miss_leg *g)
+{
+	CHECK_UINT(g->first, WORDS_ENGAGE_FRAME);
+	CHECK_UINT(g->waits, WORDS_ENGAGE_FRAME);
+	CHECK(g->edge_db > MISS_EDGE_TOL_DB);
+}
+
+/*
+ * One frame over the peak bound in a far pause at 8 phases. As one of the first
+ * two quiet frames (LEC_NLP_TAIL_QUIET_FRAMES) and under 12 dB over the floor
+ * it leaves the resume. Third in its pause, or 12 dB over the floor, it refuses
+ * it, and the burst waits 7 frames.
+ */
+static void tail_peak_test(unsigned rate)
+{
+	static struct miss_leg legs[MISS_PHASES][TAIL_LEGS];
+	unsigned k;
+
+	tail_phases_run(rate, legs);
+	case_rate(rate, "lec nlp resumes the engage run after a frame over "
+		  "the peak bound among the first two quiet frames of a "
+		  "pause");
+	tail_legs_print(legs, TAIL_LEG_FIRST);
+	tail_legs_print(legs, TAIL_LEG_SECOND);
+	for (k = 0; k < MISS_PHASES; k++) {
+		const struct miss_leg *first = &legs[k][TAIL_LEG_FIRST];
+		const struct miss_leg *second = &legs[k][TAIL_LEG_SECOND];
+
+		tail_frame_check(first, false);
+		tail_frame_check(second, false);
+		CHECK_UINT(first->first, 0);
+		CHECK(first->first_pass);
+		CHECK_UINT(first->waits, 0);
+		CHECK(fabs(first->edge_db) <= MISS_EDGE_TOL_DB);
+		CHECK_UINT(second->first, 0);
+		CHECK(second->first_pass);
+		CHECK_UINT(second->waits, 0);
+		CHECK(fabs(second->edge_db) <= MISS_EDGE_TOL_DB);
+	}
+	case_rate(rate, "lec nlp waits after a frame over the peak bound "
+		  "third in a pause");
+	tail_legs_print(legs, TAIL_LEG_THIRD);
+	for (k = 0; k < MISS_PHASES; k++) {
+		tail_frame_check(&legs[k][TAIL_LEG_THIRD], false);
+		tail_wait_check(&legs[k][TAIL_LEG_THIRD]);
+	}
+	case_rate(rate, "lec nlp waits after a frame 12 dB over the floor "
+		  "among the first two quiet frames of a pause");
+	tail_legs_print(legs, TAIL_LEG_LOUD_FIRST);
+	tail_legs_print(legs, TAIL_LEG_LOUD_SECOND);
+	for (k = 0; k < MISS_PHASES; k++) {
+		tail_frame_check(&legs[k][TAIL_LEG_LOUD_FIRST], true);
+		tail_frame_check(&legs[k][TAIL_LEG_LOUD_SECOND], true);
+		tail_wait_check(&legs[k][TAIL_LEG_LOUD_FIRST]);
+		tail_wait_check(&legs[k][TAIL_LEG_LOUD_SECOND]);
+	}
+}
+
+/* The legs of hold_resume_test and hold_refuse_test: a pause, its burst and up
+ * to two near pulses on burst or tail frames. HOLD_PULSE_DB, within 3 dB of the
+ * active bar and under 12 dB over the floor, takes the short hangover. */
+#define HOLD_PULSE_DB		8.0
+#define HOLD_AT_TAIL		-1
+/* The pulse of the line with its echo product MISS_RES_LOW_DB under the
+ * echo, whose bar stands higher. */
+#define HOLD_LOW_PULSE_DB	10.7
+/* The bar of the onset frame moves with the burst start, so a pulse can
+ * stand under it or more than 3 dB over it: the phases whose pulse takes the
+ * short hangover, of the 8, at least. */
+#define HOLD_MIN_PHASES		4u
+#define HOLD_PULSES		2u
+/* The quiet frames of a pause on the line of the through-pause legs. The short
+ * hold of the last tail frame then reaches the next burst. */
+#define HOLD_SPAN_QUIET		2u
+
+struct hold_pulse {
+	int at;
+	double db;
+};
+
+struct hold_spec {
+	const char *pattern;
+	struct hold_pulse pulse[HOLD_PULSES];
+	unsigned pulses;
+	const struct hold_spec *setup;
+};
+
+/*
+ * The figures of a leg: whether the last pulse fired, the hangover it set and
+ * its level over bar and floor, and whether the processor acted before it. Then
+ * the hold's end, the first acting frame and the waits, the ERLE at the end,
+ * and the first pulse's figures on a two-pulse leg.
+ */
+struct hold_leg {
+	bool fired;
+	unsigned set;
+	bool lead_fired;
+	unsigned lead_set;
+	double over_bar;
+	double over_floor;
+	bool acted;
+	unsigned end;
+	unsigned first;
+	unsigned waits;
+	double erle_db;
+};
+
+/* The pulse level of the frame at, or 0 for none. */
+static double hold_pulse_db(const struct hold_spec *sp, int at)
+{
+	unsigned n;
+
+	for (n = 0; n < sp->pulses; n++) {
+		if (sp->pulse[n].at == at)
+			return sp->pulse[n].db;
+	}
+	return 0.0;
+}
+
+/* The pause of the period from the frame the line stands on, with the
+ * pattern of sp on its quiet frames. Then the burst of the next period, with
+ * the pulses of sp. */
+static void hold_leg_run(struct miss_line *l, const struct hold_spec *sp,
+			 struct hold_leg *g)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	unsigned from = l->period - l->quiet;
+	int last = sp->pulse[sp->pulses - 1u].at;
+	int lead = sp->pulse[0].at;
+	bool two = sp->pulses > 1u;
+	bool pending = false;
+	bool lead_pending = false;
+	bool held = false;
+	unsigned f;
+
+	memset(g, 0, sizeof(*g));
+	g->end = MISS_BURST_FRAMES;
+	g->first = MISS_BURST_FRAMES;
+	for (f = miss_phase_get(l); f < l->period; f++) {
+		int at = (int)f - (int)from;
+		bool tail = at < 0;
+		char c = tail ? '-' : sp->pattern[at];
+		double db = tail ? hold_pulse_db(sp, at) : 0.0;
+
+		miss_frame_run(l, db != 0.0 ? db : miss_level_get(c), &reading,
+			       &info);
+		/* hold_left reads the hangover that the verdict of the frame
+		 * before set. */
+		if (pending)
+			g->set = reading.hold_left;
+		if (lead_pending)
+			g->lead_set = reading.hold_left;
+		pending = tail && at == last;
+		lead_pending = two && tail && at == lead;
+		if (lead_pending)
+			g->lead_fired = reading.dt_fired;
+		if (tail && at == last) {
+			g->fired = reading.dt_fired;
+			g->over_bar = ratio_db_get(reading.mic_power,
+						   reading.bar);
+			g->over_floor = ratio_db_get(reading.mic_power,
+						     reading.noise_power);
+			held = reading.dt_fired;
+		}
+	}
+	for (f = 0; f < MISS_BURST_FRAMES; f++) {
+		double db = hold_pulse_db(sp, (int)f);
+
+		miss_frame_run(l, db, &reading, &info);
+		if (pending)
+			g->set = reading.hold_left;
+		if (lead_pending)
+			g->lead_set = reading.hold_left;
+		pending = (int)f == last;
+		lead_pending = two && (int)f == lead;
+		if (lead_pending)
+			g->lead_fired = reading.dt_fired;
+		if ((int)f == last) {
+			g->fired = reading.dt_fired;
+			g->over_bar = ratio_db_get(reading.mic_power,
+						   reading.bar);
+			g->over_floor = ratio_db_get(reading.mic_power,
+						     reading.noise_power);
+			held = reading.dt_fired;
+		}
+		if ((int)f < last && info.nlp_active)
+			g->acted = true;
+		if (held && g->end == MISS_BURST_FRAMES &&
+		    reading.nlp_verdict != LECR_VERDICT_DT) {
+			g->end = f;
+			g->erle_db = reading.erle_db;
+		}
+		if (g->end < MISS_BURST_FRAMES &&
+		    g->first == MISS_BURST_FRAMES) {
+			if (info.nlp_active)
+				g->first = f;
+			else if (reading.nlp_verdict == LECR_VERDICT_PASS)
+				g->waits++;
+		}
+	}
+}
+
+/* The figures of each leg at every phase. The echo product of the line stands
+ * res_db under the echo, and its pauses hold quiet quiet frames. Each leg,
+ * or its setup, follows a pause of the line floor. */
+static void hold_phases_run(unsigned rate, double res_db, unsigned quiet,
+			    const struct hold_spec *specs, unsigned count,
+			    struct hold_leg legs[][MISS_PHASES])
+{
+	static const char floor_quiet[] = "----";
+	unsigned frame = rate / 100u;
+	unsigned k;
+	unsigned n;
+
+	for (k = 0; k < MISS_PHASES; k++) {
+		struct miss_leg floor;
+		struct hold_leg setup;
+		struct miss_line l;
+
+		miss_line_init(&l, rate, k * frame / MISS_PHASES, res_db);
+		miss_line_quiet_set(&l, quiet);
+		miss_line_settle(&l);
+		for (n = 0; n < count; n++) {
+			miss_leg_run(&l, floor_quiet + MISS_QUIET_FRAMES - quiet,
+				     &floor);
+			if (specs[n].setup)
+				hold_leg_run(&l, specs[n].setup, &setup);
+			hold_leg_run(&l, &specs[n], &legs[n][k]);
+		}
+		udsp_ec_nlms.destroy(l.ec);
+	}
+}
+
+static void hold_legs_print(const char *what, const struct hold_leg *legs)
+{
+	double bar_lo = 200.0, bar_hi = -200.0;
+	double floor_lo = 200.0, floor_hi = -200.0;
+	double erle = 200.0;
+	unsigned set_lo = 255, set_hi = 0;
+	unsigned waits = 0;
+	unsigned k;
+
+	for (k = 0; k < MISS_PHASES; k++) {
+		const struct hold_leg *g = &legs[k];
+
+		bar_lo = fmin(bar_lo, g->over_bar);
+		bar_hi = fmax(bar_hi, g->over_bar);
+		floor_lo = fmin(floor_lo, g->over_floor);
+		floor_hi = fmax(floor_hi, g->over_floor);
+		if (g->end < MISS_BURST_FRAMES)
+			erle = fmin(erle, g->erle_db);
+		set_lo = g->set < set_lo ? g->set : set_lo;
+		set_hi = g->set > set_hi ? g->set : set_hi;
+		waits = g->waits > waits ? g->waits : waits;
+	}
+	printf("# %s over %u phases: the pulse %.2f to %.2f dB over the bar "
+	       "and %.2f to %.2f dB over the floor, hangover %u to %u; %u wait "
+	       "frames at most after the hold; ERLE tracker from %.2f dB\n",
+	       what, MISS_PHASES, bar_lo, bar_hi, floor_lo, floor_hi, set_lo,
+	       set_hi, waits, erle);
+}
+
+static bool hold_short_get(const struct hold_leg *g)
+{
+	return g->fired && g->set == TAIL_PAIR_SHORT_FRAMES &&
+	       g->over_floor < 10.0 * log10(PAIR_SCRIPT_FLOOR_RATIO);
+}
+
+/* The phases of a leg whose last pulse took the short hangover, checked to
+ * be HOLD_MIN_PHASES or more. */
+static unsigned hold_short_count(const struct hold_leg *legs)
+{
+	unsigned n = 0;
+	unsigned k;
+
+	for (k = 0; k < MISS_PHASES; k++)
+		n += hold_short_get(&legs[k]);
+	printf("# %u of %u phases take the short hangover\n", n, MISS_PHASES);
+	CHECK(n >= HOLD_MIN_PHASES);
+	return n;
+}
+
+/* The checks of a leg that resumes: the first frame after the hold acts. */
+static void hold_resume_check(const struct hold_leg *g)
+{
+	CHECK(g->end < MISS_BURST_FRAMES);
+	CHECK_UINT(g->first, g->end);
+	CHECK_UINT(g->waits, 0);
+	CHECK(g->erle_db >= MISS_RESUME_DB);
+}
+
+/* The checks of a leg that waits 7 frames after the hold. */
+static void hold_wait_check(const struct hold_leg *g)
+{
+	CHECK(g->end < MISS_BURST_FRAMES);
+	CHECK_UINT(g->first, g->end + WORDS_ENGAGE_FRAME);
+	CHECK_UINT(g->waits, WORDS_ENGAGE_FRAME);
+}
+
+/* The legs of hold_resume_test: a pulse inside the burst, on the first frame
+ * of the burst, and on the last tail frame before a pause of two quiet
+ * frames. */
+static const struct hold_spec hold_resume_specs[] = {
+	{ "----", { { 1, HOLD_PULSE_DB } }, 1u, NULL },
+	{ "----", { { 0, HOLD_PULSE_DB } }, 1u, NULL },
+	{ "--", { { HOLD_AT_TAIL, HOLD_PULSE_DB } }, 1u, NULL },
+};
+
+/*
+ * The resume after a short hold (nlp_hold_update) at 8 phases. A pulse near the
+ * floor inside an acted burst, after a pause, or on the last tail frame takes
+ * the short hangover. The first pass frame after the hold acts, where a line
+ * without the resume waits 7 frames.
+ */
+static void hold_resume_test(unsigned rate)
+{
+	static struct hold_leg legs[3][MISS_PHASES];
+	unsigned k;
+
+	hold_phases_run(rate, MISS_RES_DEEP_DB, MISS_QUIET_FRAMES,
+			hold_resume_specs, 2u, legs);
+	hold_phases_run(rate, MISS_RES_DEEP_DB, HOLD_SPAN_QUIET,
+			&hold_resume_specs[2], 1u, &legs[2]);
+	case_rate(rate, "lec nlp resumes the engage run after the short hold "
+		  "of a verdict inside an acted burst");
+	hold_legs_print("pulse on burst frame 1", legs[0]);
+	hold_short_count(legs[0]);
+	for (k = 0; k < MISS_PHASES; k++) {
+		if (!hold_short_get(&legs[0][k]))
+			continue;
+		CHECK(legs[0][k].acted);
+		hold_resume_check(&legs[0][k]);
+	}
+	case_rate(rate, "lec nlp resumes the engage run after a short hold "
+		  "from the first frame after a pause");
+	hold_legs_print("pulse on burst frame 0", legs[1]);
+	hold_short_count(legs[1]);
+	for (k = 0; k < MISS_PHASES; k++) {
+		if (hold_short_get(&legs[1][k]))
+			hold_resume_check(&legs[1][k]);
+	}
+	case_rate(rate, "lec nlp resumes the engage run after a short hold "
+		  "through a far pause");
+	hold_legs_print("pulse on the last tail frame", legs[2]);
+	hold_short_count(legs[2]);
+	for (k = 0; k < MISS_PHASES; k++) {
+		if (hold_short_get(&legs[2][k]))
+			hold_resume_check(&legs[2][k]);
+	}
+}
+
+/* The setup of the legs after a burst without an act: pulses 12 dB over the
+ * floor on burst frames 0 and 1, whose long hold covers the burst. */
+static const struct hold_spec hold_unacted_setup = {
+	"----", { { 0, MISS_LOUD_DB }, { 1, MISS_LOUD_DB } }, 2u, NULL,
+};
+
+/* The legs of hold_refuse_test on the line with its echo product
+ * MISS_RES_DEEP_DB under the echo: after a burst without an act, a pulse on
+ * burst frame 0 and one on burst frame 1. */
+static const struct hold_spec hold_refuse_specs[] = {
+	{ "----", { { 0, HOLD_PULSE_DB } }, 1u, &hold_unacted_setup },
+	{ "----", { { 1, HOLD_PULSE_DB } }, 1u, &hold_unacted_setup },
+};
+
+/* The leg of the line with its echo product MISS_RES_LOW_DB under the echo:
+ * a pulse on burst frame 1. */
+static const struct hold_spec hold_low_spec = {
+	"----", { { 1, HOLD_LOW_PULSE_DB } }, 1u, NULL,
+};
+
+/* The legs whose pauses hold two quiet frames, a pulse on the last tail frame.
+ * One adds a quiet frame 12 dB over the floor in the pause. The other adds a
+ * loud pulse on burst frame 0 inside the short hangover. */
+static const struct hold_spec hold_refuse_span[] = {
+	{ "P-", { { HOLD_AT_TAIL, HOLD_PULSE_DB } }, 1u, NULL },
+	{ "--", { { HOLD_AT_TAIL, HOLD_PULSE_DB }, { 0, MISS_LOUD_DB } }, 2u,
+	  NULL },
+};
+
+/*
+ * The conditions of the resume after a short hold at 8 phases. These holds
+ * wait 7 frames: through a pause with a loud frame, after or inside a burst
+ * without an act, and with the tracker under the resume level. An onset
+ * verdict inside a short hangover takes the long one, and no frame after it
+ * acts.
+ */
+static void hold_refuse_test(unsigned rate)
+{
+	static struct hold_leg legs[2][MISS_PHASES];
+	static struct hold_leg span[2][MISS_PHASES];
+	static struct hold_leg low[1][MISS_PHASES];
+	unsigned k;
+
+	hold_phases_run(rate, MISS_RES_DEEP_DB, MISS_QUIET_FRAMES,
+			hold_refuse_specs, 2u, legs);
+	hold_phases_run(rate, MISS_RES_DEEP_DB, HOLD_SPAN_QUIET,
+			hold_refuse_span, 2u, span);
+	hold_phases_run(rate, MISS_RES_LOW_DB, MISS_QUIET_FRAMES,
+			&hold_low_spec, 1u, low);
+	case_rate(rate, "lec nlp waits after a short hold through a pause "
+		  "with a frame over the bound");
+	hold_legs_print("pulse on the last tail frame before P-", span[0]);
+	hold_short_count(span[0]);
+	for (k = 0; k < MISS_PHASES; k++) {
+		if (hold_short_get(&span[0][k]))
+			hold_wait_check(&span[0][k]);
+	}
+	case_rate(rate, "lec nlp waits after a short hold from a far onset "
+		  "after a burst without an act");
+	hold_legs_print("pulse on burst frame 0 after an unacted burst",
+			legs[0]);
+	hold_short_count(legs[0]);
+	for (k = 0; k < MISS_PHASES; k++) {
+		if (hold_short_get(&legs[0][k]))
+			hold_wait_check(&legs[0][k]);
+	}
+	case_rate(rate, "lec nlp waits after a short hold inside a burst "
+		  "without an act");
+	hold_legs_print("pulse on burst frame 1 after an unacted burst",
+			legs[1]);
+	hold_short_count(legs[1]);
+	for (k = 0; k < MISS_PHASES; k++) {
+		if (!hold_short_get(&legs[1][k]))
+			continue;
+		CHECK(!legs[1][k].acted);
+		hold_wait_check(&legs[1][k]);
+	}
+	case_rate(rate, "lec nlp waits after a short hold with the ERLE "
+		  "tracker under the resume level");
+	hold_legs_print("pulse on burst frame 1, low line", low[0]);
+	hold_short_count(low[0]);
+	for (k = 0; k < MISS_PHASES; k++) {
+		if (!hold_short_get(&low[0][k]))
+			continue;
+		CHECK(low[0][k].acted);
+		hold_wait_check(&low[0][k]);
+		CHECK(low[0][k].erle_db < MISS_RESUME_DB);
+	}
+	case_rate(rate, "lec nlp acts on no frame after a long hold");
+	hold_legs_print("pulse 13.5 dB over the floor on burst frame 0 inside "
+			"a short hangover", span[1]);
+	for (k = 0; k < MISS_PHASES; k++) {
+		CHECK(span[1][k].fired);
+		CHECK(span[1][k].set > TAIL_PAIR_SHORT_FRAMES);
+		CHECK(span[1][k].end < MISS_BURST_FRAMES);
+		CHECK_UINT(span[1][k].first, MISS_BURST_FRAMES);
+		CHECK_UINT(span[1][k].waits,
+			   MISS_BURST_FRAMES - span[1][k].end);
+	}
+}
+
+/*
+ * The resume after a short hold inside an escape trial, on a copy turned over
+ * at echo delay. The first pass frame after the trial's short hold carries the
+ * copy, and the processor does not act on it. An escape trial acts on its own
+ * evidence alone.
+ */
+static void hold_trial_test(unsigned rate)
+{
+	static const struct expose_row rows[] = {
+		{ "white copy at the echo delay turned over, 3 times the echo",
+		  EXPOSE_WHITE, EXPOSE_COPY, EXPOSE_INVERT_LOW_DB,
+		  EXPOSE_ECHO_MS, 0, false, true, 4.0, 1 },
+		{ "white copy at the echo delay turned over, 12 times the echo",
+		  EXPOSE_WHITE, EXPOSE_COPY, EXPOSE_INVERT_HIGH_DB,
+		  EXPOSE_ECHO_MS, 0, false, true, 6.0, 1 },
+	};
+	unsigned i;
+
+	case_rate(rate, "lec nlp resumes no engage run after a short hold "
+		  "inside an escape trial");
+	for (i = 0; i < 2u; i++) {
+		struct expose_count off;
+		struct expose_count on;
+
+		expose_row_run(&rows[i], rate, &off, &on);
+		printf("# %u Hz, %s: %u first pass frames after a short hold "
+		       "inside a trial, the processor acts on %u\n", rate,
+		       rows[i].what, on.hold_pass, on.hold_acted);
+		CHECK(on.hold_pass >= 1u);
+		CHECK_UINT(on.hold_acted, 0);
+	}
+}
+
+/* The legs of hold_cut_test on the nlp_cut_test fixture: an untrusted frozen
+ * filter, a near pulse on a far-silent frame in far noise. It fires on a tail
+ * frame, then the processor is off or a frame reads unlike. */
+#define HOLD_CUT_ERL_DB		23.0
+#define HOLD_CUT_TRAIN_FRAMES	80u
+#define HOLD_CUT_NEAR_DBM0	-15.0
+#define HOLD_CUT_FRAMES		30u
+
+enum hold_cut {
+	HOLD_CUT_NONE,
+	HOLD_CUT_OFF,
+	HOLD_CUT_UNLIKE,
+};
+
+/*
+ * The figures of a leg: whether the processor acted before the pulse, whether
+ * it fired and the hangover it set, and the dt frames after it. Then the
+ * verdict of the frame that follows them, and the pass frames to the first
+ * act after the hold. Last, the ERLE on the first pass frame.
+ */
+struct hold_cut_leg {
+	bool engaged;
+	bool fired;
+	unsigned set;
+	unsigned held;
+	unsigned verdict;
+	unsigned at;
+	double erle_db;
+};
+
+static void hold_cut_run(unsigned rate, enum hold_cut cut,
+			 struct hold_cut_leg *g)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct echo_path path;
+	struct udsp_ec *ec;
+	uint32_t state = 0x31415926u;
+	uint32_t near_state = 0xa5a5c3c3u;
+	unsigned acted = 0;
+	unsigned passes = 0;
+	unsigned f;
+
+	memset(g, 0, sizeof(*g));
+	g->at = HOLD_CUT_FRAMES;
+	ec = gate_fixture_rate_create(&path, rate, 8u, HOLD_CUT_ERL_DB,
+				      HOLD_CUT_TRAIN_FRAMES, &state, &acted);
+	verdict_far_run(ec, &path, &state, FRAMES_PER_SECOND, &acted);
+	udsp_ec_nlms_info_get(ec, &info);
+	g->engaged = info.nlp_active;
+	near_step(ec, &path, HOLD_CUT_NEAR_DBM0, &near_state, &acted);
+	udsp_ec_nlms_frame_get(ec, &reading);
+	g->fired = reading.dt_fired;
+	/* hold_left reads the hangover that the verdict of the frame before
+	 * set. The frame that reads 1 is the first after the hangover. */
+	do {
+		verdict_far_run(ec, &path, &state, 1u, &acted);
+		udsp_ec_nlms_frame_get(ec, &reading);
+		if (!g->set)
+			g->set = reading.hold_left;
+		g->held += reading.nlp_verdict == LECR_VERDICT_DT;
+	} while (reading.hold_left > 2u && g->held < HOLD_CUT_FRAMES);
+	g->verdict = LECR_VERDICT_PASS;
+	if (cut == HOLD_CUT_OFF) {
+		udsp_ec_nlms.nlp(ec, false);
+		verdict_far_run(ec, &path, &state, 1u, &acted);
+		udsp_ec_nlms.nlp(ec, true);
+	} else if (cut == HOLD_CUT_UNLIKE) {
+		near_step(ec, &path, FLAP_NEAR_DBM0, &near_state, &acted);
+	}
+	if (cut != HOLD_CUT_NONE) {
+		udsp_ec_nlms_frame_get(ec, &reading);
+		g->verdict = reading.nlp_verdict;
+	}
+	for (f = 0; f < HOLD_CUT_FRAMES && g->at == HOLD_CUT_FRAMES; f++) {
+		verdict_far_run(ec, &path, &state, 1u, &acted);
+		udsp_ec_nlms_frame_get(ec, &reading);
+		udsp_ec_nlms_info_get(ec, &info);
+		if (reading.nlp_verdict != LECR_VERDICT_PASS)
+			continue;
+		if (!passes)
+			g->erle_db = reading.erle_db;
+		if (info.nlp_active)
+			g->at = passes;
+		passes++;
+	}
+	udsp_ec_nlms.destroy(ec);
+}
+
+/*
+ * An off or unlike frame between a short hold and the next pass frame ends the
+ * hold. Without one the first pass frame acts; after one the burst waits
+ * REFUSAL_WAIT pass frames, with the tracker at MISS_RESUME_DB or more on each
+ * first pass frame.
+ */
+static void hold_cut_test(unsigned rate)
+{
+	static const char *const names[3] = { "no frame", "an off frame",
+					       "an unlike frame" };
+	static const unsigned verdicts[3] = { LECR_VERDICT_PASS,
+					      LECR_VERDICT_OFF,
+					      LECR_VERDICT_UNLIKE };
+	unsigned k;
+
+	case_rate(rate, "lec nlp ends a short hold on an off or unlike frame "
+		  "before the next pass frame");
+	for (k = 0; k < 3u; k++) {
+		struct hold_cut_leg g;
+
+		hold_cut_run(rate, (enum hold_cut)k, &g);
+		printf("# %s after the hold: the pulse fired %u and set %u, %u "
+		       "dt frames, then %s; the processor acts on pass frame "
+		       "%u after the hold, counted from 0; ERLE tracker %.2f "
+		       "dB\n", names[k], g.fired, g.set, g.held,
+		       udsp_ec_nlms_verdict_name(g.verdict), g.at, g.erle_db);
+		CHECK(g.engaged);
+		CHECK(g.fired);
+		CHECK_UINT(g.set, TAIL_PAIR_SHORT_FRAMES);
+		CHECK(g.erle_db >= MISS_RESUME_DB);
+		CHECK_UINT(g.verdict, verdicts[k]);
+		CHECK_UINT(g.at, k ? REFUSAL_WAIT : 0u);
+	}
+}
+
+/* The bar bound of a thin pair (LEC_GEIGEL_PAIR_RATIO) on the late line. Each
+ * second verdict stands 3 to 6 dB over the bar and within 12 dB of the floor,
+ * and keeps the short hangover. */
+static void hangover_pair_bar_test(unsigned rate)
+{
+	static const struct tail_pair_leg leg = {
+		"under the bar bound", { 0.0, 40.0 }, { -60.0, 0.0 },
+		{ 40u, 112u },
+	};
+	struct tail_pair_result r;
+
+	case_rate(rate, "lec hangover of a thin pair 3 to 6 dB over its bar");
+	tail_pair_run(rate, &leg, &r);
+	tail_pair_print(rate, leg.name, &r);
+	CHECK(r.thin >= TAIL_PAIR_MIN);
+	CHECK_UINT(r.thin_short, r.thin);
+	CHECK(r.bar_lo >= 10.0 * log10(TAIL_PAIR_MARGINAL_RATIO));
+	CHECK(r.floor_hi < 10.0 * log10(TAIL_PAIR_FLOOR_RATIO));
+	CHECK_UINT(r.active, 0);
+}
+
+/* The leg of hold_repeat_test on the line with its echo product
+ * MISS_RES_DEEP_DB under the echo: a pulse on the last tail frame, a thin
+ * frame, and one on burst frame 1, an active frame, 6 frames later. */
+static const struct hold_spec hold_repeat_spec = {
+	"----", { { HOLD_AT_TAIL, HOLD_PULSE_DB }, { 1, HOLD_PULSE_DB } }, 2u,
+	NULL,
+};
+
+/*
+ * The repeat count after a short verdict on a thin frame: a verdict on the last
+ * tail frame leaves the count running. A verdict on burst frame 1 within 3 dB
+ * of the bar and 12 dB of the floor then takes the short hangover. The burst
+ * acts from the first pass frame after its hold.
+ */
+static void hold_repeat_test(unsigned rate)
+{
+	static struct hold_leg legs[1][MISS_PHASES];
+	unsigned n = 0;
+	unsigned k;
+
+	hold_phases_run(rate, MISS_RES_DEEP_DB, MISS_QUIET_FRAMES,
+			&hold_repeat_spec, 1u, legs);
+	case_rate(rate, "lec double talk leaves the repeat count running "
+		  "after a short verdict on a tail frame");
+	hold_legs_print("pulse on burst frame 1 after a tail verdict", legs[0]);
+	for (k = 0; k < MISS_PHASES; k++) {
+		const struct hold_leg *g = &legs[0][k];
+
+		if (!g->lead_fired || !g->fired)
+			continue;
+		n++;
+		CHECK_UINT(g->lead_set, TAIL_PAIR_SHORT_FRAMES);
+		CHECK_UINT(g->set, TAIL_PAIR_SHORT_FRAMES);
+		hold_resume_check(g);
+	}
+	printf("# %u of %u phases fire on both pulses\n", n, MISS_PHASES);
+	CHECK(n >= HOLD_MIN_PHASES);
+}
+
+/*
+ * The implied floor of the re-acquisition window. The line is the
+ * line of floor_keep_test with the background rise_db up at the change. So
+ * the rise run at the keep implies a floor over the tracked one. From the
+ * keep the background falls back, and the far pauses read high_db and
+ * IMPLIED_CREEP_DB over the line noise in turn. The creep readings keep the
+ * floor in place. The result counts the engage-wait frames and the bursts
+ * that follow a high pause, inside the window and in the IMPLIED_AFTER frames
+ * after it.
+ */
+#define IMPLIED_CREEP_DB	1.0
+#define IMPLIED_WINDOW		700u
+#define IMPLIED_AFTER		400u
+/* The wait of an engage run after a refused resume: 7 frames. */
+#define IMPLIED_WAIT		7u
+
+/* The pause frames of implied_run that carry the high level. */
+enum implied_fill {
+	/* The last two frames of a pause, after the reference window. */
+	IMPLIED_FILL_LATE,
+	/* The second-last frame of a pause only, a tail frame of the
+	 * processor (LEC_NLP_TAIL_QUIET_FRAMES). */
+	IMPLIED_FILL_TAIL,
+};
+
+/* A line of implied_run. The levels are in dB over the line noise. */
+struct implied_line {
+	double hiss_dbm0;
+	double rise_db;
+	double high_db;
+	enum implied_fill fill;
+};
+
+struct implied_result {
+	unsigned keep;
+	unsigned waits_in;
+	unsigned high_in;
+	unsigned waits_out;
+	unsigned high_out;
+};
+
+static void implied_run(unsigned rate, const struct implied_line *l,
+			struct implied_result *r)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct echo_path path, next;
+	struct udsp_ec *ec = udsp_ec_nlms.create_rate(0, rate);
+	uint32_t state[2] = { 0x2a5e1c0du, 0x51ab0dd5u };
+	uint32_t pause_state = 0x3c6ef372u;
+	int16_t near[UDSP_FRAME_MAX];
+	unsigned frame = rate / 100u;
+	unsigned pause, f, pauses = 0, in_pause = 0;
+	uint32_t waits = 0;
+	bool was_burst = true, high = false;
+
+	memset(r, 0, sizeof(*r));
+	udsp_ec_nlms_info_get(ec, &info);
+	pause = (info.taps + frame - 1u) / frame + 2u;
+	udsp_ec_nlms_ref_loss_set(ec, PHASE2_LOSS_HALF_DB);
+	udsp_ec_nlms.nlp(ec, true);
+	path_annex_d_init(&path, rate, ANNEX_D_M1,
+			  phase2_erl_db[0] + PHASE2_DELTA_ERL_DB,
+			  FLOOR_KEEP_DELAY_MS);
+	for (f = 0; f < PHASE2_CONVERGE_FRAMES; f++)
+		floor_keep_frame(ec, &path, state,
+				 f % FLOOR_KEEP_PERIOD_FRAMES <
+				 FLOOR_KEEP_PERIOD_FRAMES - pause,
+				 l->hiss_dbm0, NULL);
+	path_annex_d_init(&next, rate, phase2_models[0], phase2_erl_db[0],
+			  FLOOR_KEEP_DELAY_MS);
+	path_history_carry(&next, &path);
+	for (f = 0; f < 14u * FRAMES_PER_SECOND; f++) {
+		unsigned g = PHASE2_CONVERGE_FRAMES + f;
+		bool burst = g % FLOOR_KEEP_PERIOD_FRAMES <
+			     FLOOR_KEEP_PERIOD_FRAMES - pause;
+		bool after = r->keep && f >= r->keep;
+		bool late, content;
+
+		if (!burst && was_burst)
+			pauses++;
+		if (burst && !was_burst && after && high) {
+			if (f < r->keep + IMPLIED_WINDOW)
+				r->high_in++;
+			else if (f < r->keep + IMPLIED_WINDOW + IMPLIED_AFTER)
+				r->high_out++;
+		}
+		was_burst = burst;
+		in_pause = burst ? 0u : in_pause + 1u;
+		if (!burst)
+			high = pauses % 2u;
+		late = l->fill == IMPLIED_FILL_LATE ? in_pause + 2u > pause :
+						      in_pause + 1u == pause;
+		content = after && !burst && (!high || late);
+		if (content)
+			noise_fill(near, frame, l->hiss_dbm0 +
+				   (high ? l->high_db : IMPLIED_CREEP_DB),
+				   &pause_state);
+		floor_keep_frame(ec, &next, state, burst,
+				 l->hiss_dbm0 + (after ? 0.0 : l->rise_db),
+				 content ? near : NULL);
+		udsp_ec_nlms_info_get(ec, &info);
+		udsp_ec_nlms_frame_get(ec, &reading);
+		if (!r->keep &&
+		    reading.trial_end == UDSP_EC_NLMS_TRIAL_END_KEPT)
+			r->keep = f + 1u;
+		if (r->keep && f >= r->keep) {
+			if (f < r->keep + IMPLIED_WINDOW)
+				r->waits_in += info.nlp_wait_frames - waits;
+			else if (f < r->keep + IMPLIED_WINDOW + IMPLIED_AFTER)
+				r->waits_out += info.nlp_wait_frames - waits;
+		}
+		waits = info.nlp_wait_frames;
+	}
+	udsp_ec_nlms.destroy(ec);
+}
+
+static void implied_print(unsigned rate, const char *what,
+			  const struct implied_result *r)
+{
+	printf("# %u Hz, %s: keep on frame %u after the change; engage-wait "
+	       "frames %u in the window after %u bursts that follow a high "
+	       "pause, %u after it after %u such bursts\n", rate, what,
+	       r->keep, r->waits_in, r->high_in, r->waits_out, r->high_out);
+}
+
+/* The lines of the implied floor cases (implied_run). */
+static const struct implied_line implied_inside = {
+	PHASE2_HISS_DBM0, 20.0, 16.0, IMPLIED_FILL_LATE
+};
+
+static const struct implied_line implied_cap = {
+	PHASE2_HISS_DBM0, 30.0, 28.0, IMPLIED_FILL_LATE
+};
+
+/*
+ * -57 dBm0: a loud line noise. The first quiet frame after the change still
+ * carries echo, and over this noise it stays within the spread bound of the
+ * rise run. A rise of 6 dB then implies a floor about 6 dB over the tracked
+ * one, under the cap. Its peak bound stands about 15 dB over the line noise, and
+ * the peak bound of a floor at the cap 21 dB.
+ */
+#define IMPLIED_LOUD_HISS_DBM0	-57.0
+
+static const struct implied_line implied_under = {
+	IMPLIED_LOUD_HISS_DBM0, 6.0, 11.0, IMPLIED_FILL_LATE
+};
+
+static const struct implied_line implied_over = {
+	IMPLIED_LOUD_HISS_DBM0, 6.0, 17.0, IMPLIED_FILL_LATE
+};
+
+/* 22 dB: over the peak bound of the capped floor and under its tail
+ * threshold (LEC_NLP_TAIL_FLOOR_RATIO). */
+static const struct implied_line implied_tail = {
+	PHASE2_HISS_DBM0, 20.0, 22.0, IMPLIED_FILL_TAIL
+};
+
+/*
+ * The background 20 dB up at the change; pauses at 16 dB over the line noise
+ * in their last two frames. The peak bound reads the implied floor, so no
+ * burst after such a pause waits more than one engage run in the window.
+ */
+static void implied_inside_test(unsigned rate)
+{
+	struct implied_result r;
+
+	implied_run(rate, &implied_inside, &r);
+	case_rate(rate, "lec reads the implied floor in the window after a "
+		  "kept echo path change");
+	implied_print(rate, "inside the window", &r);
+	CHECK(r.keep > 0u);
+	CHECK(r.high_in > 0u);
+	CHECK(r.waits_in <= IMPLIED_WAIT);
+}
+
+/*
+ * The line of implied_inside_test after the window. The implied floor ends
+ * with the window, so all but one burst after a high pause waits its engage
+ * run again.
+ */
+static void implied_outside_test(unsigned rate)
+{
+	struct implied_result r;
+
+	implied_run(rate, &implied_inside, &r);
+	case_rate(rate, "lec reads no implied floor after the window");
+	implied_print(rate, "after the window", &r);
+	CHECK(r.high_out > 1u);
+	CHECK(r.waits_out >= IMPLIED_WAIT * (r.high_out - 1u));
+}
+
+/*
+ * The background 30 dB up at the change, so the rise run implies a floor over
+ * the cap (LEC_NOISE_IMPLIED_CAP_DB, 12 dB). The pauses read 28 dB over the
+ * line noise in their last two frames. They stand over the peak bound of the
+ * capped floor, so all but one burst after them waits its engage run.
+ */
+static void implied_cap_test(unsigned rate)
+{
+	struct implied_result r;
+
+	implied_run(rate, &implied_cap, &r);
+	case_rate(rate, "lec caps the implied floor 12 dB over the tracked "
+		  "floor");
+	implied_print(rate, "over the cap", &r);
+	CHECK(r.high_in > 1u);
+	CHECK(r.waits_in >= IMPLIED_WAIT * (r.high_in - 1u));
+}
+
+/*
+ * The line of keep_renewal_test: the line of implied_run with the background
+ * RENEW_RISE_DB up at the change, so the first keep implies a floor. From the
+ * first keep the background falls back, and the far pauses read
+ * RENEW_LOW_DB and RENEW_HIGH_DB over the line noise in turn. So the next
+ * rise run spreads over its bound, and no agreement run completes. A second
+ * change, back to m1, RENEW_SECOND frames after the first keep ends in a
+ * second keep in the window. After it the pauses read RENEW_MID_DB and
+ * IMPLIED_CREEP_DB in turn.
+ */
+#define RENEW_RISE_DB		20.0
+#define RENEW_LOW_DB		4.0
+#define RENEW_HIGH_DB		14.0
+#define RENEW_MID_DB		10.0
+#define RENEW_SECOND		100u
+
+struct renew_result {
+	unsigned keep1;
+	unsigned keep2;
+	unsigned waits_first;
+	unsigned waits_late;
+	unsigned high_late;
+};
+
+static void renew_run(unsigned rate, struct renew_result *r)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct echo_path path, next, back;
+	struct udsp_ec *ec = udsp_ec_nlms.create_rate(0, rate);
+	uint32_t state[2] = { 0x2a5e1c0du, 0x51ab0dd5u };
+	uint32_t pause_state = 0x3c6ef372u;
+	int16_t near[UDSP_FRAME_MAX];
+	unsigned frame = rate / 100u;
+	unsigned pause, f, pauses = 0;
+	uint32_t waits = 0;
+	bool second = false, was_burst = true, high = false;
+
+	memset(r, 0, sizeof(*r));
+	udsp_ec_nlms_info_get(ec, &info);
+	pause = (info.taps + frame - 1u) / frame + 2u;
+	udsp_ec_nlms_ref_loss_set(ec, PHASE2_LOSS_HALF_DB);
+	udsp_ec_nlms.nlp(ec, true);
+	path_annex_d_init(&path, rate, ANNEX_D_M1,
+			  phase2_erl_db[0] + PHASE2_DELTA_ERL_DB,
+			  FLOOR_KEEP_DELAY_MS);
+	for (f = 0; f < PHASE2_CONVERGE_FRAMES; f++)
+		floor_keep_frame(ec, &path, state,
+				 f % FLOOR_KEEP_PERIOD_FRAMES <
+				 FLOOR_KEEP_PERIOD_FRAMES - pause,
+				 PHASE2_HISS_DBM0, NULL);
+	path_annex_d_init(&next, rate, phase2_models[0], phase2_erl_db[0],
+			  FLOOR_KEEP_DELAY_MS);
+	path_history_carry(&next, &path);
+	for (f = 0; f < 16u * FRAMES_PER_SECOND; f++) {
+		unsigned g = PHASE2_CONVERGE_FRAMES + f;
+		bool burst = g % FLOOR_KEEP_PERIOD_FRAMES <
+			     FLOOR_KEEP_PERIOD_FRAMES - pause;
+		bool after = r->keep1 && f >= r->keep1;
+		struct echo_path *p = second ? &back : &next;
+		double level;
+
+		if (!burst && was_burst)
+			pauses++;
+		if (burst && !was_burst && high && r->keep2 &&
+		    f >= r->keep1 + IMPLIED_WINDOW &&
+		    f < r->keep2 + IMPLIED_WINDOW)
+			r->high_late++;
+		was_burst = burst;
+		if (!burst)
+			high = pauses % 2u;
+		if (r->keep1 && !second && f == r->keep1 + RENEW_SECOND) {
+			path_annex_d_init(&back, rate, ANNEX_D_M1,
+					  phase2_erl_db[0] +
+					  PHASE2_DELTA_ERL_DB,
+					  FLOOR_KEEP_DELAY_MS);
+			path_history_carry(&back, &next);
+			second = true;
+			p = &back;
+		}
+		if (r->keep2)
+			level = high ? RENEW_MID_DB : IMPLIED_CREEP_DB;
+		else
+			level = high ? RENEW_HIGH_DB : RENEW_LOW_DB;
+		if (after && !burst)
+			noise_fill(near, frame, PHASE2_HISS_DBM0 + level,
+				   &pause_state);
+		floor_keep_frame(ec, p, state, burst,
+				 PHASE2_HISS_DBM0 +
+				 (after ? 0.0 : RENEW_RISE_DB),
+				 after && !burst ? near : NULL);
+		udsp_ec_nlms_info_get(ec, &info);
+		udsp_ec_nlms_frame_get(ec, &reading);
+		if (reading.trial_end == UDSP_EC_NLMS_TRIAL_END_KEPT) {
+			if (!r->keep1)
+				r->keep1 = f + 1u;
+			else if (second && !r->keep2)
+				r->keep2 = f + 1u;
+		}
+		if (r->keep1 && f >= r->keep1 && f < r->keep1 + IMPLIED_WINDOW)
+			r->waits_first += info.nlp_wait_frames - waits;
+		if (r->keep2 && f >= r->keep1 + IMPLIED_WINDOW &&
+		    f < r->keep2 + IMPLIED_WINDOW)
+			r->waits_late += info.nlp_wait_frames - waits;
+		waits = info.nlp_wait_frames;
+	}
+	udsp_ec_nlms.destroy(ec);
+}
+
+/*
+ * A second keep in the re-acquisition window whose rise run implies no floor.
+ * After the second keep the bursts act, and a pause at
+ * RENEW_MID_DB stands over the peak bound of the floor. From the end of the
+ * first window to the end of the second, each burst after such a pause must
+ * wait its engage run. The implied floor of the first keep must not carry
+ * over.
+ */
+static void keep_renewal_test(unsigned rate)
+{
+	struct renew_result r;
+
+	renew_run(rate, &r);
+	case_rate(rate, "lec carries no implied floor of an earlier keep past "
+		  "a keep whose run implies none");
+	printf("# %u Hz: keeps on frames %u and %u after the change; "
+	       "engage-wait frames %u in the first window, %u from its end to "
+	       "the end of the second after %u bursts that follow a loud "
+	       "pause\n", rate, r.keep1, r.keep2, r.waits_first,
+	       r.waits_late, r.high_late);
+	CHECK(r.keep1 > 0u);
+	CHECK(r.keep2 > r.keep1 && r.keep2 < r.keep1 + IMPLIED_WINDOW);
+	CHECK(r.high_late > 0u);
+	CHECK(r.waits_late >= IMPLIED_WAIT * r.high_late);
+}
+
+/*
+ * The line of IMPLIED_LOUD_HISS_DBM0 with the background 6 dB up at the
+ * change, so the rise run implies a floor under the cap. Pauses at 11 dB stand
+ * under the peak bound of that floor, so no burst after them waits more than
+ * one engage run. Pauses at 17 dB stand over it and under the peak bound of a
+ * floor at the cap. So all but one burst after them waits its engage run.
+ */
+static void implied_uncapped_test(unsigned rate)
+{
+	struct implied_result under, over;
+
+	implied_run(rate, &implied_under, &under);
+	implied_run(rate, &implied_over, &over);
+	case_rate(rate, "lec takes the implied floor from the mean of the rise "
+		  "run under the cap");
+	implied_print(rate, "under the bound of the run", &under);
+	implied_print(rate, "over the bound of the run", &over);
+	CHECK(under.keep > 0u && under.high_in > 1u);
+	CHECK(under.waits_in <= IMPLIED_WAIT);
+	CHECK(over.high_in > 1u);
+	CHECK(over.waits_in >= IMPLIED_WAIT * (over.high_in - 1u));
+}
+
+/*
+ * The line of implied_inside_test with the high level at 22 dB in the
+ * second-last frame of each pause only, a tail frame. It stands over the peak
+ * bound of the implied floor and under its tail threshold. So no burst after
+ * such a pause waits more than one engage run in the window.
+ */
+static void implied_tail_test(unsigned rate)
+{
+	struct implied_result r;
+
+	implied_run(rate, &implied_tail, &r);
+	case_rate(rate, "lec reads the implied floor in the tail threshold");
+	implied_print(rate, "tail frame", &r);
+	CHECK(r.keep > 0u && r.high_in > 1u);
+	CHECK(r.waits_in <= IMPLIED_WAIT);
+}
+
+/*
+ * The cross-fade at the start of an act. The line is the line of
+ * floor_keep_test on a path whose echo arrives delay_ms after the far end.
+ * The filter converges on that path plus an early copy of it, early_ms after
+ * the far end and early_db under it. Then the copy leaves the path. So the
+ * estimate leads the echo on the first frame of a burst. With early_db 0 the
+ * path carries no copy. With late, the path carries a late copy at the end
+ * of the filter span until the change. The result reads each frame that
+ * starts or ends an act in the FADE_FRAMES after the change, as its output
+ * over its input. It keeps the most over the act starts whose estimate
+ * stands 3 dB over the input, and over the other act starts. It keeps the
+ * least over the act ends whose estimate stands 3 dB over the input.
+ */
+/* The lead line: the first frame of a burst carries the estimate of the copy
+ * and no echo yet. */
+#define FADE_DELAY_MS		12u
+#define FADE_EARLY_MS		4u
+#define FADE_PLAIN_MS		4u
+#define FADE_LATE_BACK_MS	2u
+#define FADE_LATE_DB		-20.0
+/* 1 dB: an act end fades to the filter output, which stands over the input
+ * where the estimate outlasts the echo. */
+#define FADE_LAG_OVER_DB	1.0
+#define FADE_EARLY_DB		-30.0
+#define FADE_FRAMES		(4u * FRAMES_PER_SECOND)
+/* -20 dB: an ordinary act start fades from the filter output, far under an
+ * input that carries the echo. */
+#define FADE_PLAIN_UNDER_DB	-20.0
+/* The weight line: the echo arrives in the last 2 ms of the first frame of a
+ * burst, and the copy 5 ms before it. */
+#define FADE_WEIGHT_DELAY_MS	8u
+#define FADE_WEIGHT_EARLY_MS	3u
+#define FADE_WEIGHT_DB		-10.0
+/* -20 dB: the fade from the input keeps little of an echo at the end of the
+ * frame. A fade from the filter output keeps the estimate of the copy, about
+ * 10 dB under the input. */
+#define FADE_WEIGHT_UNDER_DB	-20.0
+
+struct fade_result {
+	unsigned lead;
+	unsigned plain;
+	unsigned lag;
+	double lead_over_db;
+	double plain_over_db;
+	double lag_over_db;
+};
+
+/* One frame of the fade line: the far end through path, the line noise, and
+ * the input and output powers of the frame. */
+static void fade_frame(struct udsp_ec *ec, struct echo_path *path,
+			uint32_t state[2], bool burst, double *in_power,
+			double *out_power)
+{
+	int16_t far[UDSP_FRAME_MAX];
+	int16_t ref[UDSP_FRAME_MAX];
+	int16_t echo[UDSP_FRAME_MAX];
+	int16_t hiss[UDSP_FRAME_MAX];
+	int16_t mic[UDSP_FRAME_MAX];
+	unsigned i;
+
+	if (burst)
+		noise_fill(far, path->frame, PHASE2_FAR_DBM0, &state[0]);
+	else
+		memset(far, 0, sizeof(far));
+	level_loss_apply(ref, far, path->frame, PHASE2_LOSS_HALF_DB);
+	path_run(path, far, echo);
+	noise_fill(hiss, path->frame, PHASE2_HISS_DBM0, &state[1]);
+	*in_power = 0.0;
+	*out_power = 0.0;
+	for (i = 0; i < path->frame; i++) {
+		mic[i] = sample_clamp((double)echo[i] + hiss[i]);
+		*in_power += (double)mic[i] * mic[i];
+	}
+	udsp_ec_nlms.run(ec, mic, ref);
+	for (i = 0; i < path->frame; i++)
+		*out_power += (double)mic[i] * mic[i];
+}
+
+/* The path with a late copy of itself, FADE_LATE_DB under it and shift
+ * samples after it. The path grows by shift taps. */
+static void fade_late_add(struct echo_path *path, unsigned shift)
+{
+	double g = pow(10.0, FADE_LATE_DB / 20.0);
+	unsigned taps = path->taps;
+	unsigned k;
+
+	if (taps + shift > LEC_PATH_TAPS_MAX)
+		return;
+	for (k = taps; k < taps + shift; k++)
+		path->h[k] = 0.0f;
+	for (k = taps + shift; k-- > shift;)
+		path->h[k] += (float)(g * path->h[k - shift]);
+	path->taps = taps + shift;
+}
+
+/* The path with an early copy of itself: each tap takes the tap shift
+ * samples later, early_db under it. */
+static void fade_copy_add(struct echo_path *path, unsigned shift,
+			   double early_db)
+{
+	double g = pow(10.0, early_db / 20.0);
+	unsigned k;
+
+	for (k = 0; k + shift < path->taps; k++)
+		path->h[k] += (float)(g * path->h[k + shift]);
+}
+
+static void fade_run(unsigned rate, unsigned delay_ms, unsigned early_ms,
+		     double early_db, bool late, struct fade_result *r)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct echo_path path, next;
+	struct udsp_ec *ec = udsp_ec_nlms.create_rate(0, rate);
+	uint32_t state[2] = { 0x2a5e1c0du, 0x51ab0dd5u };
+	unsigned frame = rate / 100u;
+	unsigned pause, f;
+	bool was_active = false;
+	double in, out;
+
+	memset(r, 0, sizeof(*r));
+	r->lead_over_db = -99.0;
+	r->plain_over_db = -99.0;
+	r->lag_over_db = 99.0;
+	udsp_ec_nlms_info_get(ec, &info);
+	pause = (info.taps + frame - 1u) / frame + 2u;
+	udsp_ec_nlms_ref_loss_set(ec, PHASE2_LOSS_HALF_DB);
+	udsp_ec_nlms.nlp(ec, true);
+	path_annex_d_init(&path, rate, ANNEX_D_M1, phase2_erl_db[0], delay_ms);
+	next = path;
+	if (early_db < 0.0)
+		fade_copy_add(&path, (delay_ms - early_ms) * rate / 1000u,
+			      early_db);
+	if (late)
+		fade_late_add(&path, info.taps - FADE_LATE_BACK_MS * rate /
+				      1000u - delay_ms * rate / 1000u);
+	for (f = 0; f < PHASE2_CONVERGE_FRAMES + FADE_FRAMES; f++) {
+		bool burst = f % FLOOR_KEEP_PERIOD_FRAMES <
+			     FLOOR_KEEP_PERIOD_FRAMES - pause;
+		bool after = f >= PHASE2_CONVERGE_FRAMES;
+		double over;
+
+		if (f == PHASE2_CONVERGE_FRAMES)
+			path_history_carry(&next, &path);
+		fade_frame(ec, after ? &next : &path, state, burst, &in, &out);
+		udsp_ec_nlms_info_get(ec, &info);
+		udsp_ec_nlms_frame_get(ec, &reading);
+		if (after && !info.nlp_active && was_active && in > 0.0 &&
+		    reading.estimate_power > 2.0f * reading.mic_power) {
+			r->lag++;
+			r->lag_over_db = fmin(r->lag_over_db,
+					      10.0 * log10(out / in));
+		}
+		if (after && info.nlp_active && !was_active && in > 0.0) {
+			over = 10.0 * log10(out / in);
+			if (reading.estimate_power > 2.0f * reading.mic_power) {
+				r->lead++;
+				r->lead_over_db = fmax(r->lead_over_db, over);
+			} else {
+				r->plain++;
+				r->plain_over_db = fmax(r->plain_over_db, over);
+			}
+		}
+		was_active = info.nlp_active;
+	}
+	udsp_ec_nlms.destroy(ec);
+}
+
+static void fade_print(unsigned rate, const char *what,
+			const struct fade_result *r)
+{
+	printf("# %u Hz, %s: %u act starts with a leading estimate, output "
+	       "at most %+.1f dB over the input; %u other act starts, at most "
+	       "%+.1f dB; %u act ends with a lagging estimate, at least "
+	       "%+.1f dB\n", rate, what, r->lead, r->lead_over_db, r->plain,
+	       r->plain_over_db, r->lag, r->lag_over_db);
+}
+
+/*
+ * The lead line of fade_run, with the early copy FADE_EARLY_DB under the
+ * path. On each frame that starts an act with a leading estimate, the
+ * cross-fade starts from the input. So the output stays under the input.
+ */
+static void fade_lead_test(unsigned rate)
+{
+	struct fade_result r;
+
+	fade_run(rate, FADE_DELAY_MS, FADE_EARLY_MS, FADE_EARLY_DB, false, &r);
+	case_rate(rate, "lec fades from the input when the estimate leads the "
+		  "echo at the start of an act");
+	fade_print(rate, "leading estimate", &r);
+	CHECK(r.lead >= 2u);
+	CHECK(r.lead_over_db <= 0.0);
+}
+
+/*
+ * The line of fade_run with no early copy: the echo arrives on the first
+ * frame of each burst (FADE_PLAIN_MS). The cross-fade starts from the filter
+ * output, so a frame that starts an act stays FADE_PLAIN_UNDER_DB under its
+ * input.
+ */
+static void fade_plain_test(unsigned rate)
+{
+	struct fade_result r;
+
+	fade_run(rate, FADE_PLAIN_MS, 0u, 0.0, false, &r);
+	case_rate(rate, "lec fades from the filter output at an ordinary start "
+		  "of an act");
+	fade_print(rate, "ordinary onset", &r);
+	CHECK(r.lead == 0u);
+	CHECK(r.plain >= 4u);
+	CHECK(r.plain_over_db <= FADE_PLAIN_UNDER_DB);
+}
+
+/*
+ * The line of fade_run with a late copy, FADE_LATE_DB under the path, that
+ * leaves the path. On the first quiet frame after a burst the estimate
+ * outlasts the echo, and the act ends there. That fade ends at the filter
+ * output, which the next frame carries, so the output stands over the input.
+ */
+static void fade_tail_test(unsigned rate)
+{
+	struct fade_result r;
+
+	fade_run(rate, FADE_PLAIN_MS, 0u, 0.0, true, &r);
+	case_rate(rate, "lec fades to the filter output at the end of an act");
+	fade_print(rate, "lagging estimate", &r);
+	CHECK(r.lag >= 1u);
+	CHECK(r.lag_over_db >= FADE_LAG_OVER_DB);
+}
+
+/*
+ * The weight line of fade_run. On the first frame of a burst, the input
+ * carries more power than the filter output, but late in the frame. The
+ * fade keeps little of the source there. The filter output carries the
+ * estimate of the copy early in the frame, where the fade keeps most of the
+ * source. So the fade from the input is the quieter one, and the frame stays
+ * FADE_WEIGHT_UNDER_DB under its input.
+ */
+static void fade_weight_test(unsigned rate)
+{
+	struct fade_result r;
+
+	fade_run(rate, FADE_WEIGHT_DELAY_MS, FADE_WEIGHT_EARLY_MS,
+		 FADE_WEIGHT_DB, false, &r);
+	case_rate(rate, "lec fades from the input when the echo arrives late in "
+		  "the frame");
+	fade_print(rate, "echo late in the frame", &r);
+	CHECK(r.lead + r.plain >= 4u);
+	CHECK(fmax(r.lead_over_db, r.plain_over_db) <= FADE_WEIGHT_UNDER_DB);
+}
+
+/*
+ * The emit line: a line of fade_run on twin instances, with its own line
+ * noise and seeds. The second twin runs with the processor off from the
+ * change. So its output is the filter output of the first, and its estimate
+ * reads the same on every frame. On each act start of the first twin, its
+ * reading names the source of the fade (fade_input). The output less the
+ * faded source is the noise term of the fade. With that term the line forms
+ * the other fade. The result keeps the most that a frame emits over the
+ * other fade and the rounding of fade_emit_read.
+ */
+/* The line noise of the cross-term lines: loud enough that the rounding to
+ * 16 bits does not hide the term of the comfort noise. */
+#define FADE_CROSS_HISS_DBM0	-45.0
+
+/*
+ * The cross-term lines: the echo arrives delay_ms after the far end, and a
+ * copy early_db under it at early_ms, with the seeds of seed. On some act
+ * starts of these lines, the two sources carry about the same energy under
+ * the fade. There the noise term decides which fade is quieter.
+ */
+static const struct fade_cross_line {
+	unsigned delay_ms;
+	unsigned early_ms;
+	double early_db;
+	unsigned seed;
+} fade_cross_lines[] = {
+	{ 8u, 3u, -12.0, 0u },
+	{ 9u, 3u, -20.0, 1u },
+};
+
+struct fade_emit_result {
+	unsigned starts;
+	unsigned apart;
+	double over_db;
+};
+
+/* One act start of the emit line: the input (in), the second twin's filter
+ * output (res) and the first twin's frame (out). The fade of out started
+ * from the input when from_in is set. */
+static void fade_emit_read(const int16_t *in, const int16_t *res,
+			   const int16_t *out, unsigned frame, bool from_in,
+			   struct fade_emit_result *r)
+{
+	double emit = 0.0, other = 0.0, slack = 0.0;
+	unsigned i;
+
+	r->starts++;
+	for (i = 0; i < frame; i++) {
+		double keep = 1.0 - (double)(i + 1u) / frame;
+		double noise = out[i] - keep * (from_in ? in[i] : res[i]);
+		double alt = keep * (from_in ? res[i] : in[i]) + noise;
+
+		emit += (double)out[i] * out[i];
+		other += alt * alt;
+		slack += fabs(out[i] - alt);
+	}
+	/*
+	 * The output rounds its fade to 16 bits, and the other fade here carries
+	 * the same rounding. So the frame can stand the sum of |out - alt| over
+	 * the other fade. The float sums of the canceller add 1e-6 of it.
+	 */
+	slack += 1e-6 * other;
+	if (emit > 0.0)
+		r->over_db = fmax(r->over_db,
+				  10.0 * log10(emit / (other + slack)));
+}
+
+static void fade_emit_run(unsigned rate, unsigned delay_ms, unsigned early_ms,
+			  double early_db, double hiss_dbm0, unsigned seed,
+			  struct fade_emit_result *r)
+{
+	struct udsp_ec_nlms_frame ra, rb;
+	struct udsp_ec_nlms_info info;
+	struct echo_path path, next;
+	struct udsp_ec *a = udsp_ec_nlms.create_rate(0, rate);
+	struct udsp_ec *b = udsp_ec_nlms.create_rate(0, rate);
+	uint32_t state[2] = { 0x2a5e1c0du ^ (seed * 0x9e3779b9u),
+			      0x51ab0dd5u ^ (seed * 0x7f4a7c15u) };
+	unsigned frame = rate / 100u;
+	unsigned pause, f, i;
+	bool was_active = false;
+
+	udsp_ec_nlms_info_get(a, &info);
+	pause = (info.taps + frame - 1u) / frame + 2u;
+	udsp_ec_nlms_ref_loss_set(a, PHASE2_LOSS_HALF_DB);
+	udsp_ec_nlms_ref_loss_set(b, PHASE2_LOSS_HALF_DB);
+	udsp_ec_nlms.nlp(a, true);
+	udsp_ec_nlms.nlp(b, true);
+	path_annex_d_init(&path, rate, ANNEX_D_M1, phase2_erl_db[0], delay_ms);
+	next = path;
+	fade_copy_add(&path, (delay_ms - early_ms) * rate / 1000u, early_db);
+	for (f = 0; f < PHASE2_CONVERGE_FRAMES + FADE_FRAMES; f++) {
+		int16_t far[UDSP_FRAME_MAX];
+		int16_t ref[UDSP_FRAME_MAX];
+		int16_t echo[UDSP_FRAME_MAX];
+		int16_t hiss[UDSP_FRAME_MAX];
+		int16_t in[UDSP_FRAME_MAX];
+		int16_t out[UDSP_FRAME_MAX];
+		int16_t res[UDSP_FRAME_MAX];
+		bool burst = f % FLOOR_KEEP_PERIOD_FRAMES <
+			     FLOOR_KEEP_PERIOD_FRAMES - pause;
+		bool after = f >= PHASE2_CONVERGE_FRAMES;
+
+		if (f == PHASE2_CONVERGE_FRAMES) {
+			path_history_carry(&next, &path);
+			udsp_ec_nlms.nlp(b, false);
+		}
+		if (burst)
+			noise_fill(far, frame, PHASE2_FAR_DBM0, &state[0]);
+		else
+			memset(far, 0, sizeof(far));
+		level_loss_apply(ref, far, frame, PHASE2_LOSS_HALF_DB);
+		path_run(after ? &next : &path, far, echo);
+		noise_fill(hiss, frame, hiss_dbm0, &state[1]);
+		for (i = 0; i < frame; i++)
+			in[i] = sample_clamp((double)echo[i] + hiss[i]);
+		memcpy(out, in, sizeof(in));
+		memcpy(res, in, sizeof(in));
+		udsp_ec_nlms.run(a, out, ref);
+		udsp_ec_nlms.run(b, res, ref);
+		udsp_ec_nlms_frame_get(a, &ra);
+		udsp_ec_nlms_frame_get(b, &rb);
+		udsp_ec_nlms_info_get(a, &info);
+		if (after && ra.estimate_power != rb.estimate_power)
+			r->apart++;
+		if (after && info.nlp_active && !was_active)
+			fade_emit_read(in, res, out, frame, ra.fade_input, r);
+		was_active = info.nlp_active;
+	}
+	udsp_ec_nlms.destroy(a);
+	udsp_ec_nlms.destroy(b);
+}
+
+/*
+ * The emit lines: the lead line and the weight line of fade_run, and the
+ * cross-term lines. On each act start, the frame emits no more energy than
+ * the other fade, up to the rounding to 16 bits.
+ */
+static void fade_emit_test(unsigned rate)
+{
+	struct fade_emit_result r;
+	unsigned l;
+
+	memset(&r, 0, sizeof(r));
+	r.over_db = -99.0;
+	fade_emit_run(rate, FADE_DELAY_MS, FADE_EARLY_MS, FADE_EARLY_DB,
+		      PHASE2_HISS_DBM0, 0u, &r);
+	fade_emit_run(rate, FADE_WEIGHT_DELAY_MS, FADE_WEIGHT_EARLY_MS,
+		      FADE_WEIGHT_DB, PHASE2_HISS_DBM0, 0u, &r);
+	for (l = 0; l < sizeof(fade_cross_lines) / sizeof(fade_cross_lines[0]);
+	     l++)
+		fade_emit_run(rate, fade_cross_lines[l].delay_ms,
+			      fade_cross_lines[l].early_ms,
+			      fade_cross_lines[l].early_db, FADE_CROSS_HISS_DBM0,
+			      fade_cross_lines[l].seed, &r);
+	case_rate(rate, "lec emits the quieter of the two fades at the start of "
+		  "an act");
+	printf("# %u Hz: %u act starts; output at most %+.3f dB over the other "
+	       "fade and its rounding; estimates apart on %u frames\n", rate,
+	       r.starts, r.over_db, r.apart);
+	CHECK(r.apart == 0u);
+	CHECK(r.starts >= 30u);
+	CHECK(r.over_db <= 0.0);
+}
+
+/*
+ * The resume on a tracker between 22 and 24 dB (LEC_NLP_RESUME_MARGIN_DB of
+ * dsp/lec.c). Down to RESUME_MARGIN_DB, the first pass frame after a far pause
+ * resumes the run on one of two forms of evidence:
+ * - climb: the tracker reads over its reading RESUME_CLIMB_FRAMES frames
+ *   before;
+ * - dip: the burst before the pause reached MISS_RESUME_DB.
+ * A dt, unlike or erle frame that cut the run since the run was last complete
+ * refuses both.
+ */
+#define RESUME_CLIMB_FRAMES	100u
+#define RESUME_MARGIN_DB	22.0
+/* The echo products of the lines. After MISS_RES_LOW_DB, RESUME_CLIMB_RES_DB
+ * takes the tracker from 20.4 dB up to 22.5 to 22.9 dB. After
+ * MISS_RES_DEEP_DB, RESUME_DIP_RES_DB takes it from 29.3 dB down to 23.1 to
+ * 23.3 dB in one burst. The two low products leave each form within
+ * RESUME_NEAR_DB under RESUME_MARGIN_DB. */
+#define RESUME_CLIMB_RES_DB	23.4
+#define RESUME_DIP_RES_DB	23.2
+#define RESUME_LOW_CLIMB_RES_DB	22.2
+#define RESUME_LOW_DIP_RES_DB	21.8
+#define RESUME_NEAR_DB		0.5
+/* The near sound of resume_cut_test on burst frames 2 to 4. Then the pulse
+ * over the tracked floor on the first frame of a burst, which takes the short
+ * hangover on the line of RESUME_CLIMB_RES_DB. */
+#define RESUME_TALK_FROM	2u
+#define RESUME_TALK_TO		5u
+#define RESUME_PULSE_DB		11.5
+
+/*
+ * The tracker readings that the resume reads, as the test keeps them from the
+ * readout of each frame: the last RESUME_CLIMB_FRAMES readings with pos on
+ * the oldest, the largest reading of the running burst, and that of the
+ * burst before the latest pause. Each frame that is not quiet is a burst
+ * frame.
+ */
+struct resume_trace {
+	double ring[RESUME_CLIMB_FRAMES];
+	unsigned pos;
+	double burst_max;
+	double pause_max;
+	bool in_pause;
+};
+
+static void resume_trace_add(struct resume_trace *tr, unsigned verdict,
+			     double erle_db)
+{
+	tr->ring[tr->pos] = erle_db;
+	tr->pos = (tr->pos + 1u) % RESUME_CLIMB_FRAMES;
+	if (verdict == LECR_VERDICT_QUIET) {
+		if (!tr->in_pause)
+			tr->pause_max = tr->burst_max;
+		tr->in_pause = true;
+		return;
+	}
+	if (tr->in_pause || erle_db > tr->burst_max)
+		tr->burst_max = erle_db;
+	tr->in_pause = false;
+}
+
+/* One frame of the line (miss_frame_run) into the trace. */
+static void resume_frame_run(struct miss_line *l, double over_db,
+			     struct resume_trace *tr,
+			     struct udsp_ec_nlms_frame *reading,
+			     struct udsp_ec_nlms_info *info)
+{
+	miss_frame_run(l, over_db, reading, info);
+	resume_trace_add(tr, reading->nlp_verdict, info->erle_db);
+}
+
+/* The quiet-miss line at phase k of the rate, with its echo product res_db
+ * under the echo, settled as miss_line_settle settles it. The trace starts
+ * with the line. */
+static void resume_line_init(struct miss_line *l, struct resume_trace *tr,
+			     unsigned rate, unsigned k, double res_db)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+
+	miss_line_init(l, rate, k * (rate / 100u) / MISS_PHASES, res_db);
+	memset(tr, 0, sizeof(*tr));
+	while (l->count < MISS_SETTLE_FRAMES ||
+	       miss_phase_get(l) != MISS_BURST_FRAMES)
+		resume_frame_run(l, 0.0, tr, &reading, &info);
+}
+
+/*
+ * The figures of a pause and the burst after it: the quiet frames of the
+ * pause and the largest reading of the burst before it. For each burst frame:
+ * the verdict, the act, the tracker after the frame and the reading
+ * RESUME_CLIMB_FRAMES frames before the frame. For the first burst frame:
+ * whether the detector fired, its microphone over the tracked floor, and the
+ * hangover that it set (hold_left of the frame after it).
+ */
+struct resume_leg {
+	unsigned quiet;
+	double pause_max;
+	unsigned verdict[MISS_BURST_FRAMES];
+	bool active[MISS_BURST_FRAMES];
+	double erle_db[MISS_BURST_FRAMES];
+	double ago_db[MISS_BURST_FRAMES];
+	bool fired;
+	unsigned set;
+	double over_floor;
+};
+
+/* The pause of the period from the frame the line stands on, with pattern on
+ * its quiet frames, then the burst of the next period. burst_db, when set,
+ * holds the level of each burst frame over the tracked floor. */
+static void resume_leg_run(struct miss_line *l, struct resume_trace *tr,
+			   const char *pattern, const double *burst_db,
+			   struct resume_leg *g)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	unsigned from = l->period - l->quiet;
+	unsigned f;
+
+	memset(g, 0, sizeof(*g));
+	for (f = miss_phase_get(l); f < l->period; f++) {
+		char c = f >= from ? pattern[f - from] : '-';
+
+		resume_frame_run(l, miss_level_get(c), tr, &reading, &info);
+		g->quiet += reading.nlp_verdict == LECR_VERDICT_QUIET;
+	}
+	g->pause_max = tr->pause_max;
+	for (f = 0; f < MISS_BURST_FRAMES; f++) {
+		g->ago_db[f] = tr->ring[tr->pos];
+		resume_frame_run(l, burst_db ? burst_db[f] : 0.0, tr, &reading,
+				 &info);
+		g->verdict[f] = reading.nlp_verdict;
+		g->active[f] = info.nlp_active;
+		g->erle_db[f] = info.erle_db;
+		if (f == 0u) {
+			g->fired = reading.dt_fired;
+			g->over_floor = ratio_db_get(reading.mic_power,
+						     reading.noise_power);
+		}
+		if (f == 1u)
+			g->set = reading.hold_left;
+	}
+}
+
+/* The first acting frame of a leg from frame from on, MISS_BURST_FRAMES for
+ * none, and the pass frames before it that waited. */
+static unsigned resume_first_get(const struct resume_leg *g, unsigned from,
+				 unsigned *waits)
+{
+	unsigned f;
+
+	*waits = 0;
+	for (f = from; f < MISS_BURST_FRAMES && !g->active[f]; f++)
+		*waits += g->verdict[f] == LECR_VERDICT_PASS;
+	return f;
+}
+
+/* The ranges of the figures of one leg over the phases, from the frame at. */
+struct resume_range {
+	double erle_lo;
+	double erle_hi;
+	double ago_lo;
+	double ago_hi;
+	double max_lo;
+	double max_hi;
+	unsigned first;
+	unsigned waits;
+};
+
+static void resume_range_init(struct resume_range *r)
+{
+	r->erle_lo = r->ago_lo = r->max_lo = 200.0;
+	r->erle_hi = r->ago_hi = r->max_hi = -200.0;
+	r->first = 0;
+	r->waits = 0;
+}
+
+static void resume_range_add(struct resume_range *r,
+			     const struct resume_leg *g, unsigned at)
+{
+	unsigned waits;
+	unsigned first = resume_first_get(g, at, &waits);
+
+	r->erle_lo = fmin(r->erle_lo, g->erle_db[at]);
+	r->erle_hi = fmax(r->erle_hi, g->erle_db[at]);
+	r->ago_lo = fmin(r->ago_lo, g->ago_db[at]);
+	r->ago_hi = fmax(r->ago_hi, g->ago_db[at]);
+	r->max_lo = fmin(r->max_lo, g->pause_max);
+	r->max_hi = fmax(r->max_hi, g->pause_max);
+	r->first = first - at > r->first ? first - at : r->first;
+	r->waits = waits > r->waits ? waits : r->waits;
+}
+
+static void resume_range_print(const char *what, const struct resume_range *r)
+{
+	printf("# %s: tracker %.2f to %.2f dB, %u frames before %.2f to %.2f "
+	       "dB; burst before the pause up to %.2f to %.2f dB; acts %u "
+	       "frames later at most, %u wait frames at most\n", what,
+	       r->erle_lo, r->erle_hi, RESUME_CLIMB_FRAMES, r->ago_lo,
+	       r->ago_hi, r->max_lo, r->max_hi, r->first, r->waits);
+}
+
+/*
+ * The checks of a leg whose onset is a pass frame after a pause of quiet
+ * frames, with the tracker under MISS_RESUME_DB: whether it climbs, whether
+ * the burst before reached MISS_RESUME_DB, and whether the burst acts on its
+ * first frame or waits 7 frames.
+ */
+static void resume_onset_check(const struct resume_leg *g, bool climb,
+			       bool dip, bool resumes)
+{
+	unsigned waits;
+	unsigned first = resume_first_get(g, 0u, &waits);
+
+	CHECK_UINT(g->quiet, MISS_QUIET_FRAMES);
+	CHECK_UINT(g->verdict[0], LECR_VERDICT_PASS);
+	CHECK(g->erle_db[0] < MISS_RESUME_DB);
+	CHECK((g->erle_db[0] > g->ago_db[0]) == climb);
+	CHECK((g->pause_max >= MISS_RESUME_DB) == dip);
+	CHECK_UINT(first, resumes ? 0u : WORDS_ENGAGE_FRAME);
+	CHECK_UINT(waits, resumes ? 0u : WORDS_ENGAGE_FRAME);
+}
+
+/* The climb line at phase k: its echo product moves from MISS_RES_LOW_DB to
+ * res_db after it settles. A pause of the line floor, then three misses. */
+static void resume_climb_run(unsigned rate, unsigned k, double res_db,
+			     struct resume_leg *g)
+{
+	struct resume_trace tr;
+	struct resume_leg floor;
+	struct miss_line l;
+
+	resume_line_init(&l, &tr, rate, k, MISS_RES_LOW_DB);
+	l.res_db = res_db;
+	resume_leg_run(&l, &tr, "----", NULL, &floor);
+	resume_leg_run(&l, &tr, "-mmm", NULL, g);
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/* The dip line at phase k: its echo product moves from MISS_RES_DEEP_DB to
+ * res_db after it settles. A pause of the line floor, then two of three
+ * misses: the first after the burst whose tracker dips, the second after the
+ * burst after it. */
+static void resume_dip_run(unsigned rate, unsigned k, double res_db,
+			   struct resume_leg g[2])
+{
+	struct resume_trace tr;
+	struct resume_leg floor;
+	struct miss_line l;
+
+	resume_line_init(&l, &tr, rate, k, MISS_RES_DEEP_DB);
+	l.res_db = res_db;
+	resume_leg_run(&l, &tr, "----", NULL, &floor);
+	resume_leg_run(&l, &tr, "-mmm", NULL, &g[0]);
+	resume_leg_run(&l, &tr, "-mmm", NULL, &g[1]);
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/*
+ * Three quiet misses at 8 phases on a line whose tracker climbs under
+ * MISS_RESUME_DB, from under RESUME_MARGIN_DB to over it. The burst before
+ * the pause stays under MISS_RESUME_DB, so the climb alone resumes the run at
+ * the far onset. A resume without the climb fails here.
+ */
+static void resume_climb_test(unsigned rate)
+{
+	struct resume_range r;
+	unsigned k;
+
+	resume_range_init(&r);
+	case_rate(rate, "lec nlp resumes the engage run at a far onset after "
+		  "three quiet misses on a climbing tracker under the resume "
+		  "level");
+	for (k = 0; k < MISS_PHASES; k++) {
+		struct resume_leg g;
+
+		resume_climb_run(rate, k, RESUME_CLIMB_RES_DB, &g);
+		resume_range_add(&r, &g, 0u);
+		resume_onset_check(&g, true, false, true);
+		CHECK(g.erle_db[0] >= RESUME_MARGIN_DB);
+	}
+	resume_range_print("climb", &r);
+}
+
+/*
+ * Three quiet misses at 8 phases after a burst whose tracker falls from 29 dB
+ * under MISS_RESUME_DB. The burst reached MISS_RESUME_DB, so the dip resumes
+ * the run at the far onset. After the next burst, which stays under
+ * MISS_RESUME_DB, no dip counts, and the far onset waits 7 frames.
+ * A resume without the dip, or with the largest reading of an older burst,
+ * fails here.
+ */
+static void resume_dip_test(unsigned rate)
+{
+	static struct resume_leg legs[MISS_PHASES][2];
+	struct resume_range r[2];
+	unsigned k;
+
+	resume_range_init(&r[0]);
+	resume_range_init(&r[1]);
+	for (k = 0; k < MISS_PHASES; k++) {
+		resume_dip_run(rate, k, RESUME_DIP_RES_DB, legs[k]);
+		resume_range_add(&r[0], &legs[k][0], 0u);
+		resume_range_add(&r[1], &legs[k][1], 0u);
+	}
+	case_rate(rate, "lec nlp resumes the engage run at a far onset after "
+		  "a burst whose tracker dipped under the resume level");
+	resume_range_print("dip", &r[0]);
+	for (k = 0; k < MISS_PHASES; k++) {
+		resume_onset_check(&legs[k][0], false, true, true);
+		CHECK(legs[k][0].erle_db[0] >= RESUME_MARGIN_DB);
+	}
+	case_rate(rate, "lec nlp waits at a far onset after a burst under the "
+		  "resume level that follows the dip");
+	resume_range_print("burst after the dip", &r[1]);
+	for (k = 0; k < MISS_PHASES; k++) {
+		resume_onset_check(&legs[k][1], false, false, false);
+		CHECK(legs[k][1].erle_db[0] >= RESUME_MARGIN_DB);
+	}
+}
+
+/*
+ * The climb and the dip at 8 phases on lines whose tracker stands within
+ * RESUME_NEAR_DB under RESUME_MARGIN_DB at the far onset. No resume follows,
+ * and the burst waits 7 frames. A resume without the margin fails here.
+ */
+static void resume_margin_test(unsigned rate)
+{
+	struct resume_range r[2];
+	unsigned k;
+
+	resume_range_init(&r[0]);
+	resume_range_init(&r[1]);
+	case_rate(rate, "lec nlp waits at a far onset on a climb or a dip with "
+		  "the tracker under 22 dB");
+	for (k = 0; k < MISS_PHASES; k++) {
+		struct resume_leg climb;
+		struct resume_leg dip[2];
+
+		resume_climb_run(rate, k, RESUME_LOW_CLIMB_RES_DB, &climb);
+		resume_dip_run(rate, k, RESUME_LOW_DIP_RES_DB, dip);
+		resume_range_add(&r[0], &climb, 0u);
+		resume_range_add(&r[1], &dip[0], 0u);
+		resume_onset_check(&climb, true, false, false);
+		resume_onset_check(&dip[0], false, true, false);
+		CHECK(climb.erle_db[0] < RESUME_MARGIN_DB);
+		CHECK(climb.erle_db[0] >= RESUME_MARGIN_DB - RESUME_NEAR_DB);
+		CHECK(dip[0].erle_db[0] < RESUME_MARGIN_DB);
+		CHECK(dip[0].erle_db[0] >= RESUME_MARGIN_DB - RESUME_NEAR_DB);
+	}
+	resume_range_print("climb under the margin", &r[0]);
+	resume_range_print("dip under the margin", &r[1]);
+}
+
+/*
+ * The climb line at 8 phases with a near sound on burst frames 2 to 4 of the
+ * burst before three quiet misses. Its dt verdicts cut the run, and the run is
+ * not complete again when that burst ends. So the climb resumes no run at the
+ * far onset, and the burst waits 7 frames. It then acts, which completes the
+ * run, and the climb resumes the run after the next three misses. A cut that
+ * sets no flag, or a complete run that leaves it set, fails here.
+ */
+static void resume_cut_test(unsigned rate)
+{
+	static struct resume_leg legs[MISS_PHASES][4];
+	double talk[MISS_BURST_FRAMES] = { 0.0 };
+	struct resume_range r[2];
+	unsigned held = 0;
+	unsigned waits;
+	unsigned k;
+	unsigned f;
+
+	for (f = RESUME_TALK_FROM; f < RESUME_TALK_TO; f++)
+		talk[f] = MISS_TALK_DB;
+	resume_range_init(&r[0]);
+	resume_range_init(&r[1]);
+	for (k = 0; k < MISS_PHASES; k++) {
+		struct resume_trace tr;
+		struct miss_line l;
+
+		resume_line_init(&l, &tr, rate, k, MISS_RES_LOW_DB);
+		l.res_db = RESUME_CLIMB_RES_DB;
+		resume_leg_run(&l, &tr, "----", NULL, &legs[k][0]);
+		resume_leg_run(&l, &tr, "----", talk, &legs[k][1]);
+		resume_leg_run(&l, &tr, "-mmm", NULL, &legs[k][2]);
+		resume_leg_run(&l, &tr, "-mmm", NULL, &legs[k][3]);
+		udsp_ec_nlms.destroy(l.ec);
+		resume_range_add(&r[0], &legs[k][2], 0u);
+		resume_range_add(&r[1], &legs[k][3], 0u);
+		held += legs[k][1].verdict[MISS_BURST_FRAMES - 1u] ==
+			LECR_VERDICT_DT;
+	}
+	case_rate(rate, "lec nlp waits at a far onset on a climbing tracker "
+		  "under the resume level after a dt verdict cut the run");
+	printf("# the near sound holds its burst to the last frame in %u of %u "
+	       "phases\n", held, MISS_PHASES);
+	resume_range_print("climb after the cut", &r[0]);
+	for (k = 0; k < MISS_PHASES; k++) {
+		const struct resume_leg *g = legs[k];
+
+		/* The burst of the sound acts before it and not from it on. */
+		CHECK(g[1].active[RESUME_TALK_FROM - 1u]);
+		CHECK_UINT(g[1].verdict[RESUME_TALK_FROM], LECR_VERDICT_DT);
+		CHECK_UINT(resume_first_get(&g[1], RESUME_TALK_FROM, &waits),
+			   MISS_BURST_FRAMES);
+		resume_onset_check(&g[2], true, false, false);
+		CHECK(g[2].erle_db[0] >= RESUME_MARGIN_DB);
+	}
+	case_rate(rate, "lec nlp resumes the engage run on a climbing tracker "
+		  "once the run is complete after the cut");
+	resume_range_print("climb after the complete run", &r[1]);
+	for (k = 0; k < MISS_PHASES; k++) {
+		resume_onset_check(&legs[k][3], true, false, true);
+		CHECK(legs[k][3].erle_db[0] >= RESUME_MARGIN_DB);
+	}
+}
+
+/*
+ * The climb line at 8 phases with a pulse on the first frame of the burst
+ * after three quiet misses. Where the pulse takes the short hangover, the
+ * hold starts on a zeroed run, so no cut sets the flag. The first pass frame
+ * after the hold reads a climbing tracker under the resume level. The resume
+ * after a short hold takes MISS_RESUME_DB alone, so the burst waits 7 frames.
+ * A short-hold resume on the climb fails here.
+ */
+static void resume_hold_test(unsigned rate)
+{
+	double pulse[MISS_BURST_FRAMES] = { 0.0 };
+	struct resume_range r;
+	unsigned held = 0;
+	unsigned k;
+
+	pulse[0] = RESUME_PULSE_DB;
+	resume_range_init(&r);
+	case_rate(rate, "lec nlp waits after a short hold from a far onset on "
+		  "a climbing tracker under the resume level");
+	for (k = 0; k < MISS_PHASES; k++) {
+		struct resume_trace tr;
+		struct resume_leg floor;
+		struct resume_leg g;
+		struct miss_line l;
+		unsigned waits;
+		unsigned first;
+		unsigned end;
+
+		resume_line_init(&l, &tr, rate, k, MISS_RES_LOW_DB);
+		l.res_db = RESUME_CLIMB_RES_DB;
+		resume_leg_run(&l, &tr, "----", NULL, &floor);
+		resume_leg_run(&l, &tr, "-mmm", pulse, &g);
+		udsp_ec_nlms.destroy(l.ec);
+		if (!g.fired || g.set != TAIL_PAIR_SHORT_FRAMES ||
+		    g.over_floor >= 10.0 * log10(PAIR_SCRIPT_FLOOR_RATIO))
+			continue;
+		held++;
+		for (end = 1u; end < MISS_BURST_FRAMES &&
+		     g.verdict[end] == LECR_VERDICT_DT; end++)
+			;
+		resume_range_add(&r, &g, end);
+		first = resume_first_get(&g, end, &waits);
+		CHECK_UINT(g.quiet, MISS_QUIET_FRAMES);
+		CHECK_UINT(end, TAIL_PAIR_SHORT_FRAMES);
+		CHECK_UINT(g.verdict[end], LECR_VERDICT_PASS);
+		CHECK(g.erle_db[end] >= RESUME_MARGIN_DB);
+		CHECK(g.erle_db[end] < MISS_RESUME_DB);
+		CHECK(g.erle_db[end] > g.ago_db[end]);
+		CHECK_UINT(first, end + WORDS_ENGAGE_FRAME);
+		CHECK_UINT(waits, WORDS_ENGAGE_FRAME);
+	}
+	printf("# %u of %u phases take the short hangover\n", held,
+	       MISS_PHASES);
+	resume_range_print("first frame after the short hold", &r);
+	CHECK(held >= HOLD_MIN_PHASES);
+}
+
+/* The fast line of resume_zero_test: the quiet-miss line with a 1 ms echo
+ * path and a 16 ms tail. After a zero its tracker reaches 22 dB in about 60
+ * frames, inside the RESUME_CLIMB_FRAMES ring. RESUME_GROW_DB grows its path on
+ * each frame. The filter follows it without a verdict up to the watchdog
+ * bound, and the tracker stays over 24 dB. */
+#define RESUME_FAST_DELAY_MS	1.0
+#define RESUME_FAST_TAIL_MS	16u
+#define RESUME_GROW_DB		0.0025
+#define RESUME_GROW_FRAMES	(100u * FRAMES_PER_SECOND)
+/* The zero comes RESUME_ZERO_AT frames into a burst that the line holds on.
+ * After it the echo product stands RESUME_ZERO_RES_DB under the echo, so the
+ * tracker climbs to about 23.5 dB. The near probe follows RESUME_ZERO_NEAR
+ * frames of the held burst, so its far onset falls inside the ring. The far
+ * probe follows RESUME_ZERO_LONG frames, then RESUME_ZERO_TAIL frames at
+ * RESUME_ZERO_DIP_DB, so the tracker dips. */
+#define RESUME_ZERO_AT		12u
+#define RESUME_ZERO_NEAR	65u
+#define RESUME_ZERO_LONG	300u
+#define RESUME_ZERO_TAIL	60u
+#define RESUME_ZERO_RES_DB	24.0
+#define RESUME_ZERO_DIP_DB	22.8
+
+/* The fast line at the rate, settled, its trace from the first frame. */
+static void resume_fast_init(struct miss_line *l, struct resume_trace *tr,
+			     unsigned rate)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	unsigned delay = path_samples_get(RESUME_FAST_DELAY_MS, rate);
+
+	miss_line_init(l, rate, 0u, MISS_RES_DEEP_DB);
+	udsp_ec_nlms.destroy(l->ec);
+	path_geometry_set(&l->path, rate);
+	l->path.taps = delay + 1u;
+	l->path.h[delay] = 1.0f;
+	path_erl_set(&l->path, MISS_ERL_DB);
+	l->ec = udsp_ec_nlms.create_rate(RESUME_FAST_TAIL_MS, rate);
+	udsp_ec_nlms.nlp(l->ec, true);
+	miss_line_quiet_set(l, MISS_QUIET_FRAMES);
+	memset(tr, 0, sizeof(*tr));
+	while (l->count < MISS_SETTLE_FRAMES ||
+	       miss_phase_get(l) != MISS_BURST_FRAMES)
+		resume_frame_run(l, 0.0, tr, &reading, &info);
+}
+
+/* One frame of a burst that the line holds past MISS_BURST_FRAMES, into the
+ * trace and, when set, into a second trace. */
+static void resume_long_frame_run(struct miss_line *l,
+				  struct resume_trace *tr,
+				  struct resume_trace *also,
+				  struct udsp_ec_nlms_info *info)
+{
+	struct udsp_ec_nlms_frame reading;
+	unsigned long base = l->count - l->count % l->period;
+
+	l->count = base + l->count % MISS_BURST_FRAMES;
+	resume_frame_run(l, 0.0, tr, &reading, info);
+	if (also)
+		resume_trace_add(also, reading.nlp_verdict, info->erle_db);
+}
+
+/* The watchdog's zero through the line: the echo path grows by
+ * RESUME_GROW_DB on each held burst frame. The watchdog then zeroes the
+ * filter outside a trial, and the path returns to its gain. The frames
+ * of the growth, or 0 when no such zero came. */
+static unsigned resume_watchdog_run(struct miss_line *l,
+				    struct resume_trace *tr)
+{
+	struct udsp_ec_nlms_info info;
+	struct echo_path base = l->path;
+	double gain = pow(10.0, RESUME_GROW_DB / 20.0);
+	uint32_t probes;
+	uint32_t resets;
+	unsigned f;
+	unsigned k;
+
+	udsp_ec_nlms_info_get(l->ec, &info);
+	probes = info.probes;
+	resets = info.diverge_resets;
+	for (f = 1; f <= RESUME_GROW_FRAMES; f++) {
+		for (k = 0; k < l->path.taps; k++)
+			l->path.h[k] = (float)(l->path.h[k] * gain);
+		resume_long_frame_run(l, tr, NULL, &info);
+		if (info.diverge_resets == resets)
+			continue;
+		memcpy(l->path.h, base.h, sizeof(base.h));
+		return info.probes == probes && info.coef_energy == 0.0f ? f :
+									   0u;
+	}
+	return 0;
+}
+
+/*
+ * The figures of a zero: the frames of the watchdog's growth, the tracker
+ * before the zero and the act. Then the frame after the zero at which the
+ * tracker reached RESUME_MARGIN_DB, and the frames from the zero to the far
+ * onset. Last, the pause and the burst after it. stale_ago and stale_max are
+ * the evidence that the instance holds when it keeps its readings through the
+ * zero: the reading RESUME_CLIMB_FRAMES frames before the onset, and the
+ * largest reading of the burst before the pause.
+ */
+struct resume_zero {
+	unsigned grown;
+	double pre_zero;
+	bool acted;
+	unsigned at_margin;
+	unsigned onset;
+	double stale_ago;
+	double stale_max;
+	struct resume_leg g;
+};
+
+/*
+ * The fast line at the rate, its filter zeroed in an acted burst by the reset,
+ * or by the watchdog. The burst goes on hold frames after the zero, or for
+ * the far probe RESUME_ZERO_LONG frames and RESUME_ZERO_TAIL frames of a dip.
+ * Then a pause with pattern on its quiet frames, and the burst after it. The
+ * trace starts over at the zero and holds the evidence after it; the stale
+ * trace runs through the zero.
+ */
+static void resume_zero_run(unsigned rate, bool watchdog, unsigned hold,
+			    const char *pattern, struct resume_zero *z)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct resume_trace stale;
+	struct resume_trace tr;
+	struct miss_line l;
+	unsigned pause;
+	unsigned k;
+
+	memset(z, 0, sizeof(*z));
+	resume_fast_init(&l, &tr, rate);
+	while (miss_phase_get(&l) != 0u)
+		resume_frame_run(&l, 0.0, &tr, &reading, &info);
+	for (k = 0; k < RESUME_ZERO_AT; k++)
+		resume_long_frame_run(&l, &tr, NULL, &info);
+	z->pre_zero = info.erle_db;
+	z->acted = info.nlp_active;
+	if (watchdog)
+		z->grown = resume_watchdog_run(&l, &tr);
+	else
+		udsp_ec_nlms_reset(l.ec);
+	stale = tr;
+	memset(&tr, 0, sizeof(tr));
+	l.res_db = RESUME_ZERO_RES_DB;
+	for (k = 0; k < (hold ? hold : RESUME_ZERO_LONG + RESUME_ZERO_TAIL);
+	     k++) {
+		if (!hold && k == RESUME_ZERO_LONG)
+			l.res_db = RESUME_ZERO_DIP_DB;
+		resume_long_frame_run(&l, &tr, &stale, &info);
+		if (!z->at_margin && info.erle_db >= RESUME_MARGIN_DB)
+			z->at_margin = k + 1u;
+	}
+	l.count += MISS_BURST_FRAMES - l.count % l.period;
+	pause = l.period - MISS_BURST_FRAMES;
+	z->onset = k + pause + 1u;
+	z->stale_ago = stale.ring[(stale.pos + pause) % RESUME_CLIMB_FRAMES];
+	z->stale_max = stale.burst_max;
+	resume_leg_run(&l, &tr, pattern, NULL, &z->g);
+	udsp_ec_nlms.destroy(l.ec);
+}
+/*
+ * A zero of the filter in an acted burst, by the reset and by the watchdog, on
+ * the fast line. Near probe: the far onset after three quiet misses falls
+ * within RESUME_CLIMB_FRAMES frames of the zero. The tracker climbs over an
+ * empty ring slot, and the burst acts on its first frame. A ring kept through
+ * the zero refuses that climb. Far probe: the tracker climbs back under
+ * MISS_RESUME_DB and dips before four quiet misses. Only the burst before the
+ * zero reached MISS_RESUME_DB, so the burst waits 7 frames; a burst maximum
+ * kept through the zero resumes there.
+ */
+static void resume_zero_test(unsigned rate)
+{
+	static const char *const paths[2] = { "reset", "watchdog" };
+	struct resume_zero near[2];
+	struct resume_zero far[2];
+	unsigned p;
+
+	for (p = 0; p < 2u; p++) {
+		resume_zero_run(rate, p == 1u, RESUME_ZERO_NEAR, "-mmm",
+				&near[p]);
+		resume_zero_run(rate, p == 1u, 0u, "mmmm", &far[p]);
+	}
+	case_rate(rate, "lec nlp resume after a zeroed filter reads no tracker "
+		  "reading from before the zero");
+	for (p = 0; p < 2u; p++) {
+		const struct resume_zero *z = &near[p];
+		unsigned waits;
+		unsigned first = resume_first_get(&z->g, 0u, &waits);
+
+		printf("# %s: tracker %.2f dB before the zero, acted %d, %u "
+		       "frames of growth; %.0f dB from frame %u after the "
+		       "zero; far onset on frame %u: tracker %.2f dB, %.2f dB "
+		       "in a ring kept through the zero; acts from frame %u\n",
+		       paths[p], z->pre_zero, z->acted, z->grown,
+		       RESUME_MARGIN_DB, z->at_margin, z->onset,
+		       z->g.erle_db[0], z->stale_ago, first);
+		CHECK(z->acted);
+		CHECK(z->pre_zero >= MISS_RESUME_DB);
+		CHECK(p == 0u || z->grown > 0u);
+		CHECK(z->at_margin > 0u);
+		CHECK(z->onset < RESUME_CLIMB_FRAMES);
+		CHECK(z->g.erle_db[0] >= RESUME_MARGIN_DB);
+		CHECK(z->stale_ago > z->g.erle_db[0]);
+		resume_onset_check(&z->g, true, false, true);
+	}
+	case_rate(rate, "lec nlp resume after a zeroed filter reads no burst "
+		  "maximum from before the zero");
+	for (p = 0; p < 2u; p++) {
+		const struct resume_zero *z = &far[p];
+
+		printf("# %s: tracker %.2f dB before the zero, acted %d; burst "
+		       "up to %.2f dB after the zero and %.2f dB through it; "
+		       "far onset: tracker %.2f dB, %u frames before %.2f "
+		       "dB\n", paths[p], z->pre_zero, z->acted,
+		       z->g.pause_max, z->stale_max, z->g.erle_db[0],
+		       RESUME_CLIMB_FRAMES, z->g.ago_db[0]);
+		CHECK(z->acted);
+		CHECK(p == 0u || z->grown > 0u);
+		CHECK(z->stale_max >= MISS_RESUME_DB);
+		CHECK(z->g.erle_db[0] >= RESUME_MARGIN_DB);
+		resume_onset_check(&z->g, false, false, false);
+	}
+}
+
+/* The cut line of resume_zero_cut_test: the fast line grows to RESUME_CUT_COEF
+ * of coefficient energy, then its echo product stands RESUME_CUT_RES_DB under
+ * the echo while the growth goes on. After the zero the tracker climbs to
+ * RESUME_CUT_CLIMB_DB, under MISS_GATE_DB. The far onset steps
+ * RESUME_CUT_STEP_DB over MISS_FAR_DBM0. */
+#define RESUME_CUT_COEF		3.97f
+#define RESUME_CUT_RES_DB	10.0
+#define RESUME_CUT_CLIMB_DB	17.0
+#define RESUME_CUT_STEP_DB	16.0
+
+/* One frame of a burst that the line holds past MISS_BURST_FRAMES, its echo
+ * path scaled by gain before the frame, into the trace. The verdict of the
+ * frame. */
+static unsigned resume_held_frame_run(struct miss_line *l,
+				      struct resume_trace *tr, double gain,
+				      struct udsp_ec_nlms_info *info)
+{
+	struct udsp_ec_nlms_frame reading;
+	unsigned long base = l->count - l->count % l->period;
+	unsigned k;
+
+	for (k = 0; k < l->path.taps; k++)
+		l->path.h[k] = (float)(l->path.h[k] * gain);
+	l->count = base + l->count % MISS_BURST_FRAMES;
+	resume_frame_run(l, 0.0, tr, &reading, info);
+	return reading.nlp_verdict;
+}
+
+/*
+ * The figures of a cut and a zero: the frames of the growth to
+ * RESUME_CUT_COEF and the act after it. Of the frames at RESUME_CUT_RES_DB,
+ * counted from 1: the first that stops the act on an erle verdict, and the one
+ * on which the watchdog zeroes the filter. The zero reads 0 for none, and
+ * RESUME_GROW_FRAMES for one inside a trial or with coefficient energy left.
+ * Then the pass frames from the cut to the end of the climb, and the frames of
+ * the climb and the tracker after it. Last, the frames from the zero to the far
+ * onset, and the pause and the burst after it.
+ */
+struct resume_cut_zero {
+	unsigned grown;
+	bool acted;
+	unsigned cut;
+	unsigned zero;
+	unsigned passes;
+	unsigned climb;
+	double climbed;
+	unsigned onset;
+	struct resume_leg g;
+};
+
+/*
+ * The cut line at the rate. Its path grows by RESUME_GROW_DB on each held
+ * burst frame until the watchdog zeroes the filter, and then returns to its
+ * gain. The tracker climbs after the zero on the held burst. Then a pause with
+ * three quiet misses, and the burst after it at the far step. The trace starts
+ * over at the zero.
+ */
+static void resume_cut_zero_run(unsigned rate, struct resume_cut_zero *z)
+{
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct resume_trace tr;
+	struct echo_path base;
+	struct miss_line l;
+	double gain = pow(10.0, RESUME_GROW_DB / 20.0);
+	uint32_t probes;
+	uint32_t resets;
+	unsigned verdict;
+	unsigned f;
+
+	memset(z, 0, sizeof(*z));
+	resume_fast_init(&l, &tr, rate);
+	while (miss_phase_get(&l) != 0u)
+		resume_frame_run(&l, 0.0, &tr, &reading, &info);
+	base = l.path;
+	probes = info.probes;
+	resets = info.diverge_resets;
+	while (info.coef_energy < RESUME_CUT_COEF &&
+	       z->grown < RESUME_GROW_FRAMES) {
+		resume_held_frame_run(&l, &tr, gain, &info);
+		z->grown++;
+	}
+	z->acted = info.nlp_active;
+	l.res_db = RESUME_CUT_RES_DB;
+	for (f = 1; f <= RESUME_GROW_FRAMES && !z->zero; f++) {
+		bool acting = info.nlp_active;
+
+		verdict = resume_held_frame_run(&l, &tr, gain, &info);
+		if (!z->cut && acting && !info.nlp_active &&
+		    verdict == LECR_VERDICT_ERLE)
+			z->cut = f;
+		z->passes += z->cut && verdict == LECR_VERDICT_PASS;
+		if (info.diverge_resets == resets)
+			continue;
+		z->zero = info.probes == probes && info.coef_energy == 0.0f ?
+			  f : RESUME_GROW_FRAMES;
+	}
+	memcpy(l.path.h, base.h, sizeof(base.h));
+	memset(&tr, 0, sizeof(tr));
+	l.res_db = MISS_RES_DEEP_DB;
+	while (z->climb < RESUME_CLIMB_FRAMES &&
+	       info.erle_db < RESUME_CUT_CLIMB_DB) {
+		verdict = resume_held_frame_run(&l, &tr, 1.0, &info);
+		z->passes += verdict == LECR_VERDICT_PASS;
+		z->climb++;
+	}
+	z->climbed = info.erle_db;
+	l.count += MISS_BURST_FRAMES - l.count % l.period;
+	z->onset = z->climb + l.period - MISS_BURST_FRAMES + 1u;
+	l.far_dbm0 = MISS_FAR_DBM0 + RESUME_CUT_STEP_DB;
+	resume_leg_run(&l, &tr, "-mmm", NULL, &z->g);
+	udsp_ec_nlms.destroy(l.ec);
+}
+
+/*
+ * A watchdog zero after a cut, on the cut line. An erle frame stops the act
+ * and cuts the run, and the watchdog zeroes the filter later in the held
+ * burst. No pass frame follows the cut up to the far onset after three quiet
+ * misses. The far step lifts the tracker on the onset to between
+ * RESUME_MARGIN_DB and MISS_RESUME_DB, over an empty ring slot. The cut stays
+ * through the zero, so the burst waits 7 frames; a cut cleared by the watchdog
+ * resumes on the climb.
+ */
+static void resume_zero_cut_test(unsigned rate)
+{
+	struct resume_cut_zero z;
+	unsigned waits;
+	unsigned first;
+
+	resume_cut_zero_run(rate, &z);
+	first = resume_first_get(&z.g, 0u, &waits);
+	case_rate(rate, "lec nlp resume after a watchdog zero keeps the cut of "
+		  "the run");
+	printf("# %u frames of growth, acted %d; erle cut on frame %u, zero on "
+	       "frame %u, %u pass frames after the cut; tracker %.2f dB after "
+	       "%u frames of climb; far onset on frame %u after the zero: "
+	       "tracker %.2f dB; acts from frame %u\n", z.grown, z.acted, z.cut,
+	       z.zero, z.passes, z.climbed, z.climb, z.onset, z.g.erle_db[0],
+	       first);
+	CHECK(z.acted);
+	CHECK(z.cut > 0u);
+	CHECK(z.zero > z.cut && z.zero < RESUME_GROW_FRAMES);
+	CHECK_UINT(z.passes, 0u);
+	CHECK(z.climbed < MISS_GATE_DB);
+	CHECK(z.onset < RESUME_CLIMB_FRAMES);
+	CHECK(z.g.erle_db[0] >= RESUME_MARGIN_DB);
+	resume_onset_check(&z.g, true, false, false);
+}
+
+/* The burst of resume_switch_test starts with the processor switched off, and
+ * the switch returns on its frame RESUME_OFF_FRAMES. The line holds the burst
+ * to frame RESUME_OFF_HOLD. */
+#define RESUME_OFF_FRAMES	20u
+#define RESUME_OFF_HOLD		40u
+
+/*
+ * The dip line at 8 phases. The burst whose tracker falls from 29 dB starts
+ * with the processor switched off, and the switch returns with the tracker
+ * under MISS_RESUME_DB. The processor acts again before the burst ends. The
+ * frames with the switch off clear the burst maximum, so no dip counts after
+ * three quiet misses, and the burst waits 7 frames. The trace of the test
+ * keeps the maximum of those frames, as a maximum kept through the switch
+ * does, and that maximum resumes the run.
+ */
+static void resume_switch_test(unsigned rate)
+{
+	struct resume_range r;
+	double on_hi = -200.0;
+	unsigned acts_lo = MISS_BURST_FRAMES;
+	unsigned k;
+
+	resume_range_init(&r);
+	case_rate(rate, "lec nlp waits at a far onset after a dip that the "
+		  "processor switch cut");
+	for (k = 0; k < MISS_PHASES; k++) {
+		struct udsp_ec_nlms_frame reading;
+		struct udsp_ec_nlms_info info;
+		struct resume_trace tr;
+		struct resume_leg floor;
+		struct resume_leg g;
+		struct miss_line l;
+		double on_max = -200.0;
+		unsigned acts = 0;
+		unsigned f;
+
+		resume_line_init(&l, &tr, rate, k, MISS_RES_DEEP_DB);
+		resume_leg_run(&l, &tr, "----", NULL, &floor);
+		while (miss_phase_get(&l) != 0u)
+			resume_frame_run(&l, 0.0, &tr, &reading, &info);
+		l.res_db = RESUME_DIP_RES_DB;
+		udsp_ec_nlms.nlp(l.ec, false);
+		for (f = 0; f < RESUME_OFF_HOLD; f++) {
+			if (f == RESUME_OFF_FRAMES)
+				udsp_ec_nlms.nlp(l.ec, true);
+			resume_long_frame_run(&l, &tr, NULL, &info);
+			if (f < RESUME_OFF_FRAMES)
+				continue;
+			on_max = fmax(on_max, info.erle_db);
+			acts += info.nlp_active;
+		}
+		l.count += MISS_BURST_FRAMES - l.count % l.period;
+		resume_leg_run(&l, &tr, "-mmm", NULL, &g);
+		udsp_ec_nlms.destroy(l.ec);
+		resume_range_add(&r, &g, 0u);
+		on_hi = fmax(on_hi, on_max);
+		acts_lo = acts < acts_lo ? acts : acts_lo;
+		CHECK(acts > 0u);
+		CHECK(on_max < MISS_RESUME_DB);
+		CHECK(g.erle_db[0] >= RESUME_MARGIN_DB);
+		resume_onset_check(&g, false, true, false);
+	}
+	printf("# after the switch returns: tracker up to %.2f dB, %u acting "
+	       "frames at least\n", on_hi, acts_lo);
+	resume_range_print("dip cut by the switch", &r);
+}
+
 int main(int argc, char **argv)
 {
 	int failed;
@@ -15490,15 +28506,12 @@ int main(int argc, char **argv)
 	floor_short_pause_test();
 	floor_bound_test();
 	floor_run_break_test();
-	floor_quiet3_test();
+	floor_quiet6_test();
 	floor_age_test();
 	floor_reset_test();
-	/*
-	 * The seed legs follow, for the numbering reason above. No case covers
-	 * a reset that keeps the seed run, and none can: the reset sets the
-	 * tracked ERLE to 0, so the first frame after it fails gate (b) of
-	 * dsp/lec.c and clears the run anyway.
-	 */
+	/* The seed legs follow, for the numbering reason above. A reset that
+	 * keeps the seed run cannot be observed: the reset zeroes the ERLE, so
+	 * gate (b) clears the run on the next frame. */
 	fan_seed_test(UDSP_SAMPLE_RATE);
 	fan_seed_test(UDSP_SAMPLE_RATE_WB);
 	fan_turns_test();
@@ -15602,6 +28615,245 @@ int main(int argc, char **argv)
 	nlp_flap_cost_test(UDSP_SAMPLE_RATE_WB);
 	nlp_cut_test(UDSP_SAMPLE_RATE);
 	nlp_cut_test(UDSP_SAMPLE_RATE_WB);
+	cohere_change_test(UDSP_SAMPLE_RATE);
+	cohere_change_test(UDSP_SAMPLE_RATE_WB);
+	cohere_step_test(UDSP_SAMPLE_RATE);
+	cohere_step_test(UDSP_SAMPLE_RATE_WB);
+	cohere_shape_test(UDSP_SAMPLE_RATE);
+	cohere_shape_test(UDSP_SAMPLE_RATE_WB);
+	cohere_precedence_test(UDSP_SAMPLE_RATE);
+	cohere_precedence_test(UDSP_SAMPLE_RATE_WB);
+	cohere_refuse_test(UDSP_SAMPLE_RATE);
+	cohere_refuse_test(UDSP_SAMPLE_RATE_WB);
+	cohere_bound_test(UDSP_SAMPLE_RATE);
+	cohere_bound_test(UDSP_SAMPLE_RATE_WB);
+	cohere_reseed_test(UDSP_SAMPLE_RATE);
+	cohere_reseed_test(UDSP_SAMPLE_RATE_WB);
+	cohere_expose_test(UDSP_SAMPLE_RATE);
+	cohere_expose_test(UDSP_SAMPLE_RATE_WB);
+	cohere_talker_test(UDSP_SAMPLE_RATE);
+	cohere_talker_test(UDSP_SAMPLE_RATE_WB);
+	cohere_pause_test(UDSP_SAMPLE_RATE);
+	cohere_pause_test(UDSP_SAMPLE_RATE_WB);
+	cohere_near_trial_test(UDSP_SAMPLE_RATE);
+	cohere_near_trial_test(UDSP_SAMPLE_RATE_WB);
+	cohere_cycle_test(UDSP_SAMPLE_RATE);
+	cohere_cycle_test(UDSP_SAMPLE_RATE_WB);
+	cohere_diverge_test();
+	cohere_gain_test(UDSP_SAMPLE_RATE);
+	cohere_gain_test(UDSP_SAMPLE_RATE_WB);
+	cohere_share_test(UDSP_SAMPLE_RATE);
+	cohere_share_test(UDSP_SAMPLE_RATE_WB);
+	cohere_partial_test(UDSP_SAMPLE_RATE);
+	cohere_partial_test(UDSP_SAMPLE_RATE_WB);
+	noise_creep_test(UDSP_SAMPLE_RATE);
+	noise_creep_test(UDSP_SAMPLE_RATE_WB);
+	nlp_first_engage_test(UDSP_SAMPLE_RATE);
+	nlp_first_engage_test(UDSP_SAMPLE_RATE_WB);
+	nlp_gate_hover_test(UDSP_SAMPLE_RATE);
+	nlp_gate_hover_test(UDSP_SAMPLE_RATE_WB);
+	floor_peak_test(UDSP_SAMPLE_RATE);
+	floor_peak_test(UDSP_SAMPLE_RATE_WB);
+	floor_peak_sequence_test(UDSP_SAMPLE_RATE);
+	floor_peak_sequence_test(UDSP_SAMPLE_RATE_WB);
+	floor_peak_talker_test(UDSP_SAMPLE_RATE);
+	floor_peak_talker_test(UDSP_SAMPLE_RATE_WB);
+	trial_bare_test(UDSP_SAMPLE_RATE);
+	trial_bare_test(UDSP_SAMPLE_RATE_WB);
+	lull_far_test(UDSP_SAMPLE_RATE);
+	lull_far_test(UDSP_SAMPLE_RATE_WB);
+	lull_talk_test(UDSP_SAMPLE_RATE);
+	lull_talk_test(UDSP_SAMPLE_RATE_WB);
+	lull_cap_test(UDSP_SAMPLE_RATE);
+	lull_cap_test(UDSP_SAMPLE_RATE_WB);
+	lull_ring_test(UDSP_SAMPLE_RATE);
+	lull_ring_test(UDSP_SAMPLE_RATE_WB);
+	lull_skip_test(UDSP_SAMPLE_RATE);
+	lull_skip_test(UDSP_SAMPLE_RATE_WB);
+	quiet_miss_test(UDSP_SAMPLE_RATE);
+	quiet_miss_test(UDSP_SAMPLE_RATE_WB);
+	quiet_miss_limit_test(UDSP_SAMPLE_RATE);
+	quiet_miss_limit_test(UDSP_SAMPLE_RATE_WB);
+	quiet_miss_talker_test(UDSP_SAMPLE_RATE);
+	quiet_miss_talker_test(UDSP_SAMPLE_RATE_WB);
+	cohere_tone_test(UDSP_SAMPLE_RATE);
+	cohere_tone_test(UDSP_SAMPLE_RATE_WB);
+	cohere_near_tone_test(UDSP_SAMPLE_RATE);
+	cohere_near_tone_test(UDSP_SAMPLE_RATE_WB);
+	phase2_test(UDSP_SAMPLE_RATE);
+	phase2_test(UDSP_SAMPLE_RATE_WB);
+	dense_change_test(UDSP_SAMPLE_RATE);
+	dense_change_test(UDSP_SAMPLE_RATE_WB);
+	misadjust_test(UDSP_SAMPLE_RATE);
+	misadjust_test(UDSP_SAMPLE_RATE_WB);
+	phase1_test(UDSP_SAMPLE_RATE);
+	phase1_test(UDSP_SAMPLE_RATE_WB);
+	nlp_boot_near_start_test(UDSP_SAMPLE_RATE);
+	nlp_boot_near_start_test(UDSP_SAMPLE_RATE_WB);
+	cn9a_test(UDSP_SAMPLE_RATE);
+	cn9a_test(UDSP_SAMPLE_RATE_WB);
+	cn_quiet_test(UDSP_SAMPLE_RATE);
+	cn_quiet_test(UDSP_SAMPLE_RATE_WB);
+	cn_drop_test();
+	dt3a_test(UDSP_SAMPLE_RATE);
+	dt3a_test(UDSP_SAMPLE_RATE_WB);
+	dt3b_test(UDSP_SAMPLE_RATE);
+	dt3b_test(UDSP_SAMPLE_RATE_WB);
+	nlp_boot_seeds_test(UDSP_SAMPLE_RATE);
+	nlp_boot_seeds_test(UDSP_SAMPLE_RATE_WB);
+	onset_mic_test(UDSP_SAMPLE_RATE);
+	onset_mic_test(UDSP_SAMPLE_RATE_WB);
+	dt3a_phase_test(UDSP_SAMPLE_RATE);
+	dt3a_phase_test(UDSP_SAMPLE_RATE_WB);
+	floor_keep_test(UDSP_SAMPLE_RATE);
+	floor_keep_test(UDSP_SAMPLE_RATE_WB);
+	floor_keep_flat_test(UDSP_SAMPLE_RATE);
+	floor_keep_flat_test(UDSP_SAMPLE_RATE_WB);
+	floor_keep_talker_test(UDSP_SAMPLE_RATE);
+	floor_keep_talker_test(UDSP_SAMPLE_RATE_WB);
+	floor_keep_window_test(UDSP_SAMPLE_RATE);
+	floor_keep_window_test(UDSP_SAMPLE_RATE_WB);
+	floor_keep_expiry_test(UDSP_SAMPLE_RATE);
+	floor_keep_expiry_test(UDSP_SAMPLE_RATE_WB);
+	floor_keep_held_test(UDSP_SAMPLE_RATE);
+	floor_keep_held_test(UDSP_SAMPLE_RATE_WB);
+	floor_keep_open_talker_test(UDSP_SAMPLE_RATE);
+	floor_keep_open_talker_test(UDSP_SAMPLE_RATE_WB);
+	floor_keep_pause_test(UDSP_SAMPLE_RATE);
+	floor_keep_pause_test(UDSP_SAMPLE_RATE_WB);
+	latch_louder_talker_test(UDSP_SAMPLE_RATE);
+	latch_louder_talker_test(UDSP_SAMPLE_RATE_WB);
+	rollback_output_test(UDSP_SAMPLE_RATE);
+	rollback_output_test(UDSP_SAMPLE_RATE_WB);
+	rollback_mask_test(UDSP_SAMPLE_RATE);
+	rollback_mask_test(UDSP_SAMPLE_RATE_WB);
+	onset_peak_test(UDSP_SAMPLE_RATE);
+	onset_peak_test(UDSP_SAMPLE_RATE_WB);
+	tone_tail_test(UDSP_SAMPLE_RATE);
+	tone_tail_test(UDSP_SAMPLE_RATE_WB);
+	escape_trial_line_test(UDSP_SAMPLE_RATE);
+	escape_trial_line_test(UDSP_SAMPLE_RATE_WB);
+	escape_trial_talker_test(UDSP_SAMPLE_RATE);
+	escape_trial_talker_test(UDSP_SAMPLE_RATE_WB);
+	escape_trial_start_test(UDSP_SAMPLE_RATE);
+	escape_trial_start_test(UDSP_SAMPLE_RATE_WB);
+	escape_trial_pause_test(UDSP_SAMPLE_RATE);
+	escape_trial_pause_test(UDSP_SAMPLE_RATE_WB);
+	escape_trial_feed_test(UDSP_SAMPLE_RATE);
+	escape_trial_feed_test(UDSP_SAMPLE_RATE_WB);
+	hangover_tail_pair_test(UDSP_SAMPLE_RATE);
+	hangover_tail_pair_test(UDSP_SAMPLE_RATE_WB);
+	hangover_pair_script_test(UDSP_SAMPLE_RATE);
+	hangover_pair_script_test(UDSP_SAMPLE_RATE_WB);
+	resume_erle_test(UDSP_SAMPLE_RATE);
+	resume_erle_test(UDSP_SAMPLE_RATE_WB);
+	resume_talker_test(UDSP_SAMPLE_RATE);
+	resume_talker_test(UDSP_SAMPLE_RATE_WB);
+	resume_floor_test(UDSP_SAMPLE_RATE);
+	resume_floor_test(UDSP_SAMPLE_RATE_WB);
+	quiet_miss_low_test(UDSP_SAMPLE_RATE);
+	quiet_miss_low_test(UDSP_SAMPLE_RATE_WB);
+	resume_off_test(UDSP_SAMPLE_RATE);
+	resume_off_test(UDSP_SAMPLE_RATE_WB);
+	quiet_headroom_low_test(UDSP_SAMPLE_RATE);
+	quiet_headroom_low_test(UDSP_SAMPLE_RATE_WB);
+	agree_readings_test(UDSP_SAMPLE_RATE);
+	agree_readings_test(UDSP_SAMPLE_RATE_WB);
+	agree_pauses_test(UDSP_SAMPLE_RATE);
+	agree_pauses_test(UDSP_SAMPLE_RATE_WB);
+	agree_window_test(UDSP_SAMPLE_RATE);
+	agree_window_test(UDSP_SAMPLE_RATE_WB);
+	agree_band_test(UDSP_SAMPLE_RATE);
+	agree_band_test(UDSP_SAMPLE_RATE_WB);
+	agree_falsify_test(UDSP_SAMPLE_RATE);
+	agree_falsify_test(UDSP_SAMPLE_RATE_WB);
+	agree_cap_test(UDSP_SAMPLE_RATE);
+	agree_cap_test(UDSP_SAMPLE_RATE_WB);
+	agree_stale_test(UDSP_SAMPLE_RATE);
+	agree_stale_test(UDSP_SAMPLE_RATE_WB);
+	agree_feed_test(UDSP_SAMPLE_RATE);
+	agree_feed_test(UDSP_SAMPLE_RATE_WB);
+	tail_peak_test(UDSP_SAMPLE_RATE);
+	tail_peak_test(UDSP_SAMPLE_RATE_WB);
+	hold_resume_test(UDSP_SAMPLE_RATE);
+	hold_resume_test(UDSP_SAMPLE_RATE_WB);
+	hold_refuse_test(UDSP_SAMPLE_RATE);
+	hold_refuse_test(UDSP_SAMPLE_RATE_WB);
+	hold_trial_test(UDSP_SAMPLE_RATE);
+	hold_trial_test(UDSP_SAMPLE_RATE_WB);
+	hold_cut_test(UDSP_SAMPLE_RATE);
+	hold_cut_test(UDSP_SAMPLE_RATE_WB);
+	hangover_pair_bar_test(UDSP_SAMPLE_RATE);
+	hangover_pair_bar_test(UDSP_SAMPLE_RATE_WB);
+	hold_repeat_test(UDSP_SAMPLE_RATE);
+	hold_repeat_test(UDSP_SAMPLE_RATE_WB);
+	onset_peak_clear_test(UDSP_SAMPLE_RATE);
+	onset_peak_clear_test(UDSP_SAMPLE_RATE_WB);
+	onset_peak_toggle_test(UDSP_SAMPLE_RATE);
+	onset_peak_toggle_test(UDSP_SAMPLE_RATE_WB);
+	over_arm_test(UDSP_SAMPLE_RATE);
+	over_arm_test(UDSP_SAMPLE_RATE_WB);
+	over_return_test(UDSP_SAMPLE_RATE);
+	over_return_test(UDSP_SAMPLE_RATE_WB);
+	over_talker_test(UDSP_SAMPLE_RATE);
+	over_talker_test(UDSP_SAMPLE_RATE_WB);
+	over_edge_test(UDSP_SAMPLE_RATE);
+	over_edge_test(UDSP_SAMPLE_RATE_WB);
+	over_watchdog_test(UDSP_SAMPLE_RATE);
+	over_watchdog_test(UDSP_SAMPLE_RATE_WB);
+	onset_start_test(UDSP_SAMPLE_RATE);
+	onset_start_test(UDSP_SAMPLE_RATE_WB);
+	drop_talker_test(UDSP_SAMPLE_RATE);
+	drop_talker_test(UDSP_SAMPLE_RATE_WB);
+	drop_copy_test(UDSP_SAMPLE_RATE);
+	drop_copy_test(UDSP_SAMPLE_RATE_WB);
+	drop_misfit_test(UDSP_SAMPLE_RATE);
+	drop_misfit_test(UDSP_SAMPLE_RATE_WB);
+	drop_misfit_break_test(UDSP_SAMPLE_RATE);
+	drop_misfit_break_test(UDSP_SAMPLE_RATE_WB);
+	implied_inside_test(UDSP_SAMPLE_RATE);
+	implied_inside_test(UDSP_SAMPLE_RATE_WB);
+	implied_outside_test(UDSP_SAMPLE_RATE);
+	implied_outside_test(UDSP_SAMPLE_RATE_WB);
+	implied_cap_test(UDSP_SAMPLE_RATE);
+	implied_cap_test(UDSP_SAMPLE_RATE_WB);
+	keep_renewal_test(UDSP_SAMPLE_RATE);
+	keep_renewal_test(UDSP_SAMPLE_RATE_WB);
+	implied_uncapped_test(UDSP_SAMPLE_RATE);
+	implied_uncapped_test(UDSP_SAMPLE_RATE_WB);
+	implied_tail_test(UDSP_SAMPLE_RATE);
+	implied_tail_test(UDSP_SAMPLE_RATE_WB);
+	fade_lead_test(UDSP_SAMPLE_RATE);
+	fade_lead_test(UDSP_SAMPLE_RATE_WB);
+	fade_plain_test(UDSP_SAMPLE_RATE);
+	fade_plain_test(UDSP_SAMPLE_RATE_WB);
+	fade_tail_test(UDSP_SAMPLE_RATE);
+	fade_tail_test(UDSP_SAMPLE_RATE_WB);
+	fade_weight_test(UDSP_SAMPLE_RATE);
+	fade_weight_test(UDSP_SAMPLE_RATE_WB);
+	fade_emit_test(UDSP_SAMPLE_RATE);
+	fade_emit_test(UDSP_SAMPLE_RATE_WB);
+	onset_zero_test(UDSP_SAMPLE_RATE);
+	onset_zero_test(UDSP_SAMPLE_RATE_WB);
+	onset_zero_boot_test(UDSP_SAMPLE_RATE);
+	onset_zero_boot_test(UDSP_SAMPLE_RATE_WB);
+	resume_climb_test(UDSP_SAMPLE_RATE);
+	resume_climb_test(UDSP_SAMPLE_RATE_WB);
+	resume_dip_test(UDSP_SAMPLE_RATE);
+	resume_dip_test(UDSP_SAMPLE_RATE_WB);
+	resume_margin_test(UDSP_SAMPLE_RATE);
+	resume_margin_test(UDSP_SAMPLE_RATE_WB);
+	resume_cut_test(UDSP_SAMPLE_RATE);
+	resume_cut_test(UDSP_SAMPLE_RATE_WB);
+	resume_hold_test(UDSP_SAMPLE_RATE);
+	resume_hold_test(UDSP_SAMPLE_RATE_WB);
+	resume_zero_test(UDSP_SAMPLE_RATE);
+	resume_zero_test(UDSP_SAMPLE_RATE_WB);
+	resume_switch_test(UDSP_SAMPLE_RATE);
+	resume_switch_test(UDSP_SAMPLE_RATE_WB);
+	resume_zero_cut_test(UDSP_SAMPLE_RATE);
+	resume_zero_cut_test(UDSP_SAMPLE_RATE_WB);
+	replay_gap_test();
 	failed = tu_summary("lec");
 	printf("# lec per-tap path: %s\n",
 	       udsp_ec_nlms_path_name(udsp_ec_nlms_path_get()));

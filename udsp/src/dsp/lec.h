@@ -62,113 +62,77 @@ static inline float udsp_ec_nlms_frame_power_get(const int16_t *samples,
 }
 
 /*
- * What the instance actually applied and what it currently sees. tail_ms is
- * the clamped tail: create() accepts a request outside the supported range
- * and the caller reads back what it got, because a silent clamp hides a
- * request the instance did not honor. core/engine.h reports granted_periods
- * the same way.
- *
- * hold_frames counts the frames whose update did not stand, for any of the
- * three reasons: a silent reference, freeze, or double talk. coef_energy is
- * the energy of the filter, which the divergence watchdog bounds and which a
- * converged instance holds at the echo return loss of the hybrid. probes
- * counts the adaptation trials the detector ran to escape a hold it could not
- * end by verdict. There are three ways in:
- * 1. a latched double-talk run;
- * 2. a frame run in which the canceller was measured to add energy to the
- *    line rather than remove it, which is a hybrid that changed rather than a
- *    talker (dsp/lec.c, LEC_PATH_CHANGE_RATIO);
- * 3. a stale run: fired frames on a trusted estimate that the classic bound
- *    could explain, which is an estimate that went stale (dsp/lec.c,
- *    LEC_GEIGEL_STALE_FRAMES).
- *
- * echo_gain is the learned lower bound of the hybrid's power gain, because a
- * minimum statistic under-reads; echo_gain times the LEC_GEIGEL_GAIN_HEADROOM
- * of dsp/lec.c is the upper bound the Geigel expectation and the
- * combined-loss NLP gate consume. It reads LEC_GEIGEL_GAIN_MIN, over the
- * reference loss of udsp_ec_nlms_ref_loss_set, until the tracker has seen
- * enough active frames to say less.
- *
- * skip_frames counts the frames the tap loops did not run on
- * because the whole reference window was zero (dsp/lec.c frame_zero_run). Each
- * of them is also a hold frame, so skip_frames against hold_frames says how
- * much of the hold was digital silence rather than a quiet or a refused
- * reference.
- *
- * The six nlp counters give each frame the verdict of the processor
- * gate (dsp/lec.c nlp_gate_get). A refused frame counts under the first
- * condition that refused it, in this order:
- * 1. a quiet reference window (nlp_quiet_frames);
- * 2. double talk (nlp_dt_frames);
- * 3. a microphone that the echo estimate does not explain (nlp_unlike_frames);
- * 4. either arm of the ERLE gate (nlp_erle_frames).
- * The processor engages when its engage run holds LEC_NLP_ON_FRAMES eligible
- * frames (dsp/lec.c). A quiet frame whose microphone is echo-like leaves the
- * run as it is. A dt, unlike or erle frame cuts a complete run to
- * LEC_NLP_DECAY_FRAMES of dsp/lec.c, and every other refused frame zeroes it.
- * The eligible frames before the run completes count in nlp_wait_frames.
- * The frame it engages on and each eligible frame after it count in
- * nlp_active_frames, the frames that read nlp_active. A quiet frame counts in
- * nlp_quiet_frames whether it keeps the run or not. A frame with the processor
- * switched off counts nowhere, so the six plus those frames add up to frames.
- * The reset zeroes the six with frames, because they describe one alignment
- * of the reference.
- *
- * coef_peak_tap is the index of the coefficient with the largest
- * magnitude. It counts from tap 0 of the applied reference, so it says where
- * the echo sits against that reference. It reads 0 while coef_energy reads 0.
- * Read the two together, because a filter aligned on its first tap also reads
- * 0.
- *
- * noise_dbov is the near-end floor the instance tracks. It uses the
- * dBov scale of dsp/cn.c udsp_cn_level_get, so a larger number is quieter. It
- * reads 127 while no floor is measured. The instance measures the floor in
- * far-end pauses. Under a far end that never pauses, the seed of dsp/lec.c
- * (noise_seed_update) measures it on active frames. It is introspection for
- * the suites and is not part of the stable record, struct udsp_lec_stats of
- * udsp.h.
- *
- * nlp_dt_fired_frames counts the nlp_dt_frames on which the
- * detector itself fired. The rest of nlp_dt_frames is the hangover behind a
- * verdict. The reset zeroes it with the six. It is not part of the stable
- * record either.
- *
- * ref_floor is the far-end floor after the last frame joined it:
- * the lowest frame power of the reference over the last 300 to 349 frames,
- * a mean square in int16 units (dsp/lec.c, ref_floor_get). It reads 0 until
- * the history is full. run() and udsp_ec_nlms_ref_feed add a frame, and the
- * reset keeps the floor.
+ * What the instance applied and what it sees. The counters describe one
+ * alignment of the reference: the reset zeroes frames and the processor
+ * counters together.
+ * Like struct udsp_ec_nlms_frame, it is not part of the stable record.
  */
 struct udsp_ec_nlms_info {
+	/* The clamped tail: a request outside the range reads back what it got,
+	 * because a silent clamp hides a request the instance did not honor. */
 	unsigned tail_ms;
 	unsigned taps;
 	uint32_t frames;
+	/* Frames whose update did not stand: a silent reference, freeze or
+	 * double talk. */
 	uint32_t hold_frames;
 	uint32_t diverge_resets;
+	/* Trials run to escape a hold that no verdict ends: the latch, the
+	 * path-change, over-estimate and coherence escapes, and the stale
+	 * run. */
 	uint32_t probes;
+	/* The filter energy that the watchdog bounds; a converged instance
+	 * holds it at the echo return loss of the hybrid. */
 	float coef_energy;
 	float erle_db;
+	/* The learned lower bound of the hybrid's power gain,
+	 * LEC_GEIGEL_GAIN_MIN over the reference loss until learned; times the
+	 * headroom, the bound of the detector and of the processor gate. */
 	float echo_gain;
 	bool double_talk;
 	bool nlp_active;
+	/* Frames whose tap loops did not run on a zero window (frame_zero_run);
+	 * each is also a hold frame, so the two tell digital silence from a
+	 * refusal. */
 	uint32_t skip_frames;
+	/* The frames that read nlp_active: the frame the processor engages on
+	 * and each eligible frame after it. With the next five and the frames
+	 * with the processor off, the counters add up to frames. */
 	uint32_t nlp_active_frames;
+	/* The eligible frames before the engage run completes. */
 	uint32_t nlp_wait_frames;
+	/* Frames refused on either arm of the ERLE gate, the last condition. */
 	uint32_t nlp_erle_frames;
+	/* Frames whose microphone the echo estimate does not explain. */
 	uint32_t nlp_unlike_frames;
 	uint32_t nlp_dt_frames;
+	/* Frames of a quiet reference window, the first condition, whether they
+	 * keep the engage run or not. */
 	uint32_t nlp_quiet_frames;
+	/* The tap of the largest magnitude, from tap 0 of the applied
+	 * reference; 0 while coef_energy reads 0, so read the two together. */
 	unsigned coef_peak_tap;
+	/* The tracked near-end floor in the dBov of udsp_cn_level_get, a larger
+	 * number quieter; 127 while no floor is measured (far pauses or the
+	 * seed). */
 	float noise_dbov;
+	/* The nlp_dt_frames on which the detector fired; the rest is the
+	 * hangover behind a verdict. */
 	uint32_t nlp_dt_fired_frames;
+	/* The far-end floor after the last frame joined it, a mean square in
+	 * int16 units (ref_floor_get); 0 until the history is full; the reset
+	 * keeps it. */
 	float ref_floor;
 };
 
+/* New values go at the end only, so a copy of dsp/lec.c built against this
+ * header (the UDSP_REPLAY_LEC_C path of lec_replay) keeps its words. */
 enum udsp_ec_nlms_trial_arm {
 	UDSP_EC_NLMS_TRIAL_ARM_NONE,
 	UDSP_EC_NLMS_TRIAL_ARM_LATCH,
 	UDSP_EC_NLMS_TRIAL_ARM_PATH,
 	UDSP_EC_NLMS_TRIAL_ARM_STALE,
+	UDSP_EC_NLMS_TRIAL_ARM_COHERE,
 };
 
 enum udsp_ec_nlms_trial_end {
@@ -180,115 +144,89 @@ enum udsp_ec_nlms_trial_end {
 };
 
 /*
- * The reading of the detector and the processor on the last frame that run()
- * took, for the verdict trace of core/chan.c. Like struct udsp_ec_nlms_info
- * it is not part of the stable record. The reset clears it, so a read after
- * a reset returns zeros.
- *
- * The powers are mean squares in int16 units. The detector fires when the
- * window is active and mic_power reaches bar, the echo expectation with every
- * term times the Geigel margin. The reader divides mic_power by bar, so the
- * tick divides nothing. ref_power is the frame's own reference and
- * window_power the loudest frame of the window.
- *
- * - frames: the frame count of the instance after this frame.
- * - noise_power: the tracked near-end floor that the bar carries.
- * - erle_db: the tracked ERLE that the detector read. The frame can move the
- *   tracker after the verdict, so a later read of the tracker can differ.
- * - window_run: the frames the window has been active for, 1 on the first
- *   and 0 while it is inactive. It saturates at UINT16_MAX.
- * - dt_run: the latch run at the end of the frame, saturated the same way.
- * - stale_run: the stale run at the end of the frame, saturated the same way
- *   (dsp/lec.c, LEC_GEIGEL_STALE_FRAMES).
- * - trust_run: the trust count at the end of the frame, the clear active
- *   frames since its last restart, saturated the same way (dsp/lec.c,
- *   LEC_GEIGEL_TRUST_FRAMES). The detector of the frame read the count before
- *   the frame. The trust therefore first holds on the frame after the one
- *   that reads the full count.
- * - hold_left: the hangover before this frame changed it, so 0 on a fresh
- *   verdict and above 0 on a re-arm inside a hangover. On the frame on which
- *   a talker ends a trial, it reads the hangover that the snapshot of the
- *   trial restored.
- * - nlp_verdict: the verdict of the processor gate, which
- *   udsp_ec_nlms_verdict_name names. A trial that ends in the frame can
- *   clear double talk before the gate reads it.
- * - dt_fired: the detector fired on this frame.
- * - classic_arm: the classic bound set the bar, because the ERLE was not
- *   trusted and the bound was above the estimate.
- * - trusted: the ERLE was at or over the trust line, and the coefficient
- *   energy explained the learned gain (dsp/lec.c,
- *   LEC_GEIGEL_TRUST_COEF_RATIO). The trust count was complete too.
- * - probing: a trial was running when the frame started. A trial that ends
- *   in the frame reads 1, and a trial that starts in it reads 0. The detector
- *   ran under that trial state, except on the frame on which a talker ends a
- *   trial: that frame reads 1, and the detector then ran with no trial.
- * - trial_arm: the way into the trial that starts on this frame (struct
- *   udsp_ec_nlms_info names the three), as enum udsp_ec_nlms_trial_arm. It
- *   reads NONE on every frame that starts no trial.
- * - trial_end: the end of the trial that ends on this frame, as enum
- *   udsp_ec_nlms_trial_end. The verdict of the trial gives KEPT or REJECTED,
- *   the watchdog stop gives DIVERGED, and a talker frame gives TALKER. It
- *   reads NONE on every frame that ends no trial. A trial that the reset
- *   clears has no end frame.
- * - ref_quiet: the window is active and the frame's own reference is not,
- *   which is the tail of a talkspurt.
- * - talker: the window is active and mic_power exceeds 16 times (12 dB) the
- *   guard window, the larger window maximum of this frame and of the frame
- *   before (dsp/lec.c, LEC_TALKER_RATIO). The reference loss raises the
- *   ratio (udsp_ec_nlms_ref_loss_set). A frame that starts inside a trial
- *   reads the window against the fixed bar. A talker that ends the trial can
- *   therefore leave the window inactive under ref_bar.
- * - ref_bar: the activity bar of the frame (dsp/lec.c, ref_bar_get). The
- *   frame is active when ref_power reaches it, and the window is active when
- *   window_power reaches it. It reads the fixed bar while a trial runs, and
- *   it follows the end of a trial that a talker ends. The fixed bar is 2500
- *   less the reference loss (udsp_ec_nlms_ref_loss_set).
- * - ref_bar_max: the cap of ref_bar on this frame. It comes from the learned
- *   gain before the frame ran, the echo_gain that info read after the frame
- *   before.
- * - background: the window stands under ref_bar and at or over the fixed
- *   bar, so the far-end floor alone holds the window inactive.
+ * The reading of the detector and the processor on the last frame of run(), for
+ * the verdict trace of core/chan.c. It is not part of the stable record, and
+ * the reset clears it. Powers are mean squares in int16 units. The detector
+ * fires when the window is active and mic_power reaches bar, which the reader
+ * divides by, so the tick divides nothing.
  */
 struct udsp_ec_nlms_frame {
+	/* The frame count of the instance after this frame. */
 	uint32_t frames;
+	/* ref_power is the frame's own reference, window_power the loudest
+	 * frame of the window, bar the echo expectation with every term times
+	 * the margin. */
 	float mic_power;
 	float window_power;
 	float estimate_power;
 	float bar;
+	/* The tracked near-end floor that the bar carries, or the pause level
+	 * on a frame without echo (bar_floor_get). */
 	float noise_power;
 	float ref_power;
+	/* The tracked ERLE that the detector read; the frame can move the
+	 * tracker after the verdict. */
 	float erle_db;
+	/* The activity bar: the frame and the window are active at it. It reads
+	 * the fixed bar, 2500 less the reference loss, while a trial runs. */
 	float ref_bar;
+	/* The cap of ref_bar, from the learned gain before the frame ran. */
 	float ref_bar_max;
+	/* Frames of the active window, 1 on the first, 0 while inactive; this
+	 * and the next three saturate at UINT16_MAX. */
 	uint16_t window_run;
+	/* The latch run at the end of the frame. */
 	uint16_t dt_run;
+	/* The stale run at the end of the frame (LEC_GEIGEL_STALE_FRAMES). */
 	uint16_t stale_run;
+	/* The trust count at the end of the frame; the detector read the count
+	 * before it, so the trust first holds on the frame after the full
+	 * count. */
 	uint16_t trust_run;
+	/* The hangover before this frame changed it: 0 on a fresh verdict;
+	 * after a talker ends a trial, the hangover that the snapshot
+	 * restored. */
 	uint8_t hold_left;
+	/* The processor verdict (udsp_ec_nlms_verdict_name); a trial that ends
+	 * in the frame can clear double talk before the gate reads it. */
 	uint8_t nlp_verdict;
+	/* The way into a trial that starts on this frame, else NONE. */
 	uint8_t trial_arm;
+	/* The end of a trial on this frame: KEPT or REJECTED by its verdict,
+	 * DIVERGED by the watchdog, TALKER by a talker frame, else NONE. */
 	uint8_t trial_end;
 	bool dt_fired;
+	/* The classic bound set the bar: the filter is untrusted, and the bound
+	 * stands over the estimate. */
 	bool classic_arm;
+	/* The trust held: tracked ERLE, energy rule and a complete trust
+	 * count. */
 	bool trusted;
+	/* A trial ran when the frame started; the detector ran under it, except
+	 * after a talker ended the trial on the frame, when it ran with
+	 * none. */
 	bool probing;
+	/* The window is active and the frame's own reference is not: the tail
+	 * of a talkspurt. */
 	bool ref_quiet;
+	/* The window is active and mic_power exceeds the guard window by
+	 * LEC_TALKER_RATIO, which the reference loss raises. */
 	bool talker;
+	/* The far-end floor alone holds the window inactive
+	 * (background_get). */
 	bool background;
+	/* The drop hold runs at the end of the frame (LEC_DROP_HOLD_DB). */
+	bool drop_hold;
+	/* The frame starts an act, and its cross-fade starts from the input
+	 * before the filter, not from the filter output. */
+	bool fade_input;
 };
 
 /*
- * Which form of the per-tap loops (the FIR accumulation and the NLMS update)
- * the canceller runs. SIMD is the aarch64 Advanced SIMD form and is the
- * default there; it exists nowhere else, and path_set returns false for it on
- * every other target. The scalar form stays complete and canonical at both
- * line rates and on every target.
- *
- * The two forms are equivalent, not identical: the vector dot product
- * accumulates in thirty-two partial sums instead of one, so the estimate
- * differs from the scalar one by the reassociation of a 128 to 1024 term sum.
- * The vector form must stay within 4 counts per sample and 0.1 dB of ERLE of
- * the scalar one, and test/test_lec.c measures that.
+ * The form of the per-tap loops: scalar, canonical on every target, or the
+ * Advanced SIMD form, the default on aarch64 and absent elsewhere. The vector
+ * dot product reassociates its sum, so the forms are equivalent, not identical;
+ * test/test_lec.c bounds the difference.
  */
 enum udsp_ec_nlms_path {
 	UDSP_EC_NLMS_PATH_SCALAR,
@@ -306,78 +244,49 @@ void udsp_ec_nlms_frame_get(const struct udsp_ec *ec,
  * "?" for a value that is not a verdict. */
 const char *udsp_ec_nlms_verdict_name(unsigned verdict);
 /*
- * Full adaptive-state reset: coefficients, trackers, detector, probe and the
- * gain estimator go back to the created state; the tail, the NLP switch, the
- * freeze, the comfort noise generator, the measured noise floor and the
- * far-end floor stay. For the engine tick when the measured loop delay
- * recalibrates: the old coefficients then subtract an estimate misaligned
- * against the re-timed reference, which is worse than starting over. RT-safe:
- * no allocation, no logging, no locks.
+ * Full adaptive-state reset for a recalibration of the loop delay, when the
+ * coefficients stand misaligned against the re-timed reference. Tail, switches,
+ * freeze, comfort noise sequence and both floors stay; the interpolator starts
+ * over, and the bootstrap of a run instance stays spent. RT-safe.
  */
 void udsp_ec_nlms_reset(struct udsp_ec *ec);
 
 /*
- * Takes one frame of reference into the history of the instance, as run()
- * does, and nothing else: no filter, no update, no counter and no processor.
- * Of the trackers it feeds the far-end floor alone, because a skipped frame
- * carries the far end too. For the engine tick when it skips run() on a
- * frame. A filter that does not see the downlink resumes on a window that
- * stopped at the skip, and its first tail of frames adapts against that stale
- * window: on the host model one resumed frame moved the coefficient energy by
- * 16 percent and dropped the ERLE from 60 dB to 15 dB. RT-safe on the terms
- * of run().
+ * One frame of reference into the history, as run() takes it, for a frame that
+ * the tick skips; the far-end floor is the one tracker it feeds. A filter that
+ * does not see the downlink resumes on a stale window and adapts against it
+ * RT-safe on the terms of run().
  */
 void udsp_ec_nlms_ref_feed(struct udsp_ec *ec, const int16_t *ref);
 
+/* The reach of the engine's receive loss, 30 dB in half-dB steps (core/udsp.c
+ * UDSP_SLIC_GAIN_MIN); a larger loss drives the scaled rules out of range. */
+#define UDSP_EC_NLMS_REF_LOSS_MAX	60u
 /*
  * The loss in half-dB steps that the engine applies to the downlink ahead of
- * the frame that the instance reads as its reference. The line still carries
- * that loss. The reference therefore stands the loss under the line, and the
- * echo path from the reference to the microphone stands the loss over the
- * hybrid. The instance scales each absolute rule of dsp/lec.c by the loss, so
- * its verdicts stay those of a reference that carries the loss. A loss of 0
- * leaves the arithmetic of every rule as it is, bit for bit.
- *
- * A new instance reads 0, and udsp_ec_nlms_reset keeps the loss. A changed
- * loss starts the instance over through udsp_ec_nlms_reset and starts its
- * far-end floor over, whether the instance ran or not, because its reference
- * history, its learned gain and that floor stand in the old scale of the
- * reference. The same loss again changes nothing. A loss over
- * UDSP_EC_NLMS_REF_LOSS_MAX clamps to it: the engine's receive loss reaches
- * 30 dB (core/udsp.c UDSP_SLIC_GAIN_MIN), and a larger value drives the
- * scaled rules out of range. RT-safe on the terms of the reset.
+ * the reference; the line still carries it. Each absolute rule scales by it; a
+ * loss of 0 changes no rule, bit for bit. A loss over UDSP_EC_NLMS_REF_LOSS_MAX
+ * clamps to it, and the same loss again changes nothing. A changed loss resets
+ * the instance and its far-end floor, not the loss. RT-safe.
  */
-#define UDSP_EC_NLMS_REF_LOSS_MAX	60u
 void udsp_ec_nlms_ref_loss_set(struct udsp_ec *ec, unsigned half_db);
 unsigned udsp_ec_nlms_ref_loss_get(const struct udsp_ec *ec);
 
 /*
- * The path switch is a control for the tests and the bench, not a runtime API.
- * It is process wide and applies to every instance from the next per-tap loop
- * on, so a caller that runs two instances side by side sets it between the two
- * run() calls (the equivalence suite does exactly that). path_set returns
- * false when the build carries no such path and leaves the selection alone;
- * path_name returns NULL for a value that is not a path.
- *
- * Quiescence required: path_set must not run while any thread is inside run()
- * on any instance. The selection is a plain file-scope flag with no
- * synchronisation of any kind. path_set allocates nothing, logs nothing and
- * takes no lock, but that makes it RT-safe, not thread-safe. Production never
- * calls it: the default is the fastest form the target carries.
+ * The process-wide path switch, for the tests and the bench; production never
+ * calls it. It takes effect at the next per-tap loop and needs quiescence: no
+ * thread inside run(). It is RT-safe, not thread-safe. path_set returns false
+ * for a path the build lacks; path_name returns NULL for a non-path.
  */
 bool udsp_ec_nlms_path_set(enum udsp_ec_nlms_path path);
 enum udsp_ec_nlms_path udsp_ec_nlms_path_get(void);
 const char *udsp_ec_nlms_path_name(enum udsp_ec_nlms_path path);
 
 /*
- * The zero-reference skip switch of one instance, a control for the tests and
- * the bench that production never writes. A new instance has it on, and the
- * reset keeps it. Off, a frame whose whole reference window is zero walks the
- * tap loops as every other frame does; on, it skips them and counts itself in
- * skip_frames. The two forms produce the same samples and the same state bit
- * for bit, and test_lec runs twin instances with the switch on and off. The
- * setters allocate nothing, take no lock and log nothing. A NULL instance
- * reads off and takes no write.
+ * The zero-reference skip switch of one instance, for the tests and the bench:
+ * on by default and kept by the reset. On, a frame whose window is zero skips
+ * the tap loops and counts in skip_frames, with the same samples and state bit
+ * for bit. A NULL instance reads off and takes no write.
  */
 void udsp_ec_nlms_zero_skip_set(struct udsp_ec *ec, bool on);
 bool udsp_ec_nlms_zero_skip_get(const struct udsp_ec *ec);
