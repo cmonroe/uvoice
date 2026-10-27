@@ -1709,8 +1709,8 @@ static void fax_exit_expire(struct uloop_timeout *t)
 		return;
 
 	if (!call_fax_exit(e->handle)) {
-		LTRACE(TRACE_HOOK, "line %u stream %u keeps the passthrough it "
-		       "took from the answer tone", e->line, e->stream);
+		LTRACE(TRACE_HOOK, "line %u stream %u does not return to voice "
+		       "after the answer tone", e->line, e->stream);
 		return;
 	}
 
@@ -1785,16 +1785,10 @@ static const struct call_cb line_call_cb = {
 };
 
 /*
- * The answer family identifies a data device, not whether it carries fax.
- * V.152 10.1.1 and 10.3 permit media policy changes on either feed.
- * A remote answer tone arms the kind; a local answer tone also starts the
- * G.711 profile and offer. CNG identifies the caller and starts neither.
- * The local V.21 preamble supplies the fax evidence separately.
- * The DSP's G.168 clause 7 disabler runs independently of these offer gates.
- *
- * chan_fax_latch() in udsp/src/core/chan.c reads answer tones from either feed.
- * With ec_tone_force_disable at zero, phase-reversed tones disable the whole
- * canceller; plain tones disable its non-linear processor.
+ * The answer family names a data device, not fax (V.152 10.1.1 and 10.3). A
+ * local answer tone starts the profile and offer. A remote plain tone (CED)
+ * arms no kind until a V.21 preamble or a carrier proves it
+ * (fax_ced_proof_event); other remote answer tones arm the modem kind at once.
  */
 static bool fax_tone_starts(uint16_t code)
 {
@@ -1883,8 +1877,40 @@ static bool fax_tone_note(struct sip_line *l, const struct proto_line_event *ev,
 }
 
 /*
+ * A V.21 preamble or a modem carrier from either feed, behind a plain answer
+ * tone from the wire, arms the kind it proves (call.h call_fax_ced_proof). A
+ * start row alone proves the tone: an end row counts no evidence. It runs ahead
+ * of the T.38 gates, which then read the kind it armed.
+ */
+static void fax_ced_proof_event(struct sip_line *l,
+				const struct proto_line_event *ev,
+				unsigned int slot)
+{
+	uint16_t code = ev->u.tone.code;
+
+	if (ev->u.tone.end)
+		return;
+
+	if (code != HAL_TONE_DET_V21_PREAMBLE && code != HAL_TONE_DET_MODEM)
+		return;
+
+	if (l->fsm.state != FSM_CONNECTED || slot >= CALL_SLOTS)
+		return;
+
+	if (!call_fax_ced_proof(l->index, slot, code))
+		return;
+
+	LTRACE(TRACE_FSM, "line %u slot %u %s from the %s after the plain "
+	       "answer tone: the %s kind reached the leg", l->index, slot,
+	       hal_tone_detect_name(code),
+	       ev->u.tone.direction == HAL_TONE_DIR_LOCAL ? "phone" : "wire",
+	       code == HAL_TONE_DET_MODEM ? "modem" : "fax");
+}
+
+/*
  * The local preamble selects the fax kind before the T.38 gates.
- * A remote tone can arm that kind without a profile or a local latch.
+ * A remote tone can arm that kind without a profile or a local latch. Behind
+ * a plain answer tone from the wire, fax_ced_proof_event() arms it first.
  * A followed upspeed also carries a kind without the latch. Both paths need
  * the fax policy even when fax_t38_enable is zero.
  *
@@ -1981,11 +2007,17 @@ static void t38_tone_event(struct sip_line *l,
 }
 
 /*
- * A remote answer tone records the hint and arms the modem kind on the
- * current codec.
+ * A remote answer tone records the hint. Every one except the plain tone
+ * also arms the modem kind on the current codec.
  * It takes no latch and sends no offer. The kind cannot wait: a proxy, for
  * example Asterisk, can answer the far upspeed itself and pass no offer to the
  * caller. V.152 10.1.1 and 10.3 permit this transition.
+ *
+ * The plain tone (CED) records the hint and arms no kind. A kind on the
+ * description outranks the DSP's disabler, and G.168 Test 10A expects the
+ * canceller to converge on that tone. The row that proves the tone arms the
+ * kind instead (fax_ced_proof_event), and the return to voice drops a tone
+ * that nothing proves.
  *
  * A local answer tone still converts a kind-only leg. T.30 6.1.7 permits the
  * calling terminal to answer a manual fax procedure. An existing profile
@@ -2007,6 +2039,7 @@ static void tone_event(struct sip_line *l, const struct proto_line_event *ev)
 		return;
 
 	if (!fax_tone_starts(ev->u.tone.code)) {
+		fax_ced_proof_event(l, ev, slot);
 		t38_tone_event(l, ev, slot);
 		return;
 	}
@@ -2023,6 +2056,14 @@ static void tone_event(struct sip_line *l, const struct proto_line_event *ev)
 		}
 
 		call_fax_hint(l->index, slot);
+		if (ev->u.tone.code == HAL_TONE_DET_CED) {
+			LTRACE(TRACE_HOOK, "line %u fax tone %s from the wire: "
+			       "no kind before a V.21 preamble or a modem "
+			       "carrier, no offer", l->index,
+			       hal_tone_detect_name(ev->u.tone.code));
+			return;
+		}
+
 		kind_set = call_fax_kind_set(l->index, slot,
 					     HAL_PASSTHROUGH_MODEM);
 		LTRACE(TRACE_HOOK, "line %u fax tone %s from the wire: "

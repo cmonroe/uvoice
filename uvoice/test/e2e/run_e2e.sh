@@ -4421,7 +4421,7 @@ fax_upspeed_run()
 
 # The far end's own G.711 fax upspeed, followed. The DUT calls out, this
 # scenario answers with G.729 alone, and the stub then reports the fax answer
-# tone from the wire, which arms the modem kind and applies no profile. The
+# tone from the wire. A plain tone arms no kind and applies no profile. The
 # scenario re-INVITEs with its list narrowed to G.711, and the DUT has to
 # recognize that pair, convert its own DSP and send no offer of its own.
 #
@@ -4501,14 +4501,14 @@ far_fax_upspeed_run()
         result_print FAIL "$name" "the remote answer tone never reached the line"
         return
     fi
-    # The tone arms the modem kind on the stream the call already runs and
-    # applies no profile: the profile and the codec belong to the exchange
-    # behind it. HAL_PASSTHROUGH_MODEM is 1.
-    if ! stub_wait "$flow_dir" \
-        '.line[0].stream[0].passthrough == 1 and .line[0].stream[0].fax_applied == false' \
-        5 remote-ced; then
+    # A plain tone arms no kind and applies no profile: the profile and the
+    # codec belong to the exchange behind it, and the canceller stays on
+    # through the tone (ITU-T G.168 7.1). HAL_PASSTHROUGH_OFF is 0.
+    if ! stub_check "$flow_dir" \
+        '.line[0].stream[0].passthrough == 0 and .line[0].stream[0].fax_applied == false' \
+        remote-ced; then
         flow_stop
-        result_print FAIL "$name" "the remote CED did not arm the modem kind alone"
+        result_print FAIL "$name" "the remote CED armed a kind or applied a profile"
         return
     fi
     # HAL_FAX_PASSTHROUGH is 1 and HAL_CODEC_PCMU is 1: the narrowing offer
@@ -4628,11 +4628,13 @@ sipp_bye_delay_get()
 # offer through (an Asterisk capture shows it), so the tone is the only
 # evidence this side gets.
 #
-# The DUT has to arm the modem kind on the stream it already runs, keep the
-# committed codec, apply no fax profile and send no offer of its own. The kind
-# is what takes the adaptive jitter buffer, the silence suppression and the
-# canceller off the carrier; the codec belongs to the SIP layer, and on a
-# G.711 leg it needs no move (ITU-T V.152 clauses 6, 10.1.1 and 10.3).
+# The plain tone arms no kind, so the canceller stays on through it (ITU-T
+# G.168 7.1). The far fax's V.21 preamble behind it then has to arm the fax
+# kind on the stream the DUT already runs. The DUT keeps the committed codec,
+# applies no fax profile and sends no offer of its own. The kind is what takes
+# the adaptive jitter buffer and the silence suppression off the carrier; the
+# codec belongs to the SIP layer, and on a G.711 leg it needs no move (ITU-T
+# V.152 clauses 6, 10.1.1 and 10.3).
 #
 # The codec sections are the three the upspeed flows provision, in the same
 # order: the offer leads with G.729 and the answer selects PCMU, so the
@@ -4702,13 +4704,23 @@ far_fax_tone_run()
         result_print FAIL "$name" "the remote answer tone never reached the line"
         return
     fi
-    # HAL_PASSTHROUGH_MODEM is 1 and HAL_CODEC_PCMU is 1: the kind lands on the
-    # committed codec, and no profile goes with it
+    # HAL_PASSTHROUGH_OFF is 0: the plain tone arms no kind of its own
+    if ! stub_check "$flow_dir" \
+        '.line[0].stream[0].passthrough == 0 and .line[0].stream[0].fax_applied == false' \
+        remote-ced; then
+        flow_stop
+        result_print FAIL "$name" "the remote CED armed a kind or applied a profile"
+        return
+    fi
+    # the far fax's DIS behind its CED
+    tone_send v21 remote || true
+    # HAL_PASSTHROUGH_FAX is 2 and HAL_CODEC_PCMU is 1: the kind arrives on
+    # the committed codec, and no profile goes with it
     if ! stub_wait "$flow_dir" \
-        '.line[0].stream[0].passthrough == 1 and .line[0].stream[0].codec == 1 and .line[0].stream[0].fax_applied == false' \
+        '.line[0].stream[0].passthrough == 2 and .line[0].stream[0].codec == 1 and .line[0].stream[0].fax_applied == false' \
         5 tone-kind; then
         flow_stop
-        result_print FAIL "$name" "the remote tone did not arm the modem kind on the stream"
+        result_print FAIL "$name" "the preamble behind the remote tone did not arm the fax kind on the stream"
         return
     fi
     # The stamp the measured window starts from, in SIPp's own log format
@@ -4720,7 +4732,7 @@ far_fax_tone_run()
     # local tone, so neither latch stands. latch_dump() omits an array that is
     # all false, so an absent array is the same answer.
     if ! status_expr_wait "$flow_dir" \
-        '.call[0].calls[0].fax == "passthrough" and .call[0].calls[0].fax_kind == "modem" and (((.call[0].fax_switched // [false])[0] // false) | not) and (((.call[0].t38_switched // [false])[0] // false) | not)' \
+        '.call[0].calls[0].fax == "passthrough" and .call[0].calls[0].fax_kind == "fax" and (((.call[0].fax_switched // [false])[0] // false) | not) and (((.call[0].t38_switched // [false])[0] // false) | not)' \
         10 kind-only; then
         flow_stop
         result_print FAIL "$name" "the status view did not name a kind-only passthrough"
@@ -4769,12 +4781,12 @@ far_fax_tone_run()
     if (( window_ms < 8000 )); then
         flow_stop
         result_print FAIL "$name" \
-            "the quiet window behind the modem kind measured $window_s seconds, under the eight this flow requires"
+            "the quiet window behind the fax kind measured $window_s seconds, under the eight this flow requires"
         return
     fi
     flow_stop
     result_print PASS "$name" \
-        "$sipp_verdict_detail, the remote tone armed the modem kind on the committed PCMU with no profile, the jitter buffer went fixed and the DUT sent no offer of its own through $window_s seconds of quiet behind the kind"
+        "$sipp_verdict_detail, the remote plain tone armed no kind and the preamble behind it armed the fax kind on the committed PCMU with no profile, the jitter buffer went fixed and the DUT sent no offer of its own through $window_s seconds of quiet behind the kind"
 }
 
 # The answering side whose answer tone was a false one. The DUT calls out, this
@@ -4913,13 +4925,14 @@ fax_upspeed_false_run()
 # with PCMU and telephone-event and then sends nothing at all, so the answer
 # tone from the wire is the only evidence this side gets.
 #
-# The tone arms the modem kind on the committed codec, the end row reads 900 ms
-# and the DUT returns the leg to voice behind its deferral: no kind on the
-# stream, the adaptive jitter buffer again, the disabler released once, and no
-# in-dialog INVITE at any point. The return itself spends nothing on the wire,
-# which is the second half of what this flow proves. The wire is the one of
-# uas_far_fax_tone_g711, so both flows run that scenario; its quiet window is
-# long enough for the end row and the deferral too.
+# The plain tone arms no kind, the end row reads 900 ms and the DUT returns
+# the leg to voice behind its deferral: no kind on the stream, the adaptive
+# jitter buffer, the disabler released once, a preamble behind the exit that
+# arms nothing, and no in-dialog INVITE at any point. The return itself
+# spends nothing on the wire, which is the second half of what this flow
+# proves. The wire is the one of uas_far_fax_tone_g711, so both flows run
+# that scenario; its quiet window is long enough for the end row and the
+# deferral too.
 far_fax_tone_false_run()
 {
     local name=uas_far_fax_tone_false
@@ -4976,16 +4989,22 @@ far_fax_tone_false_run()
         return
     fi
     tone_send ced remote || true
-    # HAL_PASSTHROUGH_MODEM is 1: the kind lands on the committed codec
-    if ! stub_wait "$flow_dir" \
-        '.line[0].stream[0].passthrough == 1 and .line[0].stream[0].codec == 1 and .line[0].stream[0].fax_applied == false' \
-        5 tone-kind; then
+    if ! daemon_log_require "$flow_dir" \
+        "fax tone CED from the wire" 5; then
         flow_stop
-        result_print FAIL "$name" "the remote tone did not arm the modem kind on the stream"
+        result_print FAIL "$name" "the remote answer tone never reached the line"
         return
     fi
-    # The stamp the measured window starts from, taken on the sample that
-    # proves the kind reached the stream, so a runner delayed anywhere before
+    # HAL_PASSTHROUGH_OFF is 0: the plain tone arms no kind of its own
+    if ! stub_check "$flow_dir" \
+        '.line[0].stream[0].passthrough == 0 and .line[0].stream[0].codec == 1 and .line[0].stream[0].fax_applied == false' \
+        tone-no-kind; then
+        flow_stop
+        result_print FAIL "$name" "the remote tone armed a kind or applied a profile"
+        return
+    fi
+    # The stamp the measured window starts from, taken behind the sample that
+    # proves the tone reached the leg, so a runner delayed anywhere before
     # this point shortens the reading and never lengthens it.
     tone_mark=$(date '+%Y-%m-%d %H:%M:%S.%6N')
     # the end row of the same tone, 1.7 s under the floor of ITU-T T.30 4.1.1
@@ -4995,6 +5014,22 @@ far_fax_tone_false_run()
         10 returned; then
         flow_stop
         result_print FAIL "$name" "the short answer tone did not return the leg to voice"
+        return
+    fi
+    # The exit dropped the tone, so a preamble behind it proves nothing. The
+    # T.38 gate traces the row after the proof runs on it, so that line
+    # says the stub dump below already holds whatever the row did.
+    tone_send v21 remote || true
+    if ! daemon_log_require "$flow_dir" \
+        "line 0 tone V21_PREAMBLE came from the wire" 5; then
+        flow_stop
+        result_print FAIL "$name" "the preamble behind the exit never reached the line"
+        return
+    fi
+    if ! stub_check "$flow_dir" '.line[0].stream[0].passthrough == 0' \
+        preamble-after-exit; then
+        flow_stop
+        result_print FAIL "$name" "a preamble behind the exit armed a kind"
         return
     fi
     if ! status_expr_wait "$flow_dir" \
@@ -5046,12 +5081,12 @@ far_fax_tone_false_run()
     if (( window_ms < 8000 )); then
         flow_stop
         result_print FAIL "$name" \
-            "the quiet window behind the modem kind measured $window_s seconds, under the eight this flow requires"
+            "the quiet window behind the tone measured $window_s seconds, under the eight this flow requires"
         return
     fi
     flow_stop
     result_print PASS "$name" \
-        "$sipp_verdict_detail, the short answer tone took the leg back to voice on the committed PCMU with one disabler release, the jitter buffer went adaptive again and the DUT sent no offer of its own through $window_s seconds of quiet"
+        "$sipp_verdict_detail, the short answer tone armed no kind and its exit released the disabler once on the committed PCMU, a preamble behind it armed nothing, the jitter buffer stayed adaptive and the DUT sent no offer of its own through $window_s seconds of quiet"
 }
 
 # The config both T.38 flows run on. fax_t38_enable is the option

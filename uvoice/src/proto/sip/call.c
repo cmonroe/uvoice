@@ -388,7 +388,11 @@ struct call {
 	 * What that passthrough carries (enum hal_passthrough). The profile
 	 * arms the modem kind, because a CED answer says a data device answered
 	 * and nothing yet says which kind it is, and the first local V.21
-	 * preamble moves it to the fax kind. It travels to the backend on the
+	 * preamble moves it to the fax kind. A tone from the wire arms a kind
+	 * with no profile. The plain answer tone arms none of its own: the
+	 * first V.21 preamble or modem carrier behind it arms the kind that
+	 * row proves (call.h call_fax_ced_proof). Every other answer tone arms
+	 * the modem kind at once. The kind travels to the backend on the
 	 * description, beside the three fields above, so a backend reads one
 	 * record and no separate profile state can fall out of step with it.
 	 */
@@ -398,7 +402,9 @@ struct call {
 	 * (call.h call_fax_hint), 0 for never. It is the tone half of the
 	 * far-end upspeed recognizer: the SDP half alone cannot tell a fax
 	 * gateway's narrowing offer from an ordinary codec change, and this
-	 * stamp is what says a data device answered on the other side.
+	 * stamp is what says a data device answered on the other side. The
+	 * same window bounds the wait of a plain answer tone for the row that
+	 * proves it (fax_ced_waits).
 	 *
 	 * The stamp is clamped away from 0 (uvoice_stamp_nonzero), because the
 	 * monotonic clock reads 0 for a millisecond after boot and again every
@@ -3711,6 +3717,20 @@ static void uas_ack_take(struct call *c, const struct sip_msg *ack)
 	    (c->state == CALL_ST_ACCEPT_WAIT_ACK || !c->media_started)) {
 		leg_abandon(c, CALL_FAIL_CONGESTION);
 		return;
+	}
+
+	/*
+	 * A kind recorded under this exchange reached no stream when the stream
+	 * refused the description; the record follows the applied description,
+	 * so a leg waiting on a plain answer tone waits again (call.h
+	 * call_fax_ced_proof).
+	 */
+	if (!media_ok && !c->fax_exit_pending && !c->fax_on &&
+	    !c->sdp.committed.t38 && c->media_set &&
+	    c->fax_kind != c->media.passthrough) {
+		leg_trace(c, "the stream refused fax kind %u at the ACK",
+			  c->fax_kind);
+		c->fax_kind = c->media.passthrough;
 	}
 
 	sess_arm(c);
@@ -8582,23 +8602,13 @@ uint8_t call_fax_kind_get(unsigned int line, unsigned int slot)
  * media policy without an exchange (V.152 10.1.1 and 10.3).
  * A refused description leaves the kind at the stream's last applied value,
  * so the next tone can retry it.
+ *
+ * This is the program step alone. call_fax_kind_set() and
+ * call_fax_ced_proof() each apply their own evidence rule before it.
  */
-bool call_fax_kind_set(unsigned int line, unsigned int slot, uint8_t kind)
+static bool fax_kind_program(struct call *c, uint8_t kind)
 {
-	struct call *c = leg_of_ui(line, slot);
 	uint8_t carried;
-
-	if (!c)
-		return false;
-
-	if (kind == HAL_PASSTHROUGH_FAX && !c->fax_on &&
-	    c->fax_kind == HAL_PASSTHROUGH_OFF)
-		return false;
-
-	/* A preamble supplies stronger evidence than a repeated answer tone. */
-	if (kind == HAL_PASSTHROUGH_MODEM &&
-	    c->fax_kind == HAL_PASSTHROUGH_FAX)
-		return true;
 
 	/*
 	 * The preamble repeats through the T.30 negotiation, and a stream that
@@ -8662,6 +8672,26 @@ bool call_fax_kind_set(unsigned int line, unsigned int slot, uint8_t kind)
 	return true;
 }
 
+/* call.h: a kind from a tone, with no profile and no offer */
+bool call_fax_kind_set(unsigned int line, unsigned int slot, uint8_t kind)
+{
+	struct call *c = leg_of_ui(line, slot);
+
+	if (!c)
+		return false;
+
+	if (kind == HAL_PASSTHROUGH_FAX && !c->fax_on &&
+	    c->fax_kind == HAL_PASSTHROUGH_OFF)
+		return false;
+
+	/* A preamble supplies stronger evidence than a repeated answer tone. */
+	if (kind == HAL_PASSTHROUGH_MODEM &&
+	    c->fax_kind == HAL_PASSTHROUGH_FAX)
+		return true;
+
+	return fax_kind_program(c, kind);
+}
+
 /* ------------------------------------------------------- return to voice */
 
 /*
@@ -8720,6 +8750,18 @@ static bool fax_carried(const struct call *c)
 	       fax_t38_session(c);
 }
 
+/*
+ * A plain answer tone from the wire that armed no kind (call.h
+ * call_fax_ced_proof): the arming candidate, its stamp inside
+ * CALL_FAX_HINT_WINDOW_MS, on a leg that carries nothing yet. A later row is
+ * evidence, not a new candidate, so a split tone cannot restart the total.
+ */
+static bool fax_ced_waits(const struct call *c)
+{
+	return !fax_carried(c) && c->fax_tone_code == HAL_TONE_DET_CED &&
+	       c->fax_tone_dir == HAL_TONE_DIR_REMOTE && fax_hint_fresh(c);
+}
+
 /* call.h: the tone half of the return-to-voice rule */
 enum call_fax_tone call_fax_tone_note(unsigned int line, unsigned int slot,
 				      uint16_t code, uint8_t direction,
@@ -8730,7 +8772,7 @@ enum call_fax_tone call_fax_tone_note(unsigned int line, unsigned int slot,
 	if (!c)
 		return end ? CALL_FAX_TONE_END : CALL_FAX_TONE_NOTED;
 
-	if (!end && fax_carried(c)) {
+	if (!end && (fax_carried(c) || fax_ced_waits(c))) {
 		if (fax_tone_is_evidence(code))
 			c->fax_evidence = true;
 
@@ -8765,6 +8807,35 @@ enum call_fax_tone call_fax_tone_note(unsigned int line, unsigned int slot,
 	c->fax_tone_ms += duration_ms;
 
 	return CALL_FAX_TONE_ENDED;
+}
+
+/* call.h: the row that proves a plain answer tone from the wire */
+bool call_fax_ced_proof(unsigned int line, unsigned int slot, uint16_t code)
+{
+	struct call *c = leg_of_ui(line, slot);
+	uint8_t kind;
+
+	if (!c)
+		return false;
+
+	switch (code) {
+	case HAL_TONE_DET_V21_PREAMBLE:
+		kind = HAL_PASSTHROUGH_FAX;
+		break;
+	case HAL_TONE_DET_MODEM:
+		kind = HAL_PASSTHROUGH_MODEM;
+		break;
+	default:
+		return false;
+	}
+
+	if (!fax_ced_waits(c))
+		return false;
+
+	leg_trace(c, "%s behind the plain answer tone from the wire",
+		  hal_tone_detect_name(code));
+
+	return fax_kind_program(c, kind);
 }
 
 /* call.h: the identity a caller holds across a timer window */
@@ -8824,7 +8895,7 @@ bool call_fax_exit(uint32_t handle)
 	uint8_t kind;
 	bool on;
 
-	if (!c || !fax_carried(c))
+	if (!c || (!fax_carried(c) && !fax_ced_waits(c)))
 		return false;
 
 	/*
@@ -8849,18 +8920,29 @@ bool call_fax_exit(uint32_t handle)
 	}
 
 	if (c->fax_tone_ms >= CALL_FAX_TONE_MIN_MS) {
-		leg_trace(c, "the answer tone ran %u ms, so the leg keeps "
-			  "its kind", c->fax_tone_ms);
+		leg_trace(c, "the answer tone ran %u ms, so the leg does not "
+			  "return to voice", c->fax_tone_ms);
 		return false;
 	}
 
 	if (c->fax_evidence) {
 		leg_trace(c, "a later signal proved the answer tone, so "
-			  "the leg keeps its kind");
+			  "the leg does not return to voice");
 		return false;
 	}
 
 	fax_latch_clear(c);
+
+	/* A plain tone from the wire armed no kind, so the stream runs the
+	 * voice description and the codec list holds no clamp; only the stamp
+	 * goes, and a later G.711-only offer is an ordinary renegotiation. */
+	if (!fax_carried(c)) {
+		c->fax_hint_ms = 0;
+		leg_trace(c, "the answer tone from the wire ran %u ms and "
+			  "nothing followed it, the leg stays voice",
+			  c->fax_tone_ms);
+		return true;
+	}
 
 	kind = c->fax_kind;
 	on = c->fax_on;

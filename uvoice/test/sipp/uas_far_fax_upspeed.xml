@@ -12,9 +12,9 @@
   of a fax call.
 
   This scenario answers with G.729 alone, so the committed codec is one that
-  no fax carrier survives. The runner then injects an answer tone from the
-  wire. The tone sets the modem media policy on the stream that the call
-  already runs, and applies no fax profile.
+  no fax carrier survives. The runner then injects a plain answer tone from
+  the wire. The tone sets no media policy on the stream that the call already
+  runs, and applies no fax profile.
 
   This scenario then re-INVITEs with its audio list narrowed to G.711 and
   `sendrecv`. A fax gateway sends this offer when it switches its own media,
@@ -123,8 +123,8 @@
   <!-- The window the runner injects the remote answer tone in. The hint the
        DUT records lives for 10 s (call.h CALL_FAX_HINT_WINDOW_MS), so five
        seconds leaves the offer below comfortably inside it while giving the
-       runner room to read the stub dump back and prove the tone armed the
-       modem kind with no fax profile behind it. -->
+       runner room to read the stub dump back and prove the tone armed no
+       kind and no fax profile. -->
   <pause milliseconds="5000"/>
 
   <!-- The far end's own upspeed: the audio list narrowed to G.711, comfort

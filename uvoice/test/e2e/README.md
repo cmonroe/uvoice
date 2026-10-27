@@ -26,11 +26,11 @@ The runner covers these flows:
 | `uas_cfu_redirect` | Set local unconditional call forwarding and offer a call. Require a 302 that carries the configured target, while line 0 never rings. (note) |
 | `uas_fax_upspeed` | Drive the fax answer tone trigger on a call committed to G.729. Require a G.711-only upspeed re-INVITE, with the passthrough profile on stream 0. (note) |
 | `uas_fax_upspeed_auth` | Same trigger, against a peer that answers the upspeed re-INVITE 401. Require a credential retry inside one second of the 401. The flow runs by name, outside the default set. (note) |
-| `uas_far_fax_upspeed` | Calling side of that call. Report an answer tone from the wire, and require that it sets the modem kind and applies no profile. Then send a G.711-only re-INVITE. The DUT must follow it into fax passthrough with no offer of its own, and `fax_switched` stays false. |
+| `uas_far_fax_upspeed` | Calling side of that call. Report a plain answer tone from the wire, and require that it sets no kind and applies no profile. Then send a G.711-only re-INVITE. The DUT must follow it into fax passthrough with no offer of its own, and `fax_switched` stays false. |
 | `uas_far_fax_upspeed_g729` | Same scenario, against a channel with G.729 alone, which shares no codec with that offer. Require the DUT to answer with fallback G.711 and to convert its DSP on that codec, not to refuse with 488. |
-| `uas_far_fax_tone_g711` | Calling side with no upspeed behind the tone. Answer with PCMU and telephone-event, report an answer tone from the wire, and require the modem kind alone on the committed codec. The scenario holds a 16 s quiet window, sized for `uas_far_fax_tone_false` too. (note) |
+| `uas_far_fax_tone_g711` | Calling side with no upspeed behind the tone. Answer with PCMU and telephone-event. Report a plain answer tone from the wire and require no kind. Then report a V.21 preamble from the wire, and require the fax kind alone on the committed codec. The scenario holds a 16 s quiet window, sized for `uas_far_fax_tone_false` too. (note) |
 | `uas_fax_upspeed_false` | Answering side, with a false answer tone. Convert on a local CED, then report that tone's end row with a 900 ms reading. Require the leg back on voice after its deferral. (note) |
-| `uas_far_fax_tone_false` | Calling side of that rule, on the `uas_far_fax_tone_g711` scenario. Set the modem kind from a CED on the wire, then report its end row at 900 ms, and require the leg back on voice. (note) |
+| `uas_far_fax_tone_false` | Calling side of that rule, on the `uas_far_fax_tone_g711` scenario. Report a CED on the wire, which sets no kind, then its end row at 900 ms. Require one disabler release, and no kind from a preamble behind the exit. (note) |
 | `uac_t38_offer` | Answer an inbound G.729 call, convert it to passthrough, and report a V.21 preamble toward the phone. Require a T.38 upgrade on the wire, on stream 0, in `voice status` and in its call record. (note) |
 | `uac_t38_reject` | Same call, with its image offer answered 488. Require G.711 failover: passthrough profile on stream 0 and a G.711 offer behind it. No second image session follows, and its call record names G.711. (note) |
 | `srtp-outbound` | Place an outbound call with `srtp_enabled` 1, and require an SDES exchange and a keyed stream. The offer carries two crypto attributes, and the answer mirrors one. Require suite and both key digests on stream 0, and a zeroize at the stop. (note) |
@@ -221,20 +221,22 @@ Notes:
   CSeq number.
 - **`uas_far_fax_tone_g711`.** `far_fax_tone_run`, scenario
   `uas_far_fax_tone_g711.xml`. Stream 0 keeps PCMU and takes no fax profile.
-  `voice status` reads `passthrough` with `fax_kind` `modem` and neither
-  latch, and the jitter buffer row reads `fixed`. An in-dialog INVITE from
-  the DUT fails the scenario. The runner measures quiet from the stub sample
-  that confirms the kind to the scenario's BYE, and fails a flow with less
-  than 8 s.
+  The plain tone leaves `passthrough` 0, and the V.21 preamble behind it sets
+  `passthrough` 2. `voice status` reads `passthrough` with `fax_kind` `fax`
+  and neither latch, and the jitter buffer row reads `fixed`. An in-dialog
+  INVITE from the DUT fails the scenario. The runner measures quiet from the
+  stub sample that confirms the kind to the scenario's BYE, and fails a flow
+  with less than 8 s.
 - **`uas_fax_upspeed_false`.** Stream 0 carries no kind, `voice status` drops
   the `fax` word, and the stub line reads `latch_clears` 1. A second CED runs
   a second upspeed, which only a reset `fax_switched` permits.
 - **`uas_far_fax_tone_false`.** `far_fax_tone_false_run`, scenario
   `uas_far_fax_tone_g711.xml`. A return to voice puts nothing on the wire, so
   this flow's wire equals that of `uas_far_fax_tone_g711`. Stream 0 keeps PCMU
-  with no kind, the jitter buffer row reads `adaptive` again, and
-  `latch_clears` is 1. An in-dialog INVITE from the DUT at any point fails
-  the scenario. The 8 s quiet rule of `uas_far_fax_tone_g711` applies.
+  with no kind, the jitter buffer row reads `adaptive`, and `latch_clears`
+  is 1. A V.21 preamble behind the exit sets no kind. An in-dialog INVITE
+  from the DUT at any point fails the scenario. The 8 s quiet rule of
+  `uas_far_fax_tone_g711` applies.
 - **`uac_t38_offer`.** `t38_run` enables `fax_t38_enable` and connects the
   call on G.729 through `t38_call_connect`, which also builds the passthrough
   that the upgrade needs:

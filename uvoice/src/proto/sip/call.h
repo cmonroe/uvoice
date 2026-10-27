@@ -645,7 +645,9 @@ bool call_fax_start(unsigned int line, unsigned int slot);
 
 /*
  * Record a remote answer-family tone for the G.711 upspeed recognizer.
- * sip/line.c separately arms the modem kind without a profile or an offer.
+ * sip/line.c separately arms the modem kind for every answer tone except the
+ * plain one, without a profile or an offer. The plain tone (CED) arms no
+ * kind: call_fax_ced_proof() arms the kind of the row behind it.
  * The hint and a G.711-only offer within CALL_FAX_HINT_WINDOW_MS permit the
  * profile and codec clamp; neither signal alone identifies that offer.
  * A slot with no leg records nothing.
@@ -675,7 +677,8 @@ bool call_fax_hint_stamp_set(unsigned int line, unsigned int slot, uint32_t stam
 /*
  * Set the media policy on the leg's current codec without a profile or offer.
  * The modem kind needs only a leg. The fax kind needs an existing kind or
- * profile, because a preamble alone must not start passthrough.
+ * profile, because a preamble alone must not start passthrough. A plain
+ * answer tone from the wire takes its kind through call_fax_ced_proof().
  * The modem kind never replaces the fax kind: a preamble supplies stronger
  * evidence than a repeated answer tone.
  *
@@ -701,16 +704,17 @@ bool call_fax_kind_set(unsigned int line, unsigned int slot, uint8_t kind);
 uint8_t call_fax_kind_get(unsigned int line, unsigned int slot);
 
 /*
- * How long a plain answer tone must last before the leg keeps its kind for
- * good. A fax CED runs 2.6 to 4.0 s (ITU-T T.30 4.1.1) and a plain V.25
- * answering tone runs 3.3 +- 0.7 s (ITU-T V.25 2.2), so 2000 ms sits 600 ms
- * under the floor of both.
- *
- * A shorter tone is not proof of a false one. A calling station response
- * truncates a plain V.25 answering tone, which can then end about 0.6 s after
- * it starts (ITU-T V.25 3.9 and 4.3). Such a leg returns to voice unless a
- * carrier follows inside the deferral below.
+ * Arm the kind that a row behind a plain answer tone from the wire proves: a
+ * V.21 preamble the fax kind, a modem carrier the modem kind, from either feed.
+ * The leg must hold the tone as its candidate inside CALL_FAX_HINT_WINDOW_MS
+ * and carry nothing else. False for no leg, no such tone or a refused
+ * description.
  */
+bool call_fax_ced_proof(unsigned int line, unsigned int slot, uint16_t code);
+
+/* How long a plain answer tone must last before the return to voice leaves the
+ * leg as it is: 600 ms under both the 2.6 s floor of a fax CED (T.30 4.1.1) and
+ * that of a V.25 answering tone, 3.3 +- 0.7 s (V.25 2.2). */
 #define CALL_FAX_TONE_MIN_MS	2000
 
 /*
@@ -747,8 +751,10 @@ enum call_fax_tone {
  * A start row on a leg that carries no kind records the arming candidate, its
  * code and its feed, and clears the running total. A start row on a leg that
  * carries a kind counts evidence for the answer family, the V.21 preamble and
- * a modem carrier: each of them says the tone was real. An end row of the
- * arming tone, on the same feed, adds duration_ms to the total.
+ * a modem carrier: each of them says the tone is real. A leg that waits on a
+ * plain answer tone from the wire (call_fax_ced_proof) counts evidence the
+ * same way. An end row of the arming tone, on the same feed, adds duration_ms
+ * to the total.
  *
  * A slot with no leg records nothing and answers by the edge alone.
  */
@@ -778,10 +784,14 @@ uint32_t call_leg_handle_get(unsigned int line, unsigned int ui_slot);
  * and the answer-tone stamp, programs the committed description and puts the
  * leg's codec list back the way loc_g711_clamp() found it.
  *
- * False for a handle that names no live leg, for a leg with no kind, for an
- * arming tone that is not the plain one, for a tone that ran long enough, for
- * evidence that stands, and for a description the stream refused. A refused
- * description leaves every fax field as it was.
+ * A plain tone from the wire that armed no kind (call_fax_ced_proof) takes
+ * the same rule. Its exit clears the latch and the stamp and answers true.
+ * It programs nothing, because the stream already runs the voice description.
+ *
+ * False for a handle that names no live leg, for a leg with no kind and no
+ * such tone, for an arming tone that is not the plain one, for a tone that
+ * ran long enough, for evidence that stands, and for a description the stream
+ * refused. A refused description leaves every fax field unchanged.
  *
  * An exchange of the leg's own defers the second half: the fax fields go at
  * once, the codec list waits, because the answer of an outstanding upspeed

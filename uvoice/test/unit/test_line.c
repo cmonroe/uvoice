@@ -1103,6 +1103,9 @@ enum cop_kind {
 	/* the kind of a passthrough the preamble named: val is the enum
 	 * hal_passthrough the shell asked for */
 	C_FAX_KIND,
+	/* the row behind a plain answer tone from the wire that asks the leg
+	 * for the kind it proves: val is the tone code */
+	C_FAX_PROOF,
 	/* one tone row against the return-to-voice rule: val is the tone code,
 	 * duration_ms its reading, slot the leg and measured the end edge */
 	C_FAX_TONE_NOTE,
@@ -1758,6 +1761,32 @@ bool call_fax_kind_set(unsigned int line, unsigned int slot, uint8_t kind)
 }
 
 /*
+ * The proof of a plain answer tone from the wire (call.h call_fax_ced_proof).
+ * The recorder keeps the leg's rule in its shortest form: a CED start row from
+ * the wire on a leg with no kind opens the wait (call_fax_tone_note below),
+ * and the proof arms the kind its row names on such a leg alone.
+ * fax_proof_refuse stands for a description the stream refused.
+ */
+static bool fax_ced_wait;
+static bool fax_proof_refuse;
+
+bool call_fax_ced_proof(unsigned int line, unsigned int slot, uint16_t code)
+{
+	struct cop *c = cop_add(C_FAX_PROOF, line);
+
+	c->slot = slot;
+	c->val = code;
+	if (fax_proof_refuse || !fax_ced_wait ||
+	    fax_kind_answer != HAL_PASSTHROUGH_OFF)
+		return false;
+
+	fax_kind_answer = code == HAL_TONE_DET_MODEM ? HAL_PASSTHROUGH_MODEM :
+						     HAL_PASSTHROUGH_FAX;
+
+	return true;
+}
+
+/*
  * The return-to-voice rule of the leg layer (call.h call_fax_tone_note,
  * call_fax_exit). The shell owns the deferral and the leg owns the rule, so
  * the recorder answers what a case scripts and keeps every argument: the two
@@ -1791,6 +1820,10 @@ enum call_fax_tone call_fax_tone_note(unsigned int line, unsigned int slot,
 	c->dir = direction;
 	c->end = end;
 	c->duration_ms = duration_ms;
+	if (!end && code == HAL_TONE_DET_CED &&
+	    direction == HAL_TONE_DIR_REMOTE &&
+	    fax_kind_answer == HAL_PASSTHROUGH_OFF)
+		fax_ced_wait = true;
 
 	return end ? fax_tone_answer : CALL_FAX_TONE_NOTED;
 }
@@ -2522,6 +2555,8 @@ static void fixture_start(void)
 	fax_kind_refuse = false;
 	fax_on_answer = false;
 	fax_kind_answer = HAL_PASSTHROUGH_OFF;
+	fax_ced_wait = false;
+	fax_proof_refuse = false;
 	fax_tone_answer = CALL_FAX_TONE_END;
 	fax_exit_answer = false;
 	leg_gen_answer = 1;
@@ -10843,7 +10878,12 @@ static void t_fax(void)
 	inject_tone(0, HAL_TONE_DET_CED, HAL_TONE_DIR_LOCAL, 0);
 	CHECK_UINT(cop_count(C_FAX), 1);
 
-	CASE("a CED from the wire arms MODEM without a local upspeed");
+	/*
+	 * The plain tone from the wire arms no kind. A kind on the description
+	 * outranks the DSP's disabler, and G.168 Test 10A wants the canceller
+	 * on through the tone, so the leg waits for the row that proves it.
+	 */
+	CASE("a CED from the wire arms no kind and starts no upspeed");
 	cfg_default();
 	snprintf(cfg.channel[0].digit_map, sizeof(cfg.channel[0].digit_map), "5");
 	fixture_start();
@@ -10852,19 +10892,16 @@ static void t_fax(void)
 	cops_reset();
 	inject_tone(0, HAL_TONE_DET_CED, HAL_TONE_DIR_REMOTE, 0);
 	CHECK_UINT(cop_count(C_FAX), 0);
+	CHECK_UINT(cop_count(C_FAX_KIND), 0);
+	CHECK_UINT(cop_count(C_FAX_PROOF), 0);
+	CHECK_UINT(fax_kind_answer, HAL_PASSTHROUGH_OFF);
 
-	CHECK_UINT(cop_count(C_FAX_KIND), 1);
-	CHECK_UINT(cop_find(C_FAX_KIND)->line, 0);
-	CHECK_UINT(cop_find(C_FAX_KIND)->slot, 0);
-	CHECK_UINT(cop_find(C_FAX_KIND)->val, HAL_PASSTHROUGH_MODEM);
-
-	CASE("and it records the hint before the kind for a later upspeed");
+	CASE("and it records the hint for a later upspeed");
 	CHECK_UINT(cop_count(C_FAX_HINT), 1);
 	CHECK_UINT(cop_find(C_FAX_HINT)->line, 0);
 	CHECK_UINT(cop_find(C_FAX_HINT)->slot, 0);
-	CHECK(cop_index(C_FAX_HINT) < cop_index(C_FAX_KIND));
 
-	CASE("and every member of the answer tone family records one");
+	CASE("and every other member of the answer tone family records one");
 	cops_reset();
 	inject_tone(0, HAL_TONE_DET_ANS, HAL_TONE_DIR_REMOTE, 0);
 	inject_tone(0, HAL_TONE_DET_ANSAM, HAL_TONE_DIR_REMOTE, 0);
@@ -10872,6 +10909,38 @@ static void t_fax(void)
 	CHECK_UINT(cop_count(C_FAX_HINT), 3);
 	CHECK_UINT(cop_count(C_FAX_KIND), 3);
 	CHECK_UINT(cop_find(C_FAX_KIND)->val, HAL_PASSTHROUGH_MODEM);
+	CHECK_UINT(cop_count(C_FAX), 0);
+
+	/* the phase reversals and the amplitude modulation say a data modem
+	 * answered, so their kind does not wait for a later row */
+	CASE("an ANSbar from the wire arms MODEM at once, behind the hint");
+	cfg_default();
+	snprintf(cfg.channel[0].digit_map,
+		 sizeof(cfg.channel[0].digit_map), "5");
+	fixture_start();
+	region_ready();
+	fax_connect(0);
+	cops_reset();
+	inject_tone(0, HAL_TONE_DET_ANSBAR, HAL_TONE_DIR_REMOTE, 0);
+	CHECK_UINT(cop_count(C_FAX_KIND), 1);
+	CHECK_UINT(cop_find(C_FAX_KIND)->slot, 0);
+	CHECK_UINT(cop_find(C_FAX_KIND)->val, HAL_PASSTHROUGH_MODEM);
+	CHECK_UINT(cop_count(C_FAX_HINT), 1);
+	CHECK(cop_index(C_FAX_HINT) < cop_index(C_FAX_KIND));
+	CHECK_UINT(cop_count(C_FAX), 0);
+
+	CASE("an ANSam from the wire arms MODEM at once as well");
+	cfg_default();
+	snprintf(cfg.channel[0].digit_map,
+		 sizeof(cfg.channel[0].digit_map), "5");
+	fixture_start();
+	region_ready();
+	fax_connect(0);
+	cops_reset();
+	inject_tone(0, HAL_TONE_DET_ANSAM, HAL_TONE_DIR_REMOTE, 0);
+	CHECK_UINT(cop_count(C_FAX_KIND), 1);
+	CHECK_UINT(cop_find(C_FAX_KIND)->val, HAL_PASSTHROUGH_MODEM);
+	CHECK_UINT(cop_count(C_FAX_HINT), 1);
 	CHECK_UINT(cop_count(C_FAX), 0);
 
 	/* the calling terminal's own tone says nothing about the far end, and
@@ -11471,9 +11540,11 @@ static void t_t38(void)
 	CHECK(!v.fax_switched_set);
 	CHECK(!v.t38_switched_set);
 
+	/* an ANSam from the wire gives the kind-only leg: the plain tone arms
+	 * no kind of its own (t_fax_ced_proof) */
 	CASE("a kind-only preamble selects FAX with T.38 enabled");
 	t38_line_connect();
-	inject_tone(0, HAL_TONE_DET_CED, HAL_TONE_DIR_REMOTE, 0);
+	inject_tone(0, HAL_TONE_DET_ANSAM, HAL_TONE_DIR_REMOTE, 0);
 	CHECK_UINT(call_fax_kind_get(0, 0), HAL_PASSTHROUGH_MODEM);
 	CHECK(!fax_on_answer);
 	cops_reset();
@@ -11489,7 +11560,7 @@ static void t_t38(void)
 
 	CASE("a kind-only preamble selects FAX with T.38 disabled");
 	fax_line_connect(false);
-	inject_tone(0, HAL_TONE_DET_CED, HAL_TONE_DIR_REMOTE, 0);
+	inject_tone(0, HAL_TONE_DET_ANSAM, HAL_TONE_DIR_REMOTE, 0);
 	CHECK_UINT(call_fax_kind_get(0, 0), HAL_PASSTHROUGH_MODEM);
 	CHECK(!fax_on_answer);
 	cops_reset();
@@ -11654,7 +11725,7 @@ static void t_fax_exit(void)
 	CHECK_UINT(cop_find(C_FAX_TONE_NOTE)->dir, HAL_TONE_DIR_REMOTE);
 	CHECK(!cop_find(C_FAX_TONE_NOTE)->end);
 	CHECK(cop_index(C_FAX_TONE_NOTE) < cop_index(C_FAX_HINT));
-	CHECK(cop_index(C_FAX_TONE_NOTE) < cop_index(C_FAX_KIND));
+	CHECK_UINT(cop_count(C_FAX_KIND), 0);
 
 	CASE("and a CNG the gates drop is recorded all the same");
 	cops_reset();
@@ -11672,7 +11743,7 @@ static void t_fax_exit(void)
 	fax_exit_arm_line(0, HAL_TONE_DIR_REMOTE, 900);
 	CHECK_UINT(cop_count(C_FAX_TONE_NOTE), 2);
 	CHECK_UINT(cop_count(C_FAX_HINT), 1);
-	CHECK_UINT(cop_count(C_FAX_KIND), 1);
+	CHECK_UINT(cop_count(C_FAX_KIND), 0);
 	CHECK_UINT(cop_count(C_FAX), 0);
 	CHECK_UINT(cops[ncops - 2].duration_ms, 900);
 	CHECK(cops[ncops - 2].end);
@@ -11898,6 +11969,155 @@ static void t_fax_exit(void)
 	region_ready();
 	uloop_pump(FAX_EXIT_EARLY_MS + FAX_EXIT_LATE_MS);
 	CHECK_UINT(cop_count(C_FAX_EXIT), 0);
+}
+
+/*
+ * A row that proves a plain answer tone from the wire (call.h
+ * call_fax_ced_proof). That tone arms no kind. A V.21 preamble or a modem
+ * carrier from either feed asks its leg for the kind it proves, ahead of the
+ * T.38 gates. The leg owns the rule. These cases check what the shell asks
+ * for, in which order, and what its T.38 gates read next.
+ */
+static void t_fax_ced_proof(void)
+{
+	struct line_view v;
+
+	CASE("a V.21 preamble from the wire behind a remote CED arms FAX");
+	fax_exit_line_up();
+	inject_tone(0, HAL_TONE_DET_CED, HAL_TONE_DIR_REMOTE, 0);
+	cops_reset();
+	inject_tone(0, HAL_TONE_DET_V21_PREAMBLE, HAL_TONE_DIR_REMOTE, 0);
+	CHECK_UINT(cop_count(C_FAX_PROOF), 1);
+	CHECK_UINT(cop_find(C_FAX_PROOF)->line, 0);
+	CHECK_UINT(cop_find(C_FAX_PROOF)->slot, 0);
+	CHECK_UINT(cop_find(C_FAX_PROOF)->val, HAL_TONE_DET_V21_PREAMBLE);
+	CHECK_UINT(fax_kind_answer, HAL_PASSTHROUGH_FAX);
+	CHECK_UINT(cop_count(C_FAX), 0);
+	CHECK_UINT(cop_count(C_T38), 0);
+	CHECK(state_is(0, "CONNECTED"));
+
+	CASE("and the rule hears that row before the proof");
+	CHECK(cop_index(C_FAX_TONE_NOTE) < cop_index(C_FAX_PROOF));
+
+	/* the far end owns the T.38 switch of a call it answered, so the gates
+	 * behind the proof take the kind it armed and offer nothing */
+	CASE("a preamble from the phone behind it arms FAX and offers no T.38");
+	t38_line_connect();
+	inject_tone(0, HAL_TONE_DET_CED, HAL_TONE_DIR_REMOTE, 0);
+	cops_reset();
+	inject_tone(0, HAL_TONE_DET_V21_PREAMBLE, HAL_TONE_DIR_LOCAL, 0);
+	CHECK_UINT(cop_count(C_FAX_PROOF), 1);
+	CHECK_UINT(fax_kind_answer, HAL_PASSTHROUGH_FAX);
+	CHECK_UINT(cop_count(C_FAX_KIND), 1);
+	CHECK_UINT(cop_find(C_FAX_KIND)->val, HAL_PASSTHROUGH_FAX);
+	CHECK(cop_index(C_FAX_PROOF) < cop_index(C_FAX_KIND));
+	CHECK_UINT(cop_count(C_T38), 0);
+	CHECK_UINT(cop_count(C_FAX), 0);
+	view_get(0, &v);
+	CHECK(!v.fax_switched_set);
+	CHECK(!v.t38_switched_set);
+
+	/* ITU-T V.25: the answering modem's carrier follows its tone within
+	 * about 1 s, and the detector classifies it behind 1010 ms */
+	CASE("a modem carrier from the wire behind a remote CED arms MODEM");
+	fax_exit_line_up();
+	inject_tone(0, HAL_TONE_DET_CED, HAL_TONE_DIR_REMOTE, 0);
+	cops_reset();
+	inject_tone(0, HAL_TONE_DET_MODEM, HAL_TONE_DIR_REMOTE, 0);
+	CHECK_UINT(cop_count(C_FAX_PROOF), 1);
+	CHECK_UINT(cop_find(C_FAX_PROOF)->val, HAL_TONE_DET_MODEM);
+	CHECK_UINT(fax_kind_answer, HAL_PASSTHROUGH_MODEM);
+	CHECK_UINT(cop_count(C_FAX_KIND), 0);
+	CHECK_UINT(cop_count(C_FAX), 0);
+
+	CASE("a carrier from the phone asks for that kind too");
+	fax_exit_line_up();
+	inject_tone(0, HAL_TONE_DET_CED, HAL_TONE_DIR_REMOTE, 0);
+	cops_reset();
+	inject_tone(0, HAL_TONE_DET_MODEM, HAL_TONE_DIR_LOCAL, 0);
+	CHECK_UINT(cop_count(C_FAX_PROOF), 1);
+	CHECK_UINT(cop_find(C_FAX_PROOF)->val, HAL_TONE_DET_MODEM);
+	CHECK_UINT(fax_kind_answer, HAL_PASSTHROUGH_MODEM);
+
+	CASE("two traces name the tone, row, feed and kind");
+	fax_exit_line_up();
+	trace_domain_set(TRACE_HOOK, true);
+	trace_domain_set(TRACE_FSM, true);
+	warn_capture_begin();
+	inject_tone(0, HAL_TONE_DET_CED, HAL_TONE_DIR_REMOTE, 0);
+	inject_tone(0, HAL_TONE_DET_MODEM, HAL_TONE_DIR_REMOTE, 0);
+	CHECK_UINT(warn_capture_count("line 0 fax tone CED from the wire: no "
+				      "kind before a V.21 preamble or a modem "
+				      "carrier, no offer"), 1);
+	CHECK_UINT(warn_capture_count("line 0 slot 0 MODEM from the wire after "
+				      "the plain answer tone: the modem kind "
+				      "reached the leg"), 1);
+	warn_capture_end();
+	trace_domain_set(TRACE_FSM, false);
+	trace_domain_set(TRACE_HOOK, false);
+
+	CASE("a CNG behind the CED asks for no proof");
+	fax_exit_line_up();
+	inject_tone(0, HAL_TONE_DET_CED, HAL_TONE_DIR_REMOTE, 0);
+	cops_reset();
+	inject_tone(0, HAL_TONE_DET_CNG, HAL_TONE_DIR_REMOTE, 0);
+	CHECK_UINT(cop_count(C_FAX_PROOF), 0);
+	CHECK_UINT(fax_kind_answer, HAL_PASSTHROUGH_OFF);
+
+	/* the leg layer refuses a leg with no such tone; the shell still asks,
+	 * because the rule is the leg's */
+	CASE("a preamble with no tone before it asks and arms nothing");
+	fax_exit_line_up();
+	cops_reset();
+	inject_tone(0, HAL_TONE_DET_V21_PREAMBLE, HAL_TONE_DIR_REMOTE, 0);
+	CHECK_UINT(cop_count(C_FAX_PROOF), 1);
+	CHECK_UINT(fax_kind_answer, HAL_PASSTHROUGH_OFF);
+	CHECK_UINT(cop_count(C_FAX_KIND), 0);
+
+	CASE("a refused proof only costs the kind");
+	fax_exit_line_up();
+	inject_tone(0, HAL_TONE_DET_CED, HAL_TONE_DIR_REMOTE, 0);
+	fax_proof_refuse = true;
+	cops_reset();
+	inject_tone(0, HAL_TONE_DET_V21_PREAMBLE, HAL_TONE_DIR_REMOTE, 0);
+	CHECK_UINT(cop_count(C_FAX_PROOF), 1);
+	CHECK_UINT(fax_kind_answer, HAL_PASSTHROUGH_OFF);
+	CHECK(state_is(0, "CONNECTED"));
+	fax_proof_refuse = false;
+
+	/*
+	 * A local carrier that started before the remote CED and ends inside
+	 * its deferral. An end row counts no evidence and cancels no deferral,
+	 * so the exit that follows would clear a kind armed on it.
+	 */
+	CASE("a carrier end row inside the deferral asks for no proof");
+	fax_exit_line_up();
+	inject_tone(0, HAL_TONE_DET_MODEM, HAL_TONE_DIR_LOCAL, 0);
+	fax_exit_arm_line(0, HAL_TONE_DIR_REMOTE, 900);
+	fax_tone_answer = CALL_FAX_TONE_END;
+	cops_reset();
+	inject_tone_ms(0, HAL_TONE_DET_MODEM, HAL_TONE_DIR_LOCAL, 1, 2400);
+	CHECK_UINT(cop_count(C_FAX_PROOF), 0);
+	CHECK_UINT(fax_kind_answer, HAL_PASSTHROUGH_OFF);
+
+	CASE("and the return to voice behind it still runs");
+	fax_exit_answer = true;
+	uloop_pump(FAX_EXIT_EARLY_MS + FAX_EXIT_LATE_MS);
+	CHECK_UINT(cop_count(C_FAX_EXIT), 1);
+
+	CASE("a call that is not answered yet asks for no proof");
+	cfg_default();
+	snprintf(cfg.channel[0].digit_map,
+		 sizeof(cfg.channel[0].digit_map), "5");
+	fixture_start();
+	region_ready();
+	inject_hook(0, HAL_HOOK_SEIZE, 0);
+	inject_digit(0, '5', false);
+	CHECK(state_is(0, "CALLING"));
+	cops_reset();
+	inject_tone(0, HAL_TONE_DET_V21_PREAMBLE, HAL_TONE_DIR_REMOTE, 0);
+	inject_tone(0, HAL_TONE_DET_MODEM, HAL_TONE_DIR_REMOTE, 0);
+	CHECK_UINT(cop_count(C_FAX_PROOF), 0);
 }
 
 static void t_media_ops(void)
@@ -18277,6 +18497,7 @@ int main(void)
 	t_fax();
 	t_t38();
 	t_fax_exit();
+	t_fax_ced_proof();
 	t_flash_relay();
 	t_recall();
 	t_call_waiting();

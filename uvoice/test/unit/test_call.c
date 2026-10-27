@@ -15231,10 +15231,11 @@ static void test_fax_follow(void)
 /* ------------------------------------ the return to voice of a false tone */
 
 /*
- * The leg a plain answer tone armed: the tone row the rule counts, then the
- * modem kind the shell sets behind it. The two are separate entries and the
- * shell calls them in this order, so the arming candidate is recorded on a
- * leg that still carries nothing.
+ * A kind-only leg whose arming candidate is the tone the case names: the tone
+ * row the rule counts, then the modem kind. The candidate is recorded on a
+ * leg that still carries nothing. The shell arms no kind on a plain tone from
+ * the wire (test_fax_wire_ced below), so these cases read the rule of a leg
+ * that carries a kind, whatever armed it.
  */
 static void exit_tone_arm(uint16_t code, uint8_t dir)
 {
@@ -16061,6 +16062,8 @@ static void test_fax_exit(void)
 	CHECK_UINT(med.last.passthrough, HAL_PASSTHROUGH_OFF);
 	med.latch_ret = HAL_OK;
 
+	/* no stamp stands, so the tone is no plain tone from the wire that
+	 * waits for its proof (call.h call_fax_ced_proof) */
 	CASE("exit: a leg that never carried a kind answers false");
 	fx_reset();
 	uac_up_codec("18 101", NULL);
@@ -16153,6 +16156,308 @@ static void test_fax_exit(void)
 	CHECK_UINT(med.fax_calls, 2);
 	CHECK(call_fax_on(0, 0));
 	CHECK_UINT(med.latch_clears, 1);
+}
+
+/* ------------------------------- the plain answer tone from the wire */
+
+/* a G.729 call: no fax carrier survives the codec, so a kind shows */
+static void wire_ced_call_up(void)
+{
+	fx_reset();
+	uac_up_codec("18 101", NULL);
+}
+
+/*
+ * A plain answer tone from the wire, in the order the shell drives it: the
+ * tone row the return-to-voice rule counts, then the stamp. The shell arms no
+ * kind on this tone (sip/line.c tone_event).
+ */
+static void wire_ced_tone(void)
+{
+	CHECK_UINT(call_fax_tone_note(0, 0, HAL_TONE_DET_CED,
+				      HAL_TONE_DIR_REMOTE, false, 0),
+		   CALL_FAX_TONE_NOTED);
+	call_fax_hint(0, 0);
+}
+
+/* one start row behind it, the way the shell drives a proof: the rule's note
+ * first, then the proof */
+static bool wire_ced_row(uint16_t code, uint8_t dir)
+{
+	CHECK_UINT(call_fax_tone_note(0, 0, code, dir, false, 0),
+		   CALL_FAX_TONE_NOTED);
+
+	return call_fax_ced_proof(0, 0, code);
+}
+
+/*
+ * A plain answer tone from the wire arms no kind (call.h call_fax_ced_proof).
+ * Its description stays voice, so a backend's canceller adapts on the tone
+ * (ITU-T G.168 Test 10A). A V.21 preamble behind it arms the fax kind, and a
+ * modem carrier arms the modem kind. A short tone that nothing proves takes
+ * the return to voice.
+ */
+static void test_fax_wire_ced(void)
+{
+	unsigned int configs, sends;
+	struct slot_view sv;
+
+	CASE("wire ced: the tone programs no kind on the description");
+	wire_ced_call_up();
+	configs = med.config_calls;
+	sends = fk.sends;
+	wire_ced_tone();
+	CHECK_UINT(med.config_calls, configs);
+	CHECK_UINT(med.last.passthrough, HAL_PASSTHROUGH_OFF);
+	CHECK_UINT(med.last.jb_mode, HAL_JB_ADAPTIVE);
+	CHECK_UINT(med.last.codec, HAL_CODEC_G729);
+	CHECK_UINT(call_fax_kind_get(0, 0), HAL_PASSTHROUGH_OFF);
+
+	CASE("wire ced: and it applies no profile and sends no offer");
+	CHECK_UINT(med.fax_calls, 0);
+	CHECK(!call_fax_on(0, 0));
+	CHECK_UINT(fk.sends, sends);
+	CHECK(slot_view_get(0, 0, &sv));
+	CHECK(!sv.fax[0]);
+	CHECK(!sv.fax_kind[0]);
+
+	CASE("wire ced: a V.21 preamble from the wire behind it arms FAX");
+	configs = med.config_calls;
+	CHECK(wire_ced_row(HAL_TONE_DET_V21_PREAMBLE, HAL_TONE_DIR_REMOTE));
+	CHECK_UINT(med.config_calls, configs + 1);
+	CHECK_UINT(med.last.passthrough, HAL_PASSTHROUGH_FAX);
+	CHECK_UINT(med.last.jb_mode, HAL_JB_FIXED);
+	CHECK_UINT(med.last.codec, HAL_CODEC_G729);
+	CHECK_UINT(call_fax_kind_get(0, 0), HAL_PASSTHROUGH_FAX);
+	CHECK_UINT(med.fax_calls, 0);
+	CHECK_UINT(fk.sends, sends);
+	CHECK(slot_view_get(0, 0, &sv));
+	CHECK(!strcmp(sv.fax, "passthrough"));
+	CHECK(!strcmp(sv.fax_kind, "fax"));
+
+	CASE("wire ced: and the proven tone does not return to voice");
+	CHECK_UINT(exit_tone_end(HAL_TONE_DET_CED, HAL_TONE_DIR_REMOTE, 900),
+		   CALL_FAX_TONE_ENDED);
+	CHECK(!call_fax_exit(exit_handle()));
+	CHECK_UINT(call_fax_kind_get(0, 0), HAL_PASSTHROUGH_FAX);
+	CHECK_UINT(med.latch_clears, 0);
+
+	CASE("wire ced: a preamble from the phone arms FAX the same way");
+	wire_ced_call_up();
+	wire_ced_tone();
+	CHECK(wire_ced_row(HAL_TONE_DET_V21_PREAMBLE, HAL_TONE_DIR_LOCAL));
+	CHECK_UINT(med.last.passthrough, HAL_PASSTHROUGH_FAX);
+	CHECK_UINT(call_fax_kind_get(0, 0), HAL_PASSTHROUGH_FAX);
+
+	/* ITU-T V.25: a modem that answers with a plain tone sends its carrier
+	 * within about 1 s, and its kind arms at the classified row */
+	CASE("wire ced: a modem carrier from the wire behind it arms MODEM");
+	wire_ced_call_up();
+	wire_ced_tone();
+	configs = med.config_calls;
+	CHECK(wire_ced_row(HAL_TONE_DET_MODEM, HAL_TONE_DIR_REMOTE));
+	CHECK_UINT(med.config_calls, configs + 1);
+	CHECK_UINT(med.last.passthrough, HAL_PASSTHROUGH_MODEM);
+	CHECK_UINT(med.last.jb_mode, HAL_JB_FIXED);
+	CHECK(!med.last.vad);
+	CHECK(!med.last.cng);
+	CHECK_UINT(call_fax_kind_get(0, 0), HAL_PASSTHROUGH_MODEM);
+	CHECK_UINT(med.fax_calls, 0);
+	CHECK(slot_view_get(0, 0, &sv));
+	CHECK(!strcmp(sv.fax_kind, "modem"));
+
+	CASE("wire ced: a carrier from the phone arms MODEM the same way");
+	wire_ced_call_up();
+	wire_ced_tone();
+	CHECK(wire_ced_row(HAL_TONE_DET_MODEM, HAL_TONE_DIR_LOCAL));
+	CHECK_UINT(med.last.passthrough, HAL_PASSTHROUGH_MODEM);
+
+	CASE("wire ced: the first proof stands, a later row moves nothing");
+	CHECK(!wire_ced_row(HAL_TONE_DET_V21_PREAMBLE, HAL_TONE_DIR_REMOTE));
+	CHECK_UINT(call_fax_kind_get(0, 0), HAL_PASSTHROUGH_MODEM);
+
+	/* --- the return to voice of a tone that nothing proves --- */
+
+	CASE("wire ced: a 900 ms tone with nothing behind it returns to voice");
+	wire_ced_call_up();
+	wire_ced_tone();
+	configs = med.config_calls;
+	CHECK_UINT(exit_tone_end(HAL_TONE_DET_CED, HAL_TONE_DIR_REMOTE, 900),
+		   CALL_FAX_TONE_ENDED);
+	CHECK(call_fax_exit(exit_handle()));
+	CHECK_UINT(med.latch_clears, 1);
+	CHECK_UINT(med.latch_line, 0);
+
+	CASE("wire ced: and the exit programs nothing, the stream is voice");
+	CHECK_UINT(med.config_calls, configs);
+	CHECK_UINT(med.last.passthrough, HAL_PASSTHROUGH_OFF);
+	CHECK_UINT(call_fax_kind_get(0, 0), HAL_PASSTHROUGH_OFF);
+	CHECK(slot_view_get(0, 0, &sv));
+	CHECK(!sv.fax[0]);
+
+	CASE("wire ced: a G.711-only offer behind the exit is not followed");
+	fake_advance(1000);
+	follow_offer("0 101", NULL);
+	CHECK_UINT(med.fax_calls, 0);
+	CHECK_UINT(med.last.passthrough, HAL_PASSTHROUGH_OFF);
+	CHECK(!call_fax_on(0, 0));
+
+	CASE("wire ced: and a preamble behind the exit arms nothing");
+	configs = med.config_calls;
+	CHECK(!wire_ced_row(HAL_TONE_DET_V21_PREAMBLE, HAL_TONE_DIR_REMOTE));
+	CHECK_UINT(med.config_calls, configs);
+	CHECK_UINT(call_fax_kind_get(0, 0), HAL_PASSTHROUGH_OFF);
+
+	/* T.30 4.1.1 and V.25 2.2: a real answer tone runs 2.6 s at least, and
+	 * its proof can follow the end row */
+	CASE("wire ced: a 3500 ms tone keeps its wait for the proof");
+	wire_ced_call_up();
+	wire_ced_tone();
+	CHECK_UINT(exit_tone_end(HAL_TONE_DET_CED, HAL_TONE_DIR_REMOTE, 3500),
+		   CALL_FAX_TONE_ENDED);
+	CHECK(!call_fax_exit(exit_handle()));
+	CHECK_UINT(med.latch_clears, 0);
+	CHECK_UINT(med.last.passthrough, HAL_PASSTHROUGH_OFF);
+	CHECK(wire_ced_row(HAL_TONE_DET_V21_PREAMBLE, HAL_TONE_DIR_REMOTE));
+	CHECK_UINT(med.last.passthrough, HAL_PASSTHROUGH_FAX);
+
+	/*
+	 * A lost packet splits a real tone, and the resumed tone opens with a
+	 * start row: on a waiting leg that row is evidence, not a new
+	 * candidate, so a short second end row cannot take a real tone back to
+	 * voice.
+	 */
+	CASE("wire ced: a resumed tone between two end rows keeps the wait");
+	wire_ced_call_up();
+	wire_ced_tone();
+	CHECK_UINT(exit_tone_end(HAL_TONE_DET_CED, HAL_TONE_DIR_REMOTE, 900),
+		   CALL_FAX_TONE_ENDED);
+	wire_ced_tone();
+	CHECK_UINT(exit_tone_end(HAL_TONE_DET_CED, HAL_TONE_DIR_REMOTE, 600),
+		   CALL_FAX_TONE_ENDED);
+	CHECK(!call_fax_exit(exit_handle()));
+	CHECK_UINT(med.latch_clears, 0);
+	CHECK(wire_ced_row(HAL_TONE_DET_MODEM, HAL_TONE_DIR_REMOTE));
+	CHECK_UINT(med.last.passthrough, HAL_PASSTHROUGH_MODEM);
+
+	CASE("wire ced: the wait ends with the hint window");
+	wire_ced_call_up();
+	wire_ced_tone();
+	CHECK(call_fax_hint_stamp_set(0, 0, uvoice_mono_ms() -
+				      CALL_FAX_HINT_WINDOW_MS - 1000));
+	configs = med.config_calls;
+	CHECK(!wire_ced_row(HAL_TONE_DET_V21_PREAMBLE, HAL_TONE_DIR_REMOTE));
+	CHECK_UINT(med.config_calls, configs);
+	CHECK_UINT(call_fax_kind_get(0, 0), HAL_PASSTHROUGH_OFF);
+
+	/* --- the legs the proof refuses --- */
+
+	CASE("wire ced: a slot with no leg refuses the proof");
+	fx_reset();
+	CHECK(!call_fax_ced_proof(0, 0, HAL_TONE_DET_V21_PREAMBLE));
+	CHECK_UINT(med.config_calls, 0);
+
+	CASE("wire ced: a code that is no preamble or carrier proves nothing");
+	wire_ced_call_up();
+	wire_ced_tone();
+	CHECK(!call_fax_ced_proof(0, 0, HAL_TONE_DET_CNG));
+	CHECK(!call_fax_ced_proof(0, 0, HAL_TONE_DET_CED));
+	CHECK_UINT(call_fax_kind_get(0, 0), HAL_PASSTHROUGH_OFF);
+
+	CASE("wire ced: a phase-reversed tone is not the plain one");
+	wire_ced_call_up();
+	call_fax_tone_note(0, 0, HAL_TONE_DET_ANSBAR, HAL_TONE_DIR_REMOTE,
+			   false, 0);
+	call_fax_hint(0, 0);
+	CHECK(!wire_ced_row(HAL_TONE_DET_V21_PREAMBLE, HAL_TONE_DIR_REMOTE));
+	CHECK_UINT(call_fax_kind_get(0, 0), HAL_PASSTHROUGH_OFF);
+
+	CASE("wire ced: a plain tone from the phone waits for no proof");
+	wire_ced_call_up();
+	call_fax_tone_note(0, 0, HAL_TONE_DET_CED, HAL_TONE_DIR_LOCAL,
+			   false, 0);
+	call_fax_hint(0, 0);
+	CHECK(!wire_ced_row(HAL_TONE_DET_V21_PREAMBLE, HAL_TONE_DIR_REMOTE));
+	CHECK_UINT(call_fax_kind_get(0, 0), HAL_PASSTHROUGH_OFF);
+
+	CASE("wire ced: a refused description leaves the leg waiting");
+	wire_ced_call_up();
+	wire_ced_tone();
+	med.config_ret = HAL_FATAL;
+	configs = med.config_calls;
+	CHECK(!wire_ced_row(HAL_TONE_DET_V21_PREAMBLE, HAL_TONE_DIR_REMOTE));
+	CHECK_UINT(med.config_calls, configs + 1);
+	med.config_ret = HAL_OK;
+	CHECK_UINT(call_fax_kind_get(0, 0), HAL_PASSTHROUGH_OFF);
+
+	CASE("wire ced: and the next preamble arms the kind");
+	CHECK(wire_ced_row(HAL_TONE_DET_V21_PREAMBLE, HAL_TONE_DIR_REMOTE));
+	CHECK_UINT(med.last.passthrough, HAL_PASSTHROUGH_FAX);
+
+	CASE("wire ced: an open exchange records the kind for its answer");
+	wire_ced_call_up();
+	wire_ced_tone();
+	CHECK(call_hold(0, 0));
+	configs = med.config_calls;
+	CHECK(wire_ced_row(HAL_TONE_DET_V21_PREAMBLE, HAL_TONE_DIR_REMOTE));
+	CHECK_UINT(med.config_calls, configs);
+	CHECK_UINT(call_fax_kind_get(0, 0), HAL_PASSTHROUGH_FAX);
+	reply(200, NULL, NULL,
+	      sdp_body(T_PEER, 20000, "18", "a=recvonly\r\n"));
+	CHECK_UINT(med.last.passthrough, HAL_PASSTHROUGH_FAX);
+
+	/* A peer exchange whose ACK description the stream refuses: the record
+	 * follows the applied description, so the leg waits again and the next
+	 * preamble from the wire retries the kind. */
+	CASE("wire ced: a proof under a peer exchange waits for its ACK");
+	wire_ced_call_up();
+	wire_ced_tone();
+	follow_offer("18 101", NULL);
+	CHECK(has(last_text(), "SIP/2.0 200"));
+	configs = med.config_calls;
+	CHECK(wire_ced_row(HAL_TONE_DET_V21_PREAMBLE, HAL_TONE_DIR_REMOTE));
+	CHECK_UINT(med.config_calls, configs);
+	CHECK_UINT(call_fax_kind_get(0, 0), HAL_PASSTHROUGH_FAX);
+
+	CASE("wire ced: a refused ACK description leaves the leg waiting");
+	med.config_ret = HAL_FATAL;
+	rx(uac_in_dialog("ACK", "peer-tag", 1, NULL, NULL));
+	med.config_ret = HAL_OK;
+	CHECK_UINT(med.config_calls, configs + 1);
+	CHECK_UINT(ev.failed, 0);
+	CHECK_UINT(call_fax_kind_get(0, 0), HAL_PASSTHROUGH_OFF);
+	CHECK(slot_view_get(0, 0, &sv));
+	CHECK(!sv.fax[0]);
+
+	CASE("wire ced: and the next preamble from the wire arms the kind");
+	CHECK(wire_ced_row(HAL_TONE_DET_V21_PREAMBLE, HAL_TONE_DIR_REMOTE));
+	CHECK_UINT(med.config_calls, configs + 2);
+	CHECK_UINT(med.last.passthrough, HAL_PASSTHROUGH_FAX);
+	CHECK_UINT(call_fax_kind_get(0, 0), HAL_PASSTHROUGH_FAX);
+
+	/* --- the paths that keep their profile --- */
+
+	CASE("wire ced: a far-end G.711 upspeed behind it applies the profile");
+	wire_ced_call_up();
+	wire_ced_tone();
+	follow_offer("0 101", NULL);
+	CHECK_UINT(med.fax_calls, 1);
+	CHECK(call_fax_on(0, 0));
+	CHECK_UINT(call_fax_kind_get(0, 0), HAL_PASSTHROUGH_MODEM);
+	CHECK_UINT(med.last.passthrough, HAL_PASSTHROUGH_MODEM);
+	CHECK(!call_fax_ced_proof(0, 0, HAL_TONE_DET_V21_PREAMBLE));
+
+	CASE("wire ced: a local CED keeps its profile and its offer");
+	wire_ced_call_up();
+	sends = fk.sends;
+	call_fax_tone_note(0, 0, HAL_TONE_DET_CED, HAL_TONE_DIR_LOCAL,
+			   false, 0);
+	CHECK(call_fax_start(0, 0));
+	CHECK_UINT(med.fax_calls, 1);
+	CHECK(call_fax_on(0, 0));
+	CHECK_UINT(call_fax_kind_get(0, 0), HAL_PASSTHROUGH_MODEM);
+	CHECK_UINT(fk.sends, sends + 1);
+	CHECK(!call_fax_ced_proof(0, 0, HAL_TONE_DET_V21_PREAMBLE));
 }
 
 static void test_line_fax_kind(void)
@@ -20019,6 +20324,7 @@ int main(void)
 	test_fax_follow();
 	test_fax_remote_kind();
 	test_fax_exit();
+	test_fax_wire_ced();
 	test_line_fax_kind();
 	test_t38();
 	test_srtp();

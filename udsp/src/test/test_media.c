@@ -6288,6 +6288,9 @@ static void case_fax(void)
 		ccfg.detect_mask = UDSP_DET_MODEM;
 		ccfg.ec_enable = true;
 		ccfg.ec_tail_ms = 32;
+		/* A plain tone latches only under the full disable option, and
+		 * the case reads the latch beside the freeze. */
+		ccfg.ec_tone_force_disable = true;
 		CHECK(udsp_chan_config(t.s, 0, &ccfg) == UDSP_OK);
 		tm_media(&m, UDSP_SEL_PCMU, 0, 10);
 		tm_stream_config(&t, &w, &m);
@@ -6309,10 +6312,10 @@ static void case_fax(void)
 					   UDSP_TONE_DIR_LOCAL);
 			}
 		}
-		/* The tone from the phone side carries the disabler's fax
-		 * policy as much as one from the wire does. */
+		/* The tone from the phone side takes the option's modem policy
+		 * as much as one from the wire does. */
 		CHECK_UINT(atomic_load(&t.s->chan[0].fax_bypass_kind),
-			   UDSP_PASSTHROUGH_FAX);
+			   UDSP_PASSTHROUGH_MODEM);
 		/* Turning the canceller off is a SYNC-TICK op, and the record
 		 * that eh_lec_state_wait takes describes the last frame the
 		 * filter ran (the case_lec pattern). */
@@ -6369,11 +6372,16 @@ static void case_fax(void)
  * times are the frames this sent: a concealment repeat would move the reversal
  * spacing the ANSBAR classification measures. */
 #define TM_ANS_CUSHION_MS	60u
+/* ITU-T V.8 7.2: ANSam carries a 15 Hz amplitude modulation of 0.2 on the
+ * 2100 Hz tone (the synthesizer of test_fax_det.c). */
+#define TM_ANS_AM_HZ		15.0
+#define TM_ANS_AM_DEPTH		0.2
 
 enum tm_ans_kind {
 	TM_ANS_PLAIN = 0,
 	TM_ANS_REVERSED,
 	TM_ANS_V21,
+	TM_ANS_AM,
 };
 
 /* What the far end carries across the packets of one carrier. */
@@ -6414,11 +6422,33 @@ static void tm_v21_send(struct tm_wire *w, struct tm_ans *a)
 	tm_pcm_send(w, 0, pcm, 80u, false);
 }
 
+/* One 10 ms packet of ANSam. The envelope runs on the frame count, so it
+ * stays continuous across the packets of one carrier. */
+static void tm_ansam_send(struct tm_wire *w, struct tm_ans *a)
+{
+	int16_t pcm[80];
+
+	for (unsigned i = 0; i < 80u; i++) {
+		double t = (a->frames * 80.0 + i) / UDSP_SAMPLE_RATE;
+		double env = 1.0 + TM_ANS_AM_DEPTH *
+				   sin(2.0 * M_PI * TM_ANS_AM_HZ * t);
+
+		pcm[i] = (int16_t)lrint(TM_ANS_AMP * env * sin(a->phase));
+		a->phase += 2.0 * M_PI * TM_ANS_HZ / UDSP_SAMPLE_RATE;
+	}
+	tm_pcm_send(w, 0, pcm, 80u, false);
+}
+
 static void tm_ans_frame_send(struct tm_wire *w, struct tm_ans *a,
 			      enum tm_ans_kind kind)
 {
 	if (kind == TM_ANS_V21) {
 		tm_v21_send(w, a);
+		a->frames++;
+		return;
+	}
+	if (kind == TM_ANS_AM) {
+		tm_ansam_send(w, a);
 		a->frames++;
 		return;
 	}
@@ -6450,11 +6480,14 @@ static void tm_ans_send(struct eh *t, struct tm_wire *w, struct tm_ans *a,
 
 /* A line off hook with the canceller, its processor and the modem detectors
  * armed, and one G.711 stream on it: what every case of the disabler starts
- * from. The tick runs no canceller on an open loop. */
-static bool tm_disable_up(struct eh *t, struct tm_wire *w,
-			  struct udsp_chan_cfg *ccfg, struct udsp_media *m)
+ * from. The tick runs no canceller on an open loop. A rate of 0 is the
+ * narrowband line. */
+static bool tm_disable_up_rate(struct eh *t, struct tm_wire *w,
+			       struct udsp_chan_cfg *ccfg,
+			       struct udsp_media *m, unsigned rate)
 {
-	if (!tm_up(t, "USA") || !tm_wire_open(w, 0) || !eh_hook_seize(t))
+	if (!tm_up_rate(t, "USA", rate) || !tm_wire_open(w, 0) ||
+	    !eh_hook_seize(t))
 		return false;
 
 	memset(ccfg, 0, sizeof(*ccfg));
@@ -6472,9 +6505,123 @@ static bool tm_disable_up(struct eh *t, struct tm_wire *w,
 	return udsp_stream_start(t->s, 0, 0) == UDSP_OK;
 }
 
+static bool tm_disable_up(struct eh *t, struct tm_wire *w,
+			  struct udsp_chan_cfg *ccfg, struct udsp_media *m)
+{
+	return tm_disable_up_rate(t, w, ccfg, m, 0);
+}
+
 static uint8_t tm_latch_kind(struct eh *t)
 {
 	return (uint8_t)atomic_load(&t->s->chan[0].fax_bypass_kind);
+}
+
+/*
+ * A plain answer tone from the wire at both line rates (a 16 kHz line hands its
+ * remote detector a decimated feed, rs_dl). G.168 7.1 and ITU-T V.25 keep a
+ * canceller enabled on a 2100 Hz tone without reversals, so the tone latches no
+ * kind; only the full disable option gives it the modem policy.
+ */
+static void tm_plain_ced_leg(unsigned rate)
+{
+	unsigned khz = (rate ? rate : UDSP_SAMPLE_RATE) / 1000u;
+	struct udsp_chan_cfg ccfg;
+	struct udsp_lec_stats lec;
+	struct udsp_media m;
+	struct tm_ans a;
+	struct tm_wire w;
+	struct eh t;
+	char name[112];
+
+	snprintf(name, sizeof(name),
+		 "a plain answer tone from the wire latches nothing at %u kHz",
+		 khz);
+	CASE(name);
+	{
+		uint32_t frames = 0;
+		uint32_t held = 0;
+
+		if (!tm_disable_up_rate(&t, &w, &ccfg, &m, rate)) {
+			CHECK(false);
+			return;
+		}
+		memset(&a, 0, sizeof(a));
+		eh_wait_ms(&t, 200);
+
+		tm_ans_send(&t, &w, &a, TM_ANS_PLAIN, 1200);
+		{
+			const struct udsp_event *e =
+				tm_tone_find(UDSP_TONE_DET_CED);
+
+			CHECK(e != NULL);
+			if (e)
+				CHECK_UINT(e->u.tone.direction,
+					   UDSP_TONE_DIR_REMOTE);
+		}
+		CHECK_UINT(tm_latch_kind(&t), UDSP_PASSTHROUGH_OFF);
+		/* A policy that never moved is a policy nobody reports. */
+		CHECK_UINT(eh_ev_count(UDSP_EV_LEC_POLICY), 0);
+		CHECK(udsp_line_lec_stats(t.s, 0, &lec) == UDSP_OK);
+		CHECK_UINT(lec.ec_active, 1);
+		CHECK_UINT(lec.nlp_enabled, 1);
+		CHECK_UINT(lec.passthrough, UDSP_PASSTHROUGH_OFF);
+
+		/*
+		 * The tone goes on, and nothing holds the tick. The reference
+		 * stands, and no latch or phone-side carrier holds the filter.
+		 * The bound leaves room for a frame that a late packet
+		 * silenced.
+		 */
+		CHECK(atomic_load(&t.s->lec_ready[0]));
+		frames = lec.frames;
+		held = lec.hold_frames;
+		tm_ans_send(&t, &w, &a, TM_ANS_PLAIN, 600);
+		CHECK(!t.s->chan[0].fax_active);
+		CHECK(udsp_line_lec_stats(t.s, 0, &lec) == UDSP_OK);
+		CHECK(lec.frames > frames + 10u);
+		CHECK(lec.hold_frames - held < (lec.frames - frames) / 2u);
+		CHECK_UINT(lec.nlp_enabled, 1);
+
+		tm_call_down(&t, &w);
+	}
+
+	snprintf(name, sizeof(name),
+		 "the force disable option takes a plain answer tone to a full "
+		 "disable at %u kHz", khz);
+	CASE(name);
+	{
+		if (!tm_disable_up_rate(&t, &w, &ccfg, &m, rate)) {
+			CHECK(false);
+			return;
+		}
+		ccfg.ec_tone_force_disable = true;
+		CHECK(udsp_chan_config(t.s, 0, &ccfg) == UDSP_OK);
+		memset(&a, 0, sizeof(a));
+
+		tm_ans_send(&t, &w, &a, TM_ANS_PLAIN, 1200);
+		CHECK(tm_tone_find(UDSP_TONE_DET_CED) != NULL);
+		CHECK_UINT(tm_latch_kind(&t), UDSP_PASSTHROUGH_MODEM);
+		CHECK(udsp_line_lec_stats(t.s, 0, &lec) == UDSP_OK);
+		CHECK_UINT(lec.ec_active, 0);
+		CHECK_UINT(lec.nlp_enabled, 0);
+		CHECK_UINT(lec.passthrough, UDSP_PASSTHROUGH_MODEM);
+		{
+			const struct udsp_event *e =
+				tm_lec_find(UDSP_LEC_REASON_LATCH);
+
+			CHECK(e != NULL);
+			if (e) {
+				/* The row names the tone that arrived, not the
+				 * policy the option asked for it. */
+				CHECK_UINT(e->u.lec.kind, UDSP_PASSTHROUGH_MODEM);
+				CHECK_UINT(e->u.lec.tone, UDSP_TONE_DET_CED);
+				CHECK_UINT(e->u.lec.direction,
+					   UDSP_TONE_DIR_REMOTE);
+			}
+		}
+
+		tm_call_down(&t, &w);
+	}
 }
 
 /*
@@ -6655,7 +6802,7 @@ static void case_fax_disable(void)
 	{
 		uint32_t frames = 0;
 
-		CASE("a plain answer tone from the wire takes the fax policy");
+		CASE("an ANSam from the wire takes the fax policy");
 		if (!tm_disable_up(&t, &w, &ccfg, &m)) {
 			CHECK(false);
 			return;
@@ -6666,8 +6813,8 @@ static void case_fax_disable(void)
 		CHECK_UINT(lec.nlp_enabled, 1);
 		frames = lec.frames;
 
-		tm_ans_send(&t, &w, &a, TM_ANS_PLAIN, 1200);
-		CHECK(tm_tone_find(UDSP_TONE_DET_CED) != NULL);
+		tm_ans_send(&t, &w, &a, TM_ANS_AM, 1200);
+		CHECK(tm_tone_find(UDSP_TONE_DET_ANSAM) != NULL);
 		CHECK_UINT(tm_latch_kind(&t), UDSP_PASSTHROUGH_FAX);
 		{
 			const struct udsp_event *e =
@@ -6676,15 +6823,14 @@ static void case_fax_disable(void)
 			CHECK(e != NULL);
 			if (e) {
 				CHECK_UINT(e->u.lec.kind, UDSP_PASSTHROUGH_FAX);
-				CHECK_UINT(e->u.lec.tone, UDSP_TONE_DET_CED);
+				CHECK_UINT(e->u.lec.tone, UDSP_TONE_DET_ANSAM);
 				CHECK_UINT(e->u.lec.direction,
 					   UDSP_TONE_DIR_REMOTE);
 			}
 		}
-		/* G.168 7.1 forbids a full disable on a tone with no
-		 * reversals: the canceller stays on the frame and only its
-		 * processor goes off, so the line still answers and the frames
-		 * it ran say the filter kept running. */
+		/* An ANSam carries no reversals, and G.168 7.1 forbids a full
+		 * disable on it: the canceller stays on, only its processor
+		 * goes off, and the frames it ran show the filter running. */
 		CHECK(udsp_line_lec_stats(t.s, 0, &lec) == UDSP_OK);
 		CHECK_UINT(lec.nlp_enabled, 0);
 		CHECK_UINT(lec.ec_active, 1);
@@ -6715,40 +6861,8 @@ static void case_fax_disable(void)
 		tm_call_down(&t, &w);
 	}
 
-	CASE("the force disable option takes a plain answer tone to a full disable");
-	{
-		if (!tm_disable_up(&t, &w, &ccfg, &m)) {
-			CHECK(false);
-			return;
-		}
-		ccfg.ec_tone_force_disable = true;
-		CHECK(udsp_chan_config(t.s, 0, &ccfg) == UDSP_OK);
-		memset(&a, 0, sizeof(a));
-
-		tm_ans_send(&t, &w, &a, TM_ANS_PLAIN, 1200);
-		CHECK(tm_tone_find(UDSP_TONE_DET_CED) != NULL);
-		CHECK_UINT(tm_latch_kind(&t), UDSP_PASSTHROUGH_MODEM);
-		CHECK(udsp_line_lec_stats(t.s, 0, &lec) == UDSP_OK);
-		CHECK_UINT(lec.ec_active, 0);
-		CHECK_UINT(lec.nlp_enabled, 0);
-		CHECK_UINT(lec.passthrough, UDSP_PASSTHROUGH_MODEM);
-		{
-			const struct udsp_event *e =
-				tm_lec_find(UDSP_LEC_REASON_LATCH);
-
-			CHECK(e != NULL);
-			if (e) {
-				/* The row names the tone that arrived, not the
-				 * policy the option asked for it. */
-				CHECK_UINT(e->u.lec.kind, UDSP_PASSTHROUGH_MODEM);
-				CHECK_UINT(e->u.lec.tone, UDSP_TONE_DET_CED);
-				CHECK_UINT(e->u.lec.direction,
-					   UDSP_TONE_DIR_REMOTE);
-			}
-		}
-
-		tm_call_down(&t, &w);
-	}
+	tm_plain_ced_leg(0);
+	tm_plain_ced_leg(UDSP_SAMPLE_RATE_WB);
 
 	CASE("the latch option holds the disabler to the end of the line's streams");
 	{
@@ -6919,7 +7033,57 @@ static void case_fax_disable(void)
 		tm_call_down(&t, &w);
 	}
 
-	CASE("an answer tone from the phone side latches too");
+	/* The G3 handshake behind a plain answer tone, CED then the V.21
+	 * preamble: the tone latches nothing and the preamble moves only a
+	 * standing latch, so canceller and processor stay on (ITU-T V.25). */
+	CASE("a V.21 preamble after a plain answer tone latches nothing");
+	{
+		if (!tm_disable_up(&t, &w, &ccfg, &m)) {
+			CHECK(false);
+			return;
+		}
+		memset(&a, 0, sizeof(a));
+
+		tm_ans_send(&t, &w, &a, TM_ANS_PLAIN, 1200);
+		CHECK(tm_tone_find(UDSP_TONE_DET_CED) != NULL);
+		tm_ans_send(&t, &w, &a, TM_ANS_V21, 1200);
+		CHECK(tm_tone_find(UDSP_TONE_DET_V21_PREAMBLE) != NULL);
+		CHECK_UINT(tm_latch_kind(&t), UDSP_PASSTHROUGH_OFF);
+		CHECK(udsp_line_lec_stats(t.s, 0, &lec) == UDSP_OK);
+		CHECK_UINT(lec.ec_active, 1);
+		CHECK_UINT(lec.nlp_enabled, 1);
+		CHECK_UINT(lec.passthrough, UDSP_PASSTHROUGH_OFF);
+		CHECK_UINT(eh_ev_count(UDSP_EV_LEC_POLICY), 0);
+
+		tm_call_down(&t, &w);
+	}
+
+	CASE("a V.21 preamble after an ANSam keeps the fax policy");
+	{
+		if (!tm_disable_up(&t, &w, &ccfg, &m)) {
+			CHECK(false);
+			return;
+		}
+		memset(&a, 0, sizeof(a));
+
+		tm_ans_send(&t, &w, &a, TM_ANS_AM, 1200);
+		CHECK_UINT(tm_latch_kind(&t), UDSP_PASSTHROUGH_FAX);
+		tm_ans_send(&t, &w, &a, TM_ANS_V21, 1200);
+		CHECK(tm_tone_find(UDSP_TONE_DET_V21_PREAMBLE) != NULL);
+		CHECK_UINT(tm_latch_kind(&t), UDSP_PASSTHROUGH_FAX);
+		CHECK(udsp_line_lec_stats(t.s, 0, &lec) == UDSP_OK);
+		CHECK_UINT(lec.ec_active, 1);
+		CHECK_UINT(lec.nlp_enabled, 0);
+		CHECK_UINT(lec.passthrough, UDSP_PASSTHROUGH_FAX);
+		/* The preamble asked for the kind the latch held, so the latch
+		 * row of the ANSam is the one row of the case. */
+		CHECK_UINT(eh_ev_count(UDSP_EV_LEC_POLICY), 1);
+		CHECK(tm_lec_find(UDSP_LEC_REASON_DEMOTE) == NULL);
+
+		tm_call_down(&t, &w);
+	}
+
+	CASE("a plain answer tone from the phone side latches nothing");
 	{
 		if (!tm_disable_up(&t, &w, &ccfg, &m)) {
 			CHECK(false);
@@ -6936,18 +7100,46 @@ static void case_fax_disable(void)
 				CHECK_UINT(e->u.tone.direction,
 					   UDSP_TONE_DIR_LOCAL);
 		}
-		CHECK_UINT(tm_latch_kind(&t), UDSP_PASSTHROUGH_FAX);
+		CHECK_UINT(tm_latch_kind(&t), UDSP_PASSTHROUGH_OFF);
+		CHECK_UINT(eh_ev_count(UDSP_EV_LEC_POLICY), 0);
 		CHECK(udsp_line_lec_stats(t.s, 0, &lec) == UDSP_OK);
-		CHECK_UINT(lec.nlp_enabled, 0);
 		CHECK_UINT(lec.ec_active, 1);
-		CHECK_UINT(lec.passthrough, UDSP_PASSTHROUGH_FAX);
+		CHECK_UINT(lec.nlp_enabled, 1);
+		CHECK_UINT(lec.passthrough, UDSP_PASSTHROUGH_OFF);
+		/* The carrier freeze is the local detector's own, latch or
+		 * none: a carrier from the phone is a near signal, and the
+		 * filter does not adapt while it sounds. */
+		CHECK(t.s->chan[0].fax_active);
+
+		atomic_store(&tm_be.src, TM_SRC_SILENCE);
+		tm_call_down(&t, &w);
+	}
+
+	CASE("the force disable option latches an answer tone from the phone side");
+	{
+		if (!tm_disable_up(&t, &w, &ccfg, &m)) {
+			CHECK(false);
+			return;
+		}
+		ccfg.ec_tone_force_disable = true;
+		CHECK(udsp_chan_config(t.s, 0, &ccfg) == UDSP_OK);
+		tm_capture_tone(2100u);
+		/* The tone stands well past the 250 ms modem window, and only
+		 * the phone side carries the holding band. */
+		eh_wait_ms(&t, 1500);
+		CHECK(tm_tone_find(UDSP_TONE_DET_CED) != NULL);
+		CHECK_UINT(tm_latch_kind(&t), UDSP_PASSTHROUGH_MODEM);
+		CHECK(udsp_line_lec_stats(t.s, 0, &lec) == UDSP_OK);
+		CHECK_UINT(lec.ec_active, 0);
+		CHECK_UINT(lec.nlp_enabled, 0);
+		CHECK_UINT(lec.passthrough, UDSP_PASSTHROUGH_MODEM);
 		{
 			const struct udsp_event *e =
 				tm_lec_find(UDSP_LEC_REASON_LATCH);
 
 			CHECK(e != NULL);
 			if (e) {
-				CHECK_UINT(e->u.lec.kind, UDSP_PASSTHROUGH_FAX);
+				CHECK_UINT(e->u.lec.kind, UDSP_PASSTHROUGH_MODEM);
 				CHECK_UINT(e->u.lec.tone, UDSP_TONE_DET_CED);
 				/* The one leg whose row names the phone: the
 				 * field tells the two feeds apart or it says
@@ -6959,7 +7151,7 @@ static void case_fax_disable(void)
 
 		/* The release reads the phone side as well as the wire. */
 		atomic_store(&tm_be.src, TM_SRC_SILENCE);
-		eh_wait_ms(&t, 7500);
+		eh_wait_ms(&t, 1000);
 		CHECK_UINT(tm_latch_kind(&t), UDSP_PASSTHROUGH_OFF);
 		CHECK(udsp_line_lec_stats(t.s, 0, &lec) == UDSP_OK);
 		CHECK_UINT(lec.nlp_enabled, 1);
@@ -6976,10 +7168,10 @@ static void case_fax_disable(void)
 	}
 
 	/*
-	 * The freeze the latch carries. A latch is set on a tone alone, so the
-	 * filter must not adapt against it: every frame it runs under one is a
-	 * held frame. The reference and the echo stand for the whole case, so
-	 * the adaptation the disarm gives back is real.
+	 * The freeze that a latch carries: every frame under a latch is held.
+	 * The fax latch of an ANSam lets the filter run, and the reference and
+	 * echo stand throughout. The adaptation that the disarm gives back is
+	 * therefore real.
 	 */
 	CASE("a latched line holds the canceller's adaptation");
 	{
@@ -7006,7 +7198,7 @@ static void case_fax_disable(void)
 		eh_wait_ms(&t, 1000);
 
 		memset(&a, 0, sizeof(a));
-		tm_ans_send(&t, &w, &a, TM_ANS_PLAIN, 1200);
+		tm_ans_send(&t, &w, &a, TM_ANS_AM, 1200);
 		CHECK_UINT(tm_latch_kind(&t), UDSP_PASSTHROUGH_FAX);
 
 		/* The tone stops and the line carries the playout again, so the
@@ -7207,9 +7399,13 @@ static void case_fax_latch_clear(void)
 		CHECK(false);
 		return;
 	}
+	/* A plain tone latches only under the full disable option, so the
+	 * option gives the caller a latch to clear (chan_fax_latch). */
+	ccfg.ec_tone_force_disable = true;
+	CHECK(udsp_chan_config(t.s, 0, &ccfg) == UDSP_OK);
 	tm_capture_tone(2100u);
 	eh_wait_ms(&t, 800);
-	CHECK_UINT(tm_latch_kind(&t), UDSP_PASSTHROUGH_FAX);
+	CHECK_UINT(tm_latch_kind(&t), UDSP_PASSTHROUGH_MODEM);
 	CHECK_UINT(eh_ev_count(UDSP_EV_LEC_POLICY), 1);
 	CHECK(udsp_line_lec_latch_clear(t.s, 0) == UDSP_OK);
 	eh_wait_ms(&t, 100);
@@ -7262,7 +7458,7 @@ static void case_fax_latch_clear(void)
 	CASE("the next answer tone latches after a caller clear");
 	atomic_store(&tm_be.src, TM_SRC_TONE);
 	eh_wait_ms(&t, 800);
-	CHECK_UINT(tm_latch_kind(&t), UDSP_PASSTHROUGH_FAX);
+	CHECK_UINT(tm_latch_kind(&t), UDSP_PASSTHROUGH_MODEM);
 	CHECK_UINT(eh_ev_count(UDSP_EV_TONE), 1);
 	e = tm_tone_find(UDSP_TONE_DET_CED);
 	CHECK(e != NULL);
@@ -7272,7 +7468,7 @@ static void case_fax_latch_clear(void)
 	e = tm_lec_find(UDSP_LEC_REASON_LATCH);
 	CHECK(e != NULL);
 	if (e) {
-		CHECK_UINT(e->u.lec.kind, UDSP_PASSTHROUGH_FAX);
+		CHECK_UINT(e->u.lec.kind, UDSP_PASSTHROUGH_MODEM);
 		CHECK_UINT(e->u.lec.tone, UDSP_TONE_DET_CED);
 		CHECK_UINT(e->u.lec.direction, UDSP_TONE_DIR_LOCAL);
 	}
@@ -7282,7 +7478,7 @@ static void case_fax_latch_clear(void)
 	      UDSP_UNSUPPORTED);
 	CHECK(udsp_line_lec_latch_clear(t.s, 256) == UDSP_UNSUPPORTED);
 	CHECK(udsp_line_lec_latch_clear(NULL, 0) == UDSP_UNSUPPORTED);
-	CHECK_UINT(tm_latch_kind(&t), UDSP_PASSTHROUGH_FAX);
+	CHECK_UINT(tm_latch_kind(&t), UDSP_PASSTHROUGH_MODEM);
 
 	CASE("a caller clear refuses a stopped engine");
 	CHECK(udsp_stop(t.s, &job) == UDSP_OK);

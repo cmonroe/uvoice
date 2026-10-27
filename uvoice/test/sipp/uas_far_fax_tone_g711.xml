@@ -21,17 +21,18 @@
   Two end-to-end flows run this scenario. They differ in what the runner
   reports inside the quiet window, and the wire is the same for both.
 
-  In the flow uas_far_fax_tone_g711, the runner reports the answer tone alone.
-  The DUT must put the modem media policy on the stream that it already runs.
-  The codec belongs to the SIP layer, and the far end never moves it in this
-  call. ITU-T V.152 clauses 10.1.1 and 10.3 permit the local transition on a
+  In the flow uas_far_fax_tone_g711, the runner reports a plain answer tone,
+  which sets no kind. It then reports the far fax's V.21 preamble, and the DUT
+  must put the fax media policy on the stream that it already runs. The codec
+  belongs to the SIP layer, and the far end never moves it in this call.
+  ITU-T V.152 clauses 10.1.1 and 10.3 permit the local transition on a
   stimulus from the other feed.
 
   In the flow uas_far_fax_tone_false, the runner then reports the end row of
   that tone, with a duration under the 2.6 s floor of ITU-T T.30 4.1.1. The
-  DUT must wait out its own deferral and put the leg back on the voice media
-  policy. The stream then carries no kind, the jitter buffer is adaptive
-  again, and the line releases its tone disabler.
+  DUT must wait out its own deferral and drop the tone. The stream carries no
+  kind, the jitter buffer stays adaptive, and the line releases its tone
+  disabler. A preamble behind that point sets no kind.
 
   The DUT sends no offer of its own in either flow, so the return to voice
   also spends nothing on the wire. An in-dialog INVITE from the DUT fails the
@@ -40,11 +41,11 @@
   harness reads stays short. The jump on the timeout of that receive is the
   passing path.
 
-  The window starts at the ACK. The runner reaches the tone and reads the kind
-  back some time behind it. The part of the window after the kind is therefore
-  shorter than the timeout. The runner measures that part, from the stub
-  sample that confirms the kind to the BYE of this scenario. It fails the flow
-  when that part is under eight seconds.
+  The window starts at the ACK. The runner reaches the tone and reads the
+  stream back some time behind it. The part of the window after that sample
+  is therefore shorter than the timeout. The runner measures that part, from
+  the stub sample to the BYE of this scenario. It fails the flow when that
+  part is under eight seconds.
 
   RFC 3264 section 8, ITU-T T.30 4.1.1, ITU-T V.25 2.2.
 -->

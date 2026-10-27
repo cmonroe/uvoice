@@ -695,17 +695,22 @@ struct hal_channel_cfg {
 	 * gain pair, which is the order libudsp's struct udsp_chan_cfg carries
 	 * them in. A backend that has a G.168 disabler answers an answer tone
 	 * from either direction whatever these two hold: the phase-reversed
-	 * tone takes the canceller off whole, the plain tone keeps it on with
-	 * the nonlinear processor off. The two options only pick the rules it
-	 * applies, and false is the recommendation's own behaviour in both.
+	 * tone takes the canceller off whole, ANSam keeps it on with the
+	 * nonlinear processor off, and the plain tone leaves both on. The two
+	 * options only pick the rules it applies, and false is the
+	 * recommendation's own behavior in both.
 	 *
 	 * ec_tone_latch false releases the disabler once the holding band falls
 	 * quiet (G.168 7.8); true holds it until the line's streams end.
 	 *
-	 * ec_tone_force_disable false takes the phase-reversed tone to the modem
-	 * policy and the plain tone to the fax policy, the mapping of G.168 7.1;
-	 * true takes the plain tone to the modem policy too, for gear that
-	 * expects a full disable on a plain 2100 Hz.
+	 * ec_tone_force_disable false is the mapping of G.168 7.1: the
+	 * phase-reversed tone takes the modem policy, ANSam the fax policy and
+	 * the plain tone none. True takes the plain tone and ANSam to the modem
+	 * policy too, for gear that expects a full disable on a plain 2100 Hz.
+	 *
+	 * A kind on the description outranks the disabler, so the call layer
+	 * sets no kind on a plain tone from the wire either
+	 * (hal_media.passthrough).
 	 *
 	 * A backend with no disabler ignores both.
 	 */
@@ -994,8 +999,12 @@ struct hal_media {
 	 *
 	 * The call layer sets the modem kind when the backend takes the
 	 * profile, and the fax kind on the first local V.21 preamble of the
-	 * leg. A backend with no canceller policy of its own ignores the field,
-	 * as it ignores the hold silence above.
+	 * leg. An answer tone from the wire sets the modem kind with no
+	 * profile, except the plain tone (HAL_TONE_DET_CED), which sets none.
+	 * The first V.21 preamble behind that plain tone sets the fax kind, and
+	 * the first modem carrier behind it sets the modem kind. A backend with
+	 * no canceller policy of its own ignores the field, as it ignores the
+	 * hold silence above.
 	 */
 	uint8_t passthrough;
 	/*
@@ -1176,9 +1185,11 @@ struct hal_jb_stats {
  * not of one canceller. The backend measures one loop delay per device. Each
  * line applies that measurement on its own, so two lines can report different
  * values. ref_delay_samples is the delay the line applied, in samples at the
- * line rate. On udsp it is the loop the line stands on, less one period,
- * inside the reach of the canceller. A loop of 240 at 8 kHz (30 ms)
- * therefore reads 160.
+ * line rate. On udsp it is the loop the line stands on, less the causal
+ * margin of the engine's pointer, inside the reach of the canceller. The
+ * margin is one period on a period-granular pointer (AN7581) and 2.5 ms on a
+ * sample-accurate one (MT7981, MT7986, MT7987, MT7988, MT7622). A loop of
+ * 240 at 8 kHz (30 ms) therefore reads 160 on AN7581 and 220 on MT7988.
  *
  * ref_ready is 1 once the reference of the line stands. While it is 0 the
  * engine holds adaptation, because a filter that adapts against a reference
@@ -1231,7 +1242,7 @@ struct hal_lec_stats {
 	uint32_t skip_frames;
 	/* Appended: the resets the line's filter took from the reference. Two
 	 * causes ask for a reset. The first is a measured loop delay that
-	 * moved beyond one period of the applied one, compared before the
+	 * moved beyond the margin of the applied one, compared before the
 	 * reach clamp. The engine re-latches that delay after every catch-up
 	 * episode, and a re-latch inside the tolerance counts nothing. The
 	 * second is a replacement engine, whatever it goes on to measure.
@@ -1258,11 +1269,13 @@ struct hal_lec_stats {
 	uint32_t nlp_quiet_frames;
 	/* Appended: the index of the largest coefficient, counted from tap 0
 	 * of the applied reference (ref_delay_samples). The reference stands
-	 * one period under the loop, so an echo that arrives at the loop reads
-	 * one period in: 80 at 8 kHz, 160 at 16 kHz. A live line reads later
-	 * by the lag of the path outside the engine rings. It reads 0 while
-	 * the filter holds no energy. Read it beside coef_energy_micro,
-	 * because a filter aligned on its first tap also reads 0. */
+	 * the margin under the loop, so an echo that arrives at the loop reads
+	 * the margin in. That is 80 at 8 kHz and 160 at 16 kHz on a
+	 * period-granular pointer, and 20 and 40 on a sample-accurate one. A
+	 * live line reads later by the lag of the path outside the engine
+	 * rings. It reads 0 while the filter holds no energy. Read it beside
+	 * coef_energy_micro, because a filter aligned on its first tap also
+	 * reads 0. */
 	uint32_t coef_peak_tap;
 	/* Appended: 1 when the tick held the filter because the loop was open.
 	 * The run reads the level that the previous tick consumed, so the flag
