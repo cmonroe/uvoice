@@ -51,6 +51,7 @@
 #include "trace_ring.h"
 #include "uvoice.h"
 #include "test_util.h"
+#include "test_uloop.h"
 #include "test_warn.h"
 
 #define CT_WIRE_SH	"/usr/share/uvoice/calltrace-wire.sh"
@@ -450,27 +451,15 @@ pid_t spawn_run(char *const argv[], enum spawn_group group)
 
 /* --------------------------------------------------------------- the pump */
 
-static struct uloop_timeout pump_timer;
-static unsigned int pump_ticks;
-static unsigned int pump_limit;
-
-static void pump_cb(struct uloop_timeout *t)
-{
-	if (++pump_ticks >= pump_limit) {
-		uloop_end();
-		return;
-	}
-
-	uloop_timeout_set(t, 5);
-}
-
+/*
+ * A window is one deadline on the monotonic clock of the loop. uloop fires a
+ * timer when less than 1 ms of it remains, so a window ends at most 1 ms
+ * early. A count of 5 ms timer rounds is no measure of time: each round
+ * takes 4 ms plus the wake-up latency of the host.
+ */
 static void pump(unsigned int ms)
 {
-	pump_ticks = 0;
-	pump_limit = ms / 5 + 1;
-	pump_timer.cb = pump_cb;
-	uloop_timeout_set(&pump_timer, 5);
-	uloop_run();
+	uloop_pump(ms);
 }
 
 /* -------------------------------------------------------------- the fixture */
