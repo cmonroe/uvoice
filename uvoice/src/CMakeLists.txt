@@ -734,7 +734,8 @@ if(UVOICE_TESTS)
 		add_executable(lec_replay
 			       ${UDSP_TEST_SRC_DIR}/test/bench/lec_replay.c
 			       ${UDSP_TEST_SRC_DIR}/dsp/lec.c
-			       ${UDSP_TEST_SRC_DIR}/dsp/cn.c)
+			       ${UDSP_TEST_SRC_DIR}/dsp/cn.c
+			       ${UDSP_TEST_SRC_DIR}/dsp/resamp.c)
 		target_include_directories(lec_replay PRIVATE
 					   ${UDSP_TEST_SRC_DIR}/include
 					   ${UDSP_TEST_SRC_DIR}/dsp)

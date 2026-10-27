@@ -23,6 +23,8 @@
  * - --verdicts prints each replayed RUN record that differs from the live
  *   record.
  * - --csv prints one row per record, and a "# " before every other line.
+ *   The last column holds the index of the segment of the record, and stays
+ *   empty for a record outside every segment.
  * - --residual writes the output of a shadow instance, whose processor is
  *   off from creation, as a mono 16 bit WAV file at the line rate. A FEED
  *   frame writes the microphone, and a RUN frame the replay skipped writes
@@ -513,36 +515,41 @@ static void csv_head_print(void)
 	printf("tick,kind,flags,lost_before,replayed,frames,replay_frames,"
 	       "verdict,replay_verdict,fired,replay_fired,dt,replay_dt,"
 	       "active,replay_active,probing,replay_probing,hold_frames,"
-	       "replay_hold_frames,out_delta\n");
+	       "replay_hold_frames,out_delta,segment\n");
 }
 
+/* The last cell names the segment open after the record, which holds it. */
 static void csv_row_print(const struct lecr_record *rec,
 			  const struct lecr_replay *r,
-			  const struct lecr_step *st)
+			  const struct lecr_step *st,
+			  const struct lecr_agree *a)
 {
 	const struct lecr_record *got = &r->got;
 	const char *live_word = udsp_ec_nlms_verdict_name(rec->nlp_verdict);
+	char seg[12] = "";
 
+	if (a->open)
+		snprintf(seg, sizeof(seg), "%u", a->seg.index);
 	printf("%" PRIu64 ",%s,0x%04x,%" PRIu32 ",%u,%" PRIu32 ",",
 	       rec->tick, kind_name(rec->kind), rec->flags, rec->lost_before,
 	       st->replayed ? 1u : 0u, rec->frames);
 	if (rec->kind != LECR_KIND_RUN || !st->replayed) {
-		printf(",%s,,%u,,%u,,%u,,%u,,%" PRIu32 ",,\n", live_word,
+		printf(",%s,,%u,,%u,,%u,,%u,,%" PRIu32 ",,,%s\n", live_word,
 		       flag_get(rec, LECR_FLAG_FIRED),
 		       flag_get(rec, LECR_FLAG_DT),
 		       flag_get(rec, LECR_FLAG_ACTIVE),
-		       flag_get(rec, LECR_FLAG_PROBING), rec->hold_frames);
+		       flag_get(rec, LECR_FLAG_PROBING), rec->hold_frames, seg);
 		return;
 	}
 	printf("%" PRIu32 ",%s,%s,%u,%u,%u,%u,%u,%u,%u,%u,%" PRIu32 ",%"
-	       PRIu32 ",%u\n", got->frames, live_word,
+	       PRIu32 ",%u,%s\n", got->frames, live_word,
 	       udsp_ec_nlms_verdict_name(got->nlp_verdict),
 	       flag_get(rec, LECR_FLAG_FIRED), flag_get(got, LECR_FLAG_FIRED),
 	       flag_get(rec, LECR_FLAG_DT), flag_get(got, LECR_FLAG_DT),
 	       flag_get(rec, LECR_FLAG_ACTIVE), flag_get(got, LECR_FLAG_ACTIVE),
 	       flag_get(rec, LECR_FLAG_PROBING),
 	       flag_get(got, LECR_FLAG_PROBING), rec->hold_frames,
-	       got->hold_frames, st->out_delta);
+	       got->hold_frames, st->out_delta, seg);
 }
 
 static void diff_names_get(unsigned diff, char *buf, size_t size)
@@ -641,7 +648,7 @@ static void segment_print(const struct replay_opts *o,
 
 	report_print(o, "segment %u, from %s, ticks %" PRIu64 " to %" PRIu64
 		     ": %" PRIu32 " RUN frames, %" PRIu32 " after %u s\n",
-		     s->index, s->from_reset ? "RESET" : "NEW", s->tick_first,
+		     s->index, lecr_from_name(s->from), s->tick_first,
 		     s->tick_last, s->runs, s->body, o->skip_s);
 	counts_print(o, &s->live, &s->replay);
 	report_print(o, "  fired symmetric difference %" PRIu32 " (live %"
@@ -1070,7 +1077,7 @@ static void record_report(void *ctx, const struct lecr_record *rec,
 	if (out->wav)
 		wav_record_write(out, rec, r, st);
 	if (o->csv)
-		csv_row_print(rec, r, st);
+		csv_row_print(rec, r, st, a);
 	if (o->verdicts && st->replayed && st->diff)
 		verdict_line_print(o, rec, r, st);
 	if (st->fresh)
@@ -1117,6 +1124,8 @@ static void totals_print(const struct replay_opts *o,
 	counts_print(o, &a->live, &a->replay);
 }
 
+/* A gap names the reason before a frames mismatch: the RUN records after a
+ * tick gap disagree on frames when the engine ran frames in the gap. */
 static void reason_print(const struct replay_opts *o,
 			 const struct lecr_agree *a)
 {
@@ -1127,13 +1136,13 @@ static void reason_print(const struct replay_opts *o,
 		report_print(o, "reason: the file does not parse\n");
 	else if (!a->first_new)
 		report_print(o, "reason: the first record is not NEW\n");
+	else if (a->gaps)
+		report_print(o, "reason: %" PRIu32 " tick gaps without a "
+			     "recorded loss\n", a->gaps);
 	else if (a->frames_bad)
 		report_print(o, "reason: frames disagree on %" PRIu32
 			     " RUN records, so the controls are incomplete\n",
 			     a->frames_bad);
-	else if (a->gaps)
-		report_print(o, "reason: %" PRIu32 " tick gaps without a "
-			     "recorded loss\n", a->gaps);
 	else if (a->failed)
 		report_print(o, "reason: %" PRIu32 " segments outside the "
 			     "criteria\n", a->failed);

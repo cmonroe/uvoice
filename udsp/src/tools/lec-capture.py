@@ -106,7 +106,8 @@ closes it. Each check reports the tick and the count:
   record follows the previous tick by one. On a record with SKIPPED, it
   follows by skipped + lost_before + 1, and the tool counts the skipped
   periods. Any other jump is a gap: records are lost from the archive. A gap
-  breaks the lineage too.
+  breaks the lineage too. lec_replay replays on past such a gap, in lossy
+  segments up to the next NEW.
 - A record with no NEW before it starts a joined lineage. lec_replay
   replays such a lineage from the next NEW only.
 - A lineage with no END before the next NEW is a failure, unless that NEW
@@ -186,9 +187,10 @@ scenarios check the jump rule, a lost END, a lost final RUN, the flag
 refusals, the time axis, the WAV limit and a truncated archive. With
 --lec-replay PATH it also runs that lec_replay binary on the replay files it
 wrote. It reads back the reference loss of a file with the loss and the
-warning of a file without it. It then writes a synthetic call and counts the
-census of lec_replay again from the frame file. Without the option it skips
-these steps and prints a note."""
+warning of a file without it. It checks that lec_replay replays every RUN
+record of a lineage past two tick gaps. It then writes a synthetic call and
+counts the census of lec_replay again from the frame file. Without the option
+it skips these steps and prints a note."""
 
 import argparse
 import contextlib
@@ -1660,6 +1662,22 @@ T_REFUSED = (
     (300, R, 1, NEW | NLP | SKP, V_QUIET, 0, 2),
     (300, E, 1, SKP, V_OFF, 0, 2),
 )
+# A lineage with two tick gaps that its records do not account for: jumps of
+# 7 ticks where skipped 2 accounts for 3 and skipped 3 for 4. lec_replay
+# replays every RUN record of it. Each RUN row of its --csv output carries
+# replayed 1 and the segment that NEW or a gap opened; the END row carries
+# neither.
+T_GAPS = [
+    (100, R, 1, NEW | NLP, V_QUIET, 0), (101, R, 2, NLP, V_QUIET, 0),
+    (108, R, 3, NLP | SKP, V_QUIET, 0, 2), (109, R, 4, NLP, V_QUIET, 0),
+    (116, R, 5, NLP | SKP, V_QUIET, 0, 3), (117, R, 6, NLP, V_QUIET, 0),
+    (118, E, 6, 0, V_OFF, 0),
+]
+T_GAPS_CSV = [("100", "1", "1"), ("101", "1", "1"), ("108", "1", "2"),
+              ("109", "1", "2"), ("116", "1", "3"), ("117", "1", "3"),
+              ("118", "0", "")]
+T_GAPS_TOTAL = ("# total: 3 segments, 0 evaluated, 0 failed; 6 RUN frames "
+                "replayed, 0 frames mismatches, 2 gaps, 0 records skipped\n")
 # The time axis of the WAV files: rows, and the frames of each file. Two
 # instances, and a joined record after a first END.
 T_AXIS = (
@@ -2289,6 +2307,21 @@ def t_replay_check(check, lec_replay, prefix):
                          capture_output=True, text=True)
     check(run.returncode == 1 and " 1 gaps," in run.stdout,
           "lec_replay on a lost final RUN: status %d" % run.returncode)
+    gaps = os.path.join(os.path.dirname(prefix), "gaps")
+    t_quiet(capture_process, t_rows_image(T_GAPS), "gaps", gaps, None)
+    run = subprocess.run([lec_replay, gaps + "-l0.lecr", "--csv"],
+                         capture_output=True, text=True)
+    rows = [x.split(",") for x in run.stdout.splitlines()
+            if not x.startswith("#")]
+    check(run.returncode == 1 and T_GAPS_TOTAL in run.stdout and
+          "# segment 2, from gap, ticks 108 to 109:" in run.stdout and
+          "# segment 3, from gap, ticks 116 to 117:" in run.stdout and
+          "# reason: 2 tick gaps without a recorded loss\n" in run.stdout,
+          "lec_replay past two tick gaps: status %d" % run.returncode)
+    check(rows[:1] and rows[0][-1] == "segment" and
+          [(x[0], x[4], x[-1]) for x in rows[1:]] == T_GAPS_CSV,
+          "lec_replay --csv past two tick gaps: %s" %
+          [(x[0], x[4], x[-1]) for x in rows[1:]])
     run = subprocess.run([lec_replay, prefix + "-l0.lecr"],
                          capture_output=True, text=True)
     check(run.returncode == 1, "lec_replay status %d" % run.returncode)

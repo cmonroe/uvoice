@@ -100,7 +100,7 @@
  * 3. In an intact lineage, the tick of a RUN or a FEED without NEW must follow
  *    the tick of the previous record by one. On a record with SKIPPED, it
  *    must follow by skipped + lost_before + 1: the engine ran no tick in the
- *    skipped periods. Any other jump is a gap.
+ *    skipped periods. Any other jump is a tick gap.
  * 4. In an intact lineage, a FEED or an END without a loss carries the frames
  *    of the previous record. A FEED with NEW carries 0. A FEED adds no frame,
  *    and an END reads the instance after its last frame. Any other count is
@@ -115,10 +115,19 @@
  *    frame and compares it with the record.
  * 9. END closes the lineage.
  *
- * A gap breaks the lineage like a loss, because records between the two are
- * lost from the archive. One loss stays invisible: a FEED lost from the
- * archive just before an END. An END carries no skipped count and follows no
- * tick rule, and a FEED adds no frame.
+ * A gap of rule 2 or 4 breaks the lineage like a loss, because records
+ * between the two are lost from the archive. One loss stays invisible: a FEED
+ * lost from the archive just before an END. An END carries no skipped count
+ * and follows no tick rule, and a FEED adds no frame.
+ *
+ * A tick gap of rule 3 counts as a loss of the ticks that the jump does not
+ * account for, and it does not break the lineage. The open segment closes as
+ * lossy, and the step replays the record that carries the jump on the
+ * instance it has, in a new segment that the gap opens. The step makes up no
+ * frame for the missing ticks. The records after a tick gap therefore replay
+ * against a canceller that did not see the frames the engine ran in the gap:
+ * their control figures are evidence of continuity, not of equality. Each
+ * segment after a tick gap is lossy up to the next NEW.
  *
  * A loss invalidates the replay until the next NEW, not until the next
  * RESET, because udsp_ec_nlms_reset keeps the floor, the lifetime counters
@@ -646,6 +655,7 @@ static inline const char *lecr_trial_arm_name(unsigned arm)
 		[UDSP_EC_NLMS_TRIAL_ARM_LATCH] = "latch",
 		[UDSP_EC_NLMS_TRIAL_ARM_PATH] = "path",
 		[UDSP_EC_NLMS_TRIAL_ARM_STALE] = "stale",
+		[UDSP_EC_NLMS_TRIAL_ARM_COHERE] = "cohere",
 	};
 
 	return arm < sizeof(names) / sizeof(names[0]) ? names[arm] : "?";
@@ -868,8 +878,8 @@ static inline void lecr_bound_check(struct lecr_replay *r,
 		lecr_gap_mark(r, st);
 }
 
-/* The jump rule of step rule 3. */
-static inline void lecr_jump_check(struct lecr_replay *r,
+/* The jump rule of step rule 3. A tick gap keeps the lineage. */
+static inline void lecr_jump_check(const struct lecr_replay *r,
 				   const struct lecr_record *rec,
 				   struct lecr_step *st)
 {
@@ -883,7 +893,7 @@ static inline void lecr_jump_check(struct lecr_replay *r,
 			st->skip_periods = rec->skipped;
 		return;
 	}
-	lecr_gap_mark(r, st);
+	st->gap = true;
 }
 
 /* The frames rule of step rule 4. */
@@ -897,15 +907,14 @@ static inline void lecr_frames_check(struct lecr_replay *r,
 }
 
 /* Step rules 3 and 4 for a record without a loss and without NEW in an
- * intact lineage. */
+ * intact lineage. A FEED after a tick gap still meets rule 4. */
 static inline void lecr_continuity_check(struct lecr_replay *r,
 					 const struct lecr_record *rec,
 					 struct lecr_step *st)
 {
 	if (rec->kind != LECR_KIND_END)
 		lecr_jump_check(r, rec, st);
-	if (!st->gap)
-		lecr_frames_check(r, rec, st);
+	lecr_frames_check(r, rec, st);
 }
 
 /* One record through the replay, in the order of the header comment. It
@@ -950,16 +959,32 @@ static inline int lecr_replay_step(struct lecr_replay *r,
 	return 0;
 }
 
+/* The record that opened a segment. */
+enum lecr_from {
+	LECR_FROM_NEW,
+	LECR_FROM_RESET,
+	LECR_FROM_GAP,
+};
+
+static inline const char *lecr_from_name(unsigned from)
+{
+	static const char *const names[] = { "NEW", "RESET", "gap" };
+
+	return from < sizeof(names) / sizeof(names[0]) ? names[from] : "?";
+}
+
 /*
- * A segment runs from NEW or RESET to the next one, to END or to a loss. The
- * control figures (frames, out and the first difference) cover every RUN of
- * the segment. The steady-state figures (the counts, the symmetric
- * differences and the verdict agreement) cover the body: the RUN records at
- * least skip_ticks after the first record of the segment.
+ * A segment runs from NEW, RESET or a tick gap to the next of these, to END
+ * or to a loss. A gap or a loss closes the open segment as lossy, and each
+ * segment after a tick gap is lossy up to the next NEW. The control figures
+ * (frames, out and the first difference) cover every RUN of the segment. The
+ * steady-state figures (the counts, the symmetric differences and the
+ * verdict agreement) cover the body: the RUN records at least skip_ticks
+ * after the first record of the segment.
  */
 struct lecr_segment {
 	unsigned index;
-	bool from_reset;
+	unsigned from;
 	bool lossy;
 	uint64_t tick_first;
 	uint64_t tick_last;
@@ -1043,10 +1068,13 @@ static inline const char *lecr_result_name(enum lecr_result result)
  * records the replay did not take. skip_marks counts the records with
  * SKIPPED that the step accepted, and skip_periods sums their skipped
  * fields. refusal names the rule of a record that the reader refused.
+ * after_gap marks a gap since the last NEW: each segment that opens before
+ * the next NEW reads lossy.
  */
 struct lecr_agree {
 	uint64_t skip_ticks;
 	bool open;
+	bool after_gap;
 	struct lecr_segment seg;
 	struct lecr_segment done;
 	unsigned segments;
@@ -1114,11 +1142,12 @@ static inline void lecr_agree_close(struct lecr_agree *a)
 
 static inline void lecr_agree_open(struct lecr_agree *a,
 				   const struct lecr_record *rec,
-				   bool from_reset)
+				   enum lecr_from from)
 {
 	memset(&a->seg, 0, sizeof(a->seg));
 	a->seg.index = ++a->segments;
-	a->seg.from_reset = from_reset;
+	a->seg.from = from;
+	a->seg.lossy = a->after_gap;
 	a->seg.tick_first = rec->tick;
 	a->seg.tick_last = rec->tick;
 	a->open = true;
@@ -1163,13 +1192,16 @@ static inline void lecr_segment_add(struct lecr_segment *s, uint64_t skip,
  * Adds one stepped record. It returns true when the record closed a
  * segment, which a->done then holds. A loss on a NEW record belongs to the
  * lineage before it, so the loss closes the open segment before NEW opens
- * the next.
+ * the next. A tick gap closes the open segment, and the record that carries
+ * the jump, which the step replays, opens the next.
  */
 static inline bool lecr_agree_add(struct lecr_agree *a,
 				  const struct lecr_record *rec,
 				  const struct lecr_step *st,
 				  const struct lecr_record *got)
 {
+	bool reset = rec->kind == LECR_KIND_RUN &&
+		     (rec->flags & LECR_FLAG_RESET);
 	bool closed = false;
 
 	a->records++;
@@ -1192,21 +1224,24 @@ static inline bool lecr_agree_add(struct lecr_agree *a,
 		lecr_agree_close(a);
 		closed = true;
 	}
+	if (st->gap)
+		a->after_gap = true;
 	if (st->fresh) {
 		a->instances++;
+		a->after_gap = false;
 		if (a->open) {
 			lecr_agree_close(a);
 			closed = true;
 		}
-		lecr_agree_open(a, rec, false);
-	} else if (st->replayed && rec->kind == LECR_KIND_RUN &&
-		   (rec->flags & LECR_FLAG_RESET)) {
-		a->resets++;
+		lecr_agree_open(a, rec, LECR_FROM_NEW);
+	} else if (st->replayed && (reset || st->gap)) {
+		a->resets += reset ? 1u : 0u;
 		if (a->open) {
 			lecr_agree_close(a);
 			closed = true;
 		}
-		lecr_agree_open(a, rec, true);
+		lecr_agree_open(a, rec, st->gap ? LECR_FROM_GAP :
+						  LECR_FROM_RESET);
 	}
 	if (rec->kind == LECR_KIND_END) {
 		if (a->open) {

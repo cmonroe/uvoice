@@ -330,7 +330,7 @@ if(UDSP_TESTS)
 	add_test(NAME test_jb COMMAND test_jb)
 
 	add_executable(test_lec ${CMAKE_CURRENT_SOURCE_DIR}/test/test_lec.c
-		       dsp/lec.c dsp/cn.c)
+		       dsp/lec.c dsp/cn.c dsp/resamp.c)
 	target_include_directories(test_lec PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test
 				   ${CMAKE_CURRENT_SOURCE_DIR}/dsp)
 	target_link_libraries(test_lec m)
@@ -484,10 +484,14 @@ if(UDSP_BENCH)
 	    "the canceller source that lec_replay links")
 	add_executable(lec_replay
 		       ${CMAKE_CURRENT_SOURCE_DIR}/test/bench/lec_replay.c
-		       ${UDSP_REPLAY_LEC_C} dsp/cn.c)
+		       ${UDSP_REPLAY_LEC_C} dsp/cn.c dsp/resamp.c)
 	target_include_directories(lec_replay PRIVATE
 				   ${CMAKE_CURRENT_SOURCE_DIR}/dsp)
 	target_link_libraries(lec_replay m)
+
+	# The canceller harness: lec_hz, lec_replay_coh and lec_tone_sweep on
+	# the same canceller source.
+	add_subdirectory(test/bench/harness)
 
 	pkg_check_modules(SPEEXDSP QUIET speexdsp)
 	if(SPEEXDSP_FOUND)

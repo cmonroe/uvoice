@@ -49,6 +49,9 @@ the library also gets the ALSA TDM backend (`tdm/alsa.c`).
 | `UDSP_REPLAY_LEC_C` | `dsp/lec.c` | Canceller source that `lec_replay` links. |
 | `UDSP_VERSION` | `PKG_VERSION` of `Makefile` | Library version and SONAME. |
 
+With `UDSP_BENCH` on and `python3` found, the build also holds the canceller
+harness in `src/test/bench/harness`; `lec_harness.py` is its entry point.
+
 A development build turns on the tests and the tools:
 
 ```

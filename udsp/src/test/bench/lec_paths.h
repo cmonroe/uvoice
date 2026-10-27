@@ -201,11 +201,11 @@ static inline void path_dispersive_init(struct echo_path *path, unsigned rate,
 }
 
 /*
- * A composite hybrid derived from G.168, not the Annex D coefficient tables
- * (the recommendation text is not in this tree): a flat bulk section, a
- * dispersive main reflection from 4 to 12 ms (891 Hz, 1.75 ms of decay) and a
- * second weaker reflection from 20 to 25 ms (637 Hz, 1.25 ms of decay), which
- * is the shape the Annex D models have.
+ * A composite hybrid derived from G.168, not an Annex D coefficient table
+ * (path_annex_d_init): a flat bulk section, a dispersive main reflection from
+ * 4 to 12 ms (891 Hz, 1.75 ms of decay) and a second weaker reflection from
+ * 20 to 25 ms (637 Hz, 1.25 ms of decay), which is the shape the Annex D
+ * models have.
  */
 static inline void path_composite_init(struct echo_path *path, unsigned rate,
 				       double erl_db)
@@ -315,6 +315,311 @@ static inline void path_weak_init(struct echo_path *path, unsigned rate,
 				      sin(2.0 * M_PI * 2400.0 *
 					  (double)(k - from) / rate));
 	path_erl_set(path, erl_db);
+}
+
+/*
+ * Composite source derived from the G.168 Annex C description. One 500 ms
+ * cycle repeats:
+ * - a voiced burst of 100 Hz harmonics, 50 ms;
+ * - a pause, 150 ms;
+ * - pseudo noise, 200 ms;
+ * - a second pause, 100 ms.
+ * The bench and the suite need its activity factor, and its alternation
+ * between a periodic and a noise-like excitation. phase counts the samples of
+ * the 500 ms cycle, so two sources whose phases differ by a quarter cycle
+ * never voice together.
+ */
+static inline void css_fill(int16_t *dst, unsigned count, double level_dbm0,
+			    uint32_t *state, unsigned long *phase,
+			    unsigned rate)
+{
+	double amplitude = dbm0_rms_get(level_dbm0);
+	unsigned long cycle = rate / 2u;
+	unsigned long burst_to = rate / 20u;
+	unsigned long noise_from = rate / 5u;
+	unsigned long noise_to = 2ul * rate / 5u;
+	unsigned i;
+
+	for (i = 0; i < count; i++) {
+		unsigned long position = (*phase + i) % cycle;
+		double value = 0.0;
+		unsigned harmonic;
+
+		if (position < burst_to) {
+			for (harmonic = 1; harmonic <= 12u; harmonic++)
+				value += sin(2.0 * M_PI * 100.0 * harmonic *
+					     (double)position /
+					     rate) / harmonic;
+			value *= amplitude * 0.8;
+		} else if (position >= noise_from && position < noise_to) {
+			double unit = rng_next(state) / 4294967295.0 * 2.0 -
+				1.0;
+
+			value = unit * amplitude * sqrt(3.0);
+		}
+		dst[i] = sample_clamp(value);
+	}
+	*phase = (*phase + count) % cycle;
+}
+
+/*
+ * A source with the time structure of the single talk CSS of G.168 Annex C.3.1:
+ * per 350 ms half period, a voiced burst of 48.62 ms (Table C.1, interpolated
+ * from 44.1 kHz), a noise burst of 200 ms (white noise through a one-pole
+ * high-pass at 150 Hz and low-pass at 400 Hz) and a pause; the second half
+ * inverts the first. Both bursts have unit RMS, so the period RMS is the level.
+ * The canceller converges on it as on the CSS of the harness.
+ */
+#define CSS_ANNEX_C1_RATE	44100u
+#define CSS_ANNEX_C1_SAMPLES	134u
+#define CSS_ANNEX_VOICED_MS	48.62
+#define CSS_ANNEX_NOISE_MS	200.0
+#define CSS_ANNEX_HALF_MS	350.0
+#define CSS_ANNEX_HIGH_HZ	150.0
+#define CSS_ANNEX_LOW_HZ	400.0
+#define CSS_ANNEX_VOICED_MAX	1200u
+#define CSS_ANNEX_NOISE_MAX	3200u
+
+static const int16_t css_annex_c1[CSS_ANNEX_C1_SAMPLES] = {
+	-155, 276, 517, 578, 491, 302, 86, -103, -207, -198, -60, 190, 543,
+	948, 1362, 1741, 2043, 2276, 2422, 2500, 2552, 2595, 2655, 2758, 2896,
+	3060, 3224, 3370, 3500, 3569, 3603, 3603, 3595, 3586, 3595, 3638, 3724,
+	3819, 3922, 4000, 4043, 4034, 3974, 3862, 3724, 3577, 3439, 3336, 3267,
+	3224, 3198, 3172, 3129, 3043, 2914, 2750, 2560, 2353, 2155, 1991, 1853,
+	1750, 1672, 1603, 1534, 1440, 1310, 1146, 965, 776, 603, 448, 345, 276,
+	250, 250, 267, 267, 241, 190, 103, -9, -138, -267, -388, -491, -569,
+	-638, -698, -759, -813, -888, -957, -1034, -1103, -1146, -1181, -1190,
+	-1198, -1215, -1259, -1327, -1457, -1629, -1853, -2121, -2414, -2707,
+	-3017, -3319, -3612, -3913, -4224, -4560, -4922, -5301, -5715, -6137,
+	-6560, -6948, -7301, -7568, -7732, -7758, -7620, -7310, -6810, -6155,
+	-5344, -4439, -3474, -2508, -1595, -802,
+};
+
+/* The two bursts hold unit RMS; scale sets the level. */
+struct css_annex {
+	double voiced[CSS_ANNEX_VOICED_MAX];
+	double noise[CSS_ANNEX_NOISE_MAX];
+	unsigned voiced_n;
+	unsigned noise_n;
+	unsigned half_n;
+	unsigned long pos;
+	double scale;
+};
+
+static inline void css_annex_unit_set(double *x, unsigned n)
+{
+	double sum = 0.0;
+	unsigned k;
+
+	for (k = 0; k < n; k++)
+		sum += x[k] * x[k];
+	for (k = 0; k < n; k++)
+		x[k] /= sqrt(sum / n);
+}
+
+/* The noise burst: white noise from seed through the two filters, from
+ * filters at rest. */
+static inline void css_annex_noise_draw(struct css_annex *s, unsigned rate,
+					uint32_t seed)
+{
+	double high_a = exp(-2.0 * M_PI * CSS_ANNEX_HIGH_HZ / rate);
+	double low_a = exp(-2.0 * M_PI * CSS_ANNEX_LOW_HZ / rate);
+	double high_x = 0.0;
+	double high_y = 0.0;
+	double low_y = 0.0;
+	uint32_t state = seed;
+	unsigned n;
+
+	for (n = 0; n < s->noise_n; n++) {
+		double unit = (rng_next(&state) / 4294967295.0 * 2.0 - 1.0) *
+			      sqrt(3.0);
+
+		high_y = high_a * (high_y + unit - high_x);
+		high_x = unit;
+		low_y = (1.0 - low_a) * high_y + low_a * low_y;
+		s->noise[n] = low_y;
+	}
+	css_annex_unit_set(s->noise, s->noise_n);
+}
+
+/* The source with the voiced period of table, of table_n samples at
+ * CSS_ANNEX_C1_RATE, a voiced burst of voiced_ms and a half period of
+ * half_ms. */
+static inline void css_annex_setup(struct css_annex *s, unsigned rate,
+				   double level_dbm0, uint32_t seed,
+				   const int16_t *table, unsigned table_n,
+				   double voiced_ms, double half_ms)
+{
+	unsigned n;
+
+	memset(s, 0, sizeof(*s));
+	s->voiced_n = path_samples_get(voiced_ms, rate);
+	s->noise_n = path_samples_get(CSS_ANNEX_NOISE_MS, rate);
+	s->half_n = path_samples_get(half_ms, rate);
+	if (s->voiced_n > CSS_ANNEX_VOICED_MAX)
+		s->voiced_n = CSS_ANNEX_VOICED_MAX;
+	if (s->noise_n > CSS_ANNEX_NOISE_MAX)
+		s->noise_n = CSS_ANNEX_NOISE_MAX;
+	for (n = 0; n < s->voiced_n; n++) {
+		double t = fmod((double)n * CSS_ANNEX_C1_RATE / rate, table_n);
+		unsigned k = (unsigned)t;
+		double frac = t - k;
+
+		s->voiced[n] = table[k] * (1.0 - frac) +
+			       table[(k + 1u) % table_n] * frac;
+	}
+	css_annex_unit_set(s->voiced, s->voiced_n);
+	css_annex_noise_draw(s, rate, seed);
+	s->scale = dbm0_rms_get(level_dbm0) /
+		   sqrt((double)(s->voiced_n + s->noise_n) / s->half_n);
+}
+
+static inline void css_annex_init(struct css_annex *s, unsigned rate,
+				  double level_dbm0, uint32_t seed)
+{
+	css_annex_setup(s, rate, level_dbm0, seed, css_annex_c1,
+			CSS_ANNEX_C1_SAMPLES, CSS_ANNEX_VOICED_MS,
+			CSS_ANNEX_HALF_MS);
+}
+
+/*
+ * A source with the time structure of the double talk CSS of G.168 Annex C.3.2:
+ * per 400 ms half period, a voiced burst of 72.70 ms (Table C.3, whose value
+ * 168 both editions print as -938), a noise burst of 200 ms and a pause. Its
+ * period differs from css_annex_init, so near bursts slide over far ones as in
+ * G.168 tests 3A to 3C. The active level stands 1.66 dB over the period RMS
+ * (G.168 clause 6.4.1.2).
+ */
+#define CSS_ANNEX_C3_SAMPLES	229u
+#define CSS_ANNEX_DT_VOICED_MS	72.70
+#define CSS_ANNEX_DT_HALF_MS	400.0
+
+static const int16_t css_annex_c3[CSS_ANNEX_C3_SAMPLES] = {
+	-198, -112, -9, 103, 233, 388, 543, 724, 896, 1060, 1233, 1388, 1517,
+	1638, 1747, 1810, 1845, 1845, 1802, 1707, 1569, 1379, 1146, 871, 560,
+	233, -121, -491, -871, -1250, -1638, -2043, -2465, -2896, -3345,
+	-3819, -4310, -4810, -5319, -5836, -6353, -6853, -7353, -7836, -8292,
+	-8715, -9077, -9370, -9542, -9542, -9361, -8956, -8327, -7465, -6396,
+	-5163, -3827, -2448, -1103, 155, 1293, 2241, 3034, 3655, 4138, 4517,
+	4827, 5094, 5344, 5594, 5827, 6043, 6215, 6344, 6413, 6422, 6379,
+	6310, 6215, 6120, 6051, 6000, 5991, 5991, 6000, 6008, 5991, 5939,
+	5853, 5715, 5560, 5387, 5215, 5043, 4879, 4732, 4586, 4439, 4276,
+	4086, 3870, 3629, 3370, 3086, 2801, 2534, 2267, 2034, 1819, 1612,
+	1422, 1224, 1026, 819, 603, 388, 181, 9, -181, -328, -448, -543, -629,
+	-707, -784, -871, -948, -1026, -1112, -1181, -1241, -1276, -1293,
+	-1302, -1293, -1267, -1250, -1233, -1224, -1224, -1224, -1224, -1215,
+	-1198, -1172, -1129, -1077, -1026, -974, -922, -888, -871, -845, -828,
+	-810, -793, -767, -741, -698, -672, -638, -603, -595, -586, -595,
+	-603, -621, -629, -938, -638, -638, -638, -638, -638, -647, -664,
+	-690, -724, -767, -793, -819, -845, -853, -871, -879, -888, -896,
+	-922, -948, -974, -1009, -1026, -1052, -1069, -1077, -1069, -1060,
+	-1060, -1052, -1043, -1043, -1052, -1060, -1060, -1060, -1052, -1034,
+	-1017, -991, -957, -931, -905, -888, -862, -845, -819, -793, -767,
+	-724, -672, -621, -560, -509, -457, -397, -345, -276, -207, -112,
+};
+
+static inline void css_annex_dt_init(struct css_annex *s, unsigned rate,
+				     double level_dbm0, uint32_t seed)
+{
+	css_annex_setup(s, rate, level_dbm0, seed, css_annex_c3,
+			CSS_ANNEX_C3_SAMPLES, CSS_ANNEX_DT_VOICED_MS,
+			CSS_ANNEX_DT_HALF_MS);
+}
+
+static inline void css_annex_fill(int16_t *dst, unsigned count,
+				  struct css_annex *s)
+{
+	unsigned i;
+
+	for (i = 0; i < count; i++) {
+		unsigned long at = s->pos % s->half_n;
+		double sign = s->pos < s->half_n ? 1.0 : -1.0;
+		double value = 0.0;
+
+		if (at < s->voiced_n)
+			value = s->voiced[at];
+		else if (at < s->voiced_n + s->noise_n)
+			value = s->noise[at - s->voiced_n];
+		dst[i] = sample_clamp(sign * s->scale * value);
+		s->pos = (s->pos + 1u) % (2u * s->half_n);
+	}
+}
+
+/*
+ * Room noise at the 8 kHz rate of the wire, as the near end of G.168 test 9A
+ * plays it: ROOM_WHITE, or ROOM_HOTH, white noise through the two filters of
+ * the composite source's noise burst, falling 6 dB per octave over 400 Hz near
+ * the Hoth spectrum (IEEE 269). The scale sets the RMS from a first draw of
+ * ROOM_CAL_SAMPLES; the source then restarts from rest with its seed.
+ */
+#define ROOM_CAL_SAMPLES	80000u
+
+enum room_kind {
+	ROOM_WHITE,
+	ROOM_HOTH,
+};
+
+struct room_noise {
+	enum room_kind kind;
+	double high_a;
+	double low_a;
+	double high_x;
+	double high_y;
+	double low_y;
+	double scale;
+	uint32_t seed;
+	uint32_t state;
+};
+
+static inline double room_noise_next(struct room_noise *r)
+{
+	double unit = (rng_next(&r->state) / 4294967295.0 * 2.0 - 1.0) *
+		      sqrt(3.0);
+
+	if (r->kind == ROOM_WHITE)
+		return unit;
+	r->high_y = r->high_a * (r->high_y + unit - r->high_x);
+	r->high_x = unit;
+	r->low_y = (1.0 - r->low_a) * r->high_y + r->low_a * r->low_y;
+	return r->low_y;
+}
+
+static inline void room_noise_restart(struct room_noise *r)
+{
+	r->state = r->seed;
+	r->high_x = 0.0;
+	r->high_y = 0.0;
+	r->low_y = 0.0;
+}
+
+static inline void room_noise_init(struct room_noise *r, enum room_kind kind,
+				   double level_dbm0, uint32_t seed)
+{
+	double sum = 0.0;
+	unsigned n;
+
+	memset(r, 0, sizeof(*r));
+	r->kind = kind;
+	r->seed = seed;
+	r->high_a = exp(-2.0 * M_PI * CSS_ANNEX_HIGH_HZ / UDSP_SAMPLE_RATE);
+	r->low_a = exp(-2.0 * M_PI * CSS_ANNEX_LOW_HZ / UDSP_SAMPLE_RATE);
+	room_noise_restart(r);
+	for (n = 0; n < ROOM_CAL_SAMPLES; n++) {
+		double v = room_noise_next(r);
+
+		sum += v * v;
+	}
+	r->scale = dbm0_rms_get(level_dbm0) / sqrt(sum / ROOM_CAL_SAMPLES);
+	room_noise_restart(r);
+}
+
+static inline void room_noise_fill(int16_t *dst, unsigned count,
+				   struct room_noise *r)
+{
+	unsigned i;
+
+	for (i = 0; i < count; i++)
+		dst[i] = sample_clamp(r->scale * room_noise_next(r));
 }
 
 /*
@@ -550,9 +855,10 @@ struct field_path {
  * the cos(pi j / 64) form: a 129-point window, cut at its 127 inner lags. The
  * sign alternates with the lag. It is an explicit flip, the rule
  * of path_edge_cos(), and not the sign of sin(). The table is zero outside
- * its 512 taps.
+ * its taps, 512 for a field path.
  */
-static inline float field_odd_tap_get(const float *h8, unsigned k)
+static inline float path_odd_tap_get(const float *h8, unsigned taps,
+				     unsigned k)
 {
 	double sign = 1.0;
 	double acc = 0.0;
@@ -563,12 +869,17 @@ static inline float field_odd_tap_get(const float *h8, unsigned k)
 		double w = 0.42 + 0.5 * cos(M_PI * j / 64.0) +
 			   0.08 * cos(2.0 * M_PI * j / 64.0);
 		unsigned after = k + 1u + i;
-		double left = k >= i ? h8[k - i] : 0.0;
-		double right = after < FIELD_PATH_TAPS ? h8[after] : 0.0;
+		double left = k >= i && k - i < taps ? h8[k - i] : 0.0;
+		double right = after < taps ? h8[after] : 0.0;
 
 		acc += sign / (M_PI * j) * w * (left + right);
 	}
 	return (float)acc;
+}
+
+static inline float field_odd_tap_get(const float *h8, unsigned k)
+{
+	return path_odd_tap_get(h8, FIELD_PATH_TAPS, k);
 }
 
 /*
@@ -601,6 +912,132 @@ static inline void path_field_init(struct echo_path *path, unsigned rate,
 	for (k = 0; k < FIELD_PATH_TAPS; k++) {
 		path->h[2u * k] = 0.5f * table->h[k];
 		path->h[2u * k + 1u] = field_odd_tap_get(table->h, k);
+	}
+}
+
+/*
+ * The echo path models m1, m4, m6, m7 and m8 of ITU-T G.168 (12/2022) Annex D
+ * (Tables D.2, D.5, D.7, D.8 and D.9 at 8 kHz, read in columns), as int32,
+ * because some values of m6 and m8 exceed int16. A model at erl_db is Ki
+ * 10^(-erl_db / 20) m(k), with Ki and the least ERL of Table D.1a.
+ */
+static const int32_t annex_d_m1[64] = {
+	-436, -829, -2797, -4208, -17968, -11215, 46150, 34480, -10427, 9049,
+	-1309, -6320, 390, -8191, -1751, -6051, -3796, -4055, -3948, -2557,
+	-3372, -1808, -2259, -1300, -1098, -618, -340, -61, 323, 419, 745, 716,
+	946, 880, 1014, 976, 1033, 1091, 1053, 1042, 794, 831, 899, 716, 390,
+	313, 304, 304, 73, -119, -109, -176, -359, -407, -512, -580, -704,
+	-618, -685, -791, -772, -820, -839, -724,
+};
+static const int32_t annex_d_m4[128] = {
+	160, 312, -241, -415, 897, 908, -1326, -1499, 2405, 3347, -3624, -7733,
+	4041, 14484, -1477, -21739, -4470, 25356, 11458, -19696, -11800, 5766,
+	789, 6633, 14624, -6975, -17156, -187, 149, 1515, 14907, 4345, -7128,
+	-2757, -10185, -7083, 6850, 3944, 6969, 8694, -4068, -3852, -5793,
+	-9371, 453, 1060, 3965, 9463, 2393, 2784, -892, -7366, -3376, -5847,
+	-2399, 3011, 1537, 6623, 4205, 1602, 1592, -4752, -3646, -5207, -5577,
+	-501, -1174, 4041, 5647, 4628, 7252, 2123, 2654, -881, -4113, -3244,
+	-7289, -3830, -4600, -2508, 431, -144, 4184, 2372, 4617, 3576, 2382,
+	2839, -404, 539, -1803, -1401, -1705, -2269, -783, -1608, -220, -306,
+	257, 615, 225, 561, 8, 344, 127, -57, 182, 41, 203, -111, 95, -79, 30,
+	84, -13, -68, -241, -68, -24, 19, -57, -24, 30, -68, 84, -155, -68, 19,
+};
+static const int32_t annex_d_m6[120] = {
+	29, 109, -83, 198, -294, -135, -415, -202, -444, -337, -313, -450,
+	-105, -503, 145, -490, 267, -231, 340, 77, 343, 783, 158, 1341, 195,
+	1798, 344, 1845, 629, 1604, 1182, 940, 5163, 19522, 8421, -50953,
+	-9043, 18046, -13553, 13336, -3471, -107, 1788, -7409, 2469, -7994,
+	490, -3860, -837, 490, -636, 3682, 1141, 5019, 2635, 5025, 3946, 4414,
+	4026, 3005, 3380, 1616, 2007, 158, 388, -1198, -1117, -2134, -2547,
+	-2589, -3310, -2778, -3427, -2779, -3116, -2502, -2399, -1956, -1539,
+	-1239, -570, -377, 251, 331, 964, 1177, 1449, 1564, 1724, 1871, 1767,
+	1802, 1630, 1632, 1379, 1271, 1063, 856, 711, 482, 289, 54, -137, -321,
+	-490, -638, -764, -836, -800, -859, -838, -837, -834, -740, -673, -581,
+	-493, -436, -327, -201,
+};
+static const int32_t annex_d_m7[96] = {
+	258, -111, 337, -319, 347, -434, 192, -450, -108, -343, -596, -177,
+	-1187, -52, -1781, -147, -1959, -326, -1601, -1389, -13620, -720,
+	33818, -10683, -6742, 12489, -9862, 8950, -1574, 758, 3526, -3118,
+	2421, -8966, -4901, 11385, 18072, -14410, -7473, 19836, -16854, -3115,
+	9483, -17799, 7399, -4342, -7415, 7929, -10726, 6239, -2526, -1317,
+	5345, -4565, 6868, -2195, 3425, 1969, -109, 3963, -1275, 3087, -892,
+	1239, 2, -427, 596, -1184, 551, -1244, 141, -743, -415, -372, -769,
+	-183, -785, -270, -659, -377, -523, -325, -245, -255, -60, 35, 218,
+	149, 340, 233, 365, 303, 251, 230, 209, 179,
+};
+static const int32_t annex_d_m8[99] = {
+	80, 31, 4, 42, 42, -61, -81, -64, -121, -102, -26, 1002, -9250, -22562,
+	39321, 35681, -35289, 25312, -1457, -229, 15659, -6786, 16791, 3860,
+	2239, -28730, -11885, 33871, -176, -16421, 18173, -9669, -10163, 9941,
+	-19365, 3592, -5907, -10257, 5336, -12933, 4348, -4802, -1791, 3035,
+	-4433, 5553, -2596, 3992, 1255, 1450, 4079, 324, 4340, 1059, 3083,
+	1917, 1756, 2478, 1027, 1871, 845, 1284, 813, 806, 869, 471, 646, 438,
+	449, 432, 473, 394, 452, 538, 717, 723, 850, 756, 753, 899, 555, 669,
+	619, 500, 650, 615, 516, 492, 427, 291, 356, 147, 107, -50, -88, -59,
+	-238, -165, -183,
+};
+
+enum annex_d_model {
+	ANNEX_D_M1,
+	ANNEX_D_M4,
+	ANNEX_D_M6,
+	ANNEX_D_M7,
+	ANNEX_D_M8,
+	ANNEX_D_MODELS,
+};
+
+struct annex_d_table {
+	const char *name;
+	const int32_t *m;
+	unsigned taps;
+	double ki;
+	double erl_min_db;
+};
+
+static const struct annex_d_table annex_d_tables[ANNEX_D_MODELS] = {
+	{ "m1", annex_d_m1, 64u, 1.39e-5, 6.0 },
+	{ "m4", annex_d_m4, 128u, 1.77e-5, 6.0 },
+	{ "m6", annex_d_m6, 120u, 1.51e-5, 6.0 },
+	{ "m7", annex_d_m7, 96u, 2.33e-5, 11.06 },
+	{ "m8", annex_d_m8, 99u, 1.33e-5, 9.27 },
+};
+
+/*
+ * Model m of Annex D at erl_db after a pure delay of delay_ms, at the line
+ * rate. At 16 kHz the 8 kHz response, delay included, is interpolated by two
+ * as path_field_init does, so the band above 4 kHz stays empty and the half
+ * band rings on both sides of each tap. An ERL under the least ERL of the
+ * model or a rate other than 8 or 16 kHz builds nothing.
+ */
+static inline void path_annex_d_init(struct echo_path *path, unsigned rate,
+				     enum annex_d_model m, double erl_db,
+				     unsigned delay_ms)
+{
+	const struct annex_d_table *t = &annex_d_tables[m];
+	float h8[LEC_PATH_TAPS_MAX / 2u];
+	unsigned delay = path_samples_get(delay_ms, UDSP_SAMPLE_RATE);
+	unsigned n = delay + t->taps;
+	double scale = t->ki * pow(10.0, -erl_db / 20.0);
+	unsigned k;
+
+	path_geometry_set(path, rate);
+	if (erl_db < t->erl_min_db - 1e-9 || n + 32u > LEC_PATH_TAPS_MAX / 2u)
+		return;
+	memset(h8, 0, sizeof(h8));
+	for (k = 0; k < t->taps; k++)
+		h8[delay + k] = (float)(scale * t->m[k]);
+	if (rate == UDSP_SAMPLE_RATE) {
+		path->taps = n;
+		memcpy(path->h, h8, n * sizeof(*h8));
+		return;
+	}
+	if (rate != UDSP_SAMPLE_RATE_WB)
+		return;
+	path->taps = 2u * (n + 32u);
+	for (k = 0; k < n + 32u; k++) {
+		path->h[2u * k] = 0.5f * h8[k];
+		path->h[2u * k + 1u] = path_odd_tap_get(h8, n, k);
 	}
 }
 

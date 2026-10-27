@@ -58,6 +58,7 @@ enum source_kind {
 	SOURCE_NOISE,
 	SOURCE_CSS,
 	SOURCE_TONE,
+	SOURCE_WORDS,
 };
 
 enum path_kind {
@@ -175,45 +176,32 @@ static void bench_ec_run(struct udsp_ec *ec, int16_t *mic, const int16_t *ref,
 	udsp_ec_nlms.run(ec, mic, bench_ref_get(ref, buf, frame));
 }
 
-
-
 /*
- * Composite source derived from the G.168 Annex C description: a voiced burst
- * of 100 Hz harmonics (50 ms), a pause (150 ms), pseudo noise (200 ms) and a
- * second pause (100 ms), repeating. The activity factor and the alternation
- * between a periodic and a noise-like excitation are what the bench needs
- * from it.
+ * The trials of a row, counted by the arm that started them and indexed by
+ * enum udsp_ec_nlms_trial_arm of dsp/lec.h.
  */
-static void css_fill(int16_t *dst, unsigned count, double level_dbm0,
-		     uint32_t *state, unsigned long *phase, unsigned rate)
+#define BENCH_ARMS	(UDSP_EC_NLMS_TRIAL_ARM_COHERE + 1u)
+
+static void arms_note(unsigned *arms, const struct udsp_ec *ec)
 {
-	double amplitude = dbm0_rms_get(level_dbm0);
-	unsigned long cycle = rate / 2u;
-	unsigned long burst_to = rate / 20u;
-	unsigned long noise_from = rate / 5u;
-	unsigned long noise_to = 2ul * rate / 5u;
-	unsigned i;
+	struct udsp_ec_nlms_frame reading;
 
-	for (i = 0; i < count; i++) {
-		unsigned long position = (*phase + i) % cycle;
-		double value = 0.0;
-		unsigned harmonic;
+	udsp_ec_nlms_frame_get(ec, &reading);
+	if (reading.trial_arm != UDSP_EC_NLMS_TRIAL_ARM_NONE &&
+	    reading.trial_arm < BENCH_ARMS)
+		arms[reading.trial_arm]++;
+}
 
-		if (position < burst_to) {
-			for (harmonic = 1; harmonic <= 12u; harmonic++)
-				value += sin(2.0 * M_PI * 100.0 * harmonic *
-					     (double)position /
-					     rate) / harmonic;
-			value *= amplitude * 0.8;
-		} else if (position >= noise_from && position < noise_to) {
-			double unit = rng_next(state) / 4294967295.0 * 2.0 -
-				1.0;
+static void arms_print(const unsigned *arms, int width)
+{
+	char text[48];
 
-			value = unit * amplitude * sqrt(3.0);
-		}
-		dst[i] = sample_clamp(value);
-	}
-	*phase = (*phase + count) % cycle;
+	snprintf(text, sizeof(text), "%u/%u/%u/%u",
+		 arms[UDSP_EC_NLMS_TRIAL_ARM_LATCH],
+		 arms[UDSP_EC_NLMS_TRIAL_ARM_PATH],
+		 arms[UDSP_EC_NLMS_TRIAL_ARM_STALE],
+		 arms[UDSP_EC_NLMS_TRIAL_ARM_COHERE]);
+	printf("%*s", width, text);
 }
 
 static void track_add(struct track *track, unsigned block, const int16_t *echo,
@@ -2030,6 +2018,7 @@ struct talk_result {
 	unsigned resets_trial;
 	unsigned resets_zero;
 	unsigned probes;
+	unsigned arms[BENCH_ARMS];
 	unsigned windows;
 	unsigned windows_hot;
 	double worst_window;
@@ -2096,6 +2085,7 @@ static void talk_run(unsigned line_rate, unsigned skew, double floor_dbm0,
 		memcpy(nlp_out, mic, frame * sizeof(*mic));
 		udsp_ec_nlms.run(ec, mic, ref_ec);
 		udsp_ec_nlms_info_get(ec, &info);
+		arms_note(out->arms, ec);
 		udsp_ec_nlms.run(nlp, nlp_out, ref_ec);
 		udsp_ec_nlms_info_get(nlp, &ninfo);
 		if (near_on && ninfo.nlp_active)
@@ -2161,6 +2151,7 @@ static void talk_run(unsigned line_rate, unsigned skew, double floor_dbm0,
 		for (i = 0; i < frame; i++)
 			mic[i] = sample_clamp((double)echo[i] + hiss[i]);
 		bench_ec_run(ec, mic, ref, frame);
+		arms_note(out->arms, ec);
 		for (i = 0; i < frame; i++) {
 			settle[0] += (double)echo[i] * echo[i];
 			settle[1] += (double)mic[i] * mic[i];
@@ -2184,24 +2175,26 @@ static void talk_table_print(unsigned line_rate, double floor_dbm0)
 	static const unsigned skews[] = { 0u, 15u, 22u, 30u, 45u };
 	unsigned row;
 
-	printf("  %-8s | %7s | %23s | %6s | %15s | %6s | %9s | %9s | %10s\n",
-	       "skew", "overlap", "resets", "probes", "echo windows",
-	       "adapt", "reconverge", "near repl", "clean repl");
-	printf("  %-8s | %7s | %6s | %6s | %5s | %6s | %6s | %6s | %6s | %9s |"
-	       " %9s | %10s\n", "frames", "", "trial", "zero", "total", "",
-	       "hot/N", "worst", "", "ms", "frames", "frames");
+	printf("  %-8s | %7s | %23s | %6s | %9s | %15s | %6s | %9s |"
+	       " %9s | %10s\n", "skew", "overlap", "resets", "probes",
+	       "by arm", "echo windows", "adapt", "reconverge", "near repl",
+	       "clean repl");
+	printf("  %-8s | %7s | %6s | %6s | %5s | %6s | %9s | %6s | %6s | %6s |"
+	       " %9s | %9s | %10s\n", "frames", "", "trial", "zero", "total",
+	       "", "l/p/s/c", "hot/N", "worst", "", "ms", "frames", "frames");
 	for (row = 0; row < sizeof(skews) / sizeof(skews[0]); row++) {
 		struct talk_result r;
 		char hot[24];
 
 		talk_run(line_rate, skews[row], floor_dbm0, &r);
 		snprintf(hot, sizeof(hot), "%u/%u", r.windows_hot, r.windows);
-		printf("  %8u | %6.0f%% | %6u | %6u | %5u | %6u | %6s | %6.1f | %5.0f%% | ",
+		printf("  %8u | %6.0f%% | %6u | %6u | %5u | %6u | ",
 		       skews[row],
 		       r.far_active ? 100.0 * r.overlap / r.far_active : 0.0,
 		       r.resets_trial, r.resets_zero,
-		       r.resets_trial + r.resets_zero, r.probes, hot,
-		       r.worst_window,
+		       r.resets_trial + r.resets_zero, r.probes);
+		arms_print(r.arms, 9);
+		printf(" | %6s | %6.1f | %5.0f%% | ", hot, r.worst_window,
 		       r.clean ? 100.0 * r.clean_adapt / r.clean : 0.0);
 		if (isnan(r.settle_ms))
 			printf("%9s", "never");
@@ -2219,7 +2212,11 @@ static void talk_print(unsigned line_rate)
 	       TALK_NEAR_DBM0, TALK_FLOOR_DBM0);
 	printf("overlap is the share of far-active frames the near end also talks on;\n");
 	printf("resets are split into trial aborts and the plain zero branch, which the\n");
-	printf("field sampling could not resolve; adapt is the share of the CLEAN far-only\n");
+	printf("field sampling could not resolve; by arm splits the probes by "
+	       "the arm that\n");
+	printf("started them: latch, path-change, stale run, coherence "
+	       "(l/p/s/c);\n");
+	printf("adapt is the share of the CLEAN far-only\n");
 	printf("frames the filter still learned from; echo is the regression gain of the\n");
 	printf("output on the injected echo over 0.5 s of near-end silence, the field method,\n");
 	printf("and hot counts the windows above %.0f dB, where the canceller hands back MORE\n",
@@ -2363,6 +2360,7 @@ struct far_noise_frame {
  */
 struct far_noise_result {
 	uint32_t probes;
+	unsigned arms[BENCH_ARMS];
 	uint32_t resets;
 	unsigned talk_frames;
 	unsigned talk_dt;
@@ -2578,6 +2576,9 @@ static void far_noise_run(const struct far_noise_row *row, unsigned line_rate,
 		if (row->kind == FAR_NOISE_STEP && f == FAR_NOISE_STEP_FRAME)
 			path_erl_set(&line.path, FAR_NOISE_STEP_ERL_DB);
 		far_noise_frame_run(&line, &p, &fr);
+		if (fr.reading.trial_arm != UDSP_EC_NLMS_TRIAL_ARM_NONE &&
+		    fr.reading.trial_arm < BENCH_ARMS)
+			out->arms[fr.reading.trial_arm]++;
 		if (p.talker)
 			far_noise_talk_add(out, &fr, line.frame);
 		if (p.erle && weak_active_get(fr.words, line.frame,
@@ -2635,8 +2636,10 @@ static void far_noise_talk_print(const struct far_noise_result *r)
 static void far_noise_row_print(const struct far_noise_row *row,
 				const struct far_noise_result *r)
 {
-	printf("  %-11s | %5.0f | %6u | %6u |", row->name, row->noise_dbm0,
-	       r->probes, r->resets);
+	printf("  %-11s | %5.0f | %6u | ", row->name, row->noise_dbm0,
+	       r->probes);
+	arms_print(r->arms, 9);
+	printf(" | %6u |", r->resets);
 	if (r->talk_frames)
 		far_noise_talk_print(r);
 	else
@@ -2704,13 +2707,13 @@ static void far_noise_table_print(unsigned line_rate)
 	bool stepped = false;
 	unsigned row;
 
-	printf("  %-11s | %5s | %6s | %6s | %6s | %6s | %8s | %9s | %7s |"
-	       " %9s | %6s | %7s | %6s\n", "row", "noise", "trials", "resets",
-	       "dt", "quiet", "exposure", "near loss", "added", "near repl",
-	       "ERLE", "floor", "gain");
-	printf("  %-11s | %5s | %6s | %6s | %6s | %6s | %8s | %9s | %7s |"
-	       " %9s | %6s | %7s | %6s\n", "", "dBm0", "", "", "", "", "frames",
-	       "dB", "dB", "frames", "dB", "dBov", "dB");
+	printf("  %-11s | %5s | %6s | %9s | %6s | %6s | %6s | %8s | %9s |"
+	       " %7s | %9s | %6s | %7s | %6s\n", "row", "noise", "trials",
+	       "by arm", "resets", "dt", "quiet", "exposure", "near loss",
+	       "added", "near repl", "ERLE", "floor", "gain");
+	printf("  %-11s | %5s | %6s | %9s | %6s | %6s | %6s | %8s | %9s |"
+	       " %7s | %9s | %6s | %7s | %6s\n", "", "dBm0", "", "l/p/s/c", "",
+	       "", "", "frames", "dB", "dB", "frames", "dB", "dBov", "dB");
 	for (row = 0; row < sizeof(rows) / sizeof(rows[0]); row++) {
 		far_noise_run(&rows[row], line_rate, &r);
 		far_noise_row_print(&rows[row], &r);
@@ -2771,6 +2774,9 @@ static void far_noise_print(unsigned line_rate)
 	printf("every column but ERLE, the processor off gives ERLE\n");
 	printf("trials and resets count the trials and the divergence resets "
 	       "of the row;\n");
+	printf("by arm splits the trials by the arm that started them: latch, "
+	       "path-change,\n");
+	printf("stale run, coherence (l/p/s/c);\n");
 	printf("dt is the share of the talker frames that end in double "
 	       "talk;\n");
 	printf("quiet is the share of the talker frames with a zero talker "
@@ -2801,6 +2807,302 @@ static void far_noise_print(unsigned line_rate)
 	       "has no near talker,\n");
 	printf("n/a that no frame of the row holds the figure\n");
 	far_noise_table_print(line_rate);
+}
+
+/*
+ * The louder-path rows. A flat 8 ms hybrid converges for 4 s on the far end of
+ * the row. The line then changes to the late 28 ms hybrid at 12 dB ERL, with
+ * the far-end history carried (path_history_carry). The ERL of the flat
+ * hybrid is 12 dB plus the step of the row, so the change makes the echo
+ * louder by that step, and the old estimate does not predict it. It is the
+ * change of G.168 test 2 Phase II, on the suite's own paths. The rows run the
+ * default tail of the line rate, with the processor off.
+ *
+ * The bench rebuilds the readings of two trial arms of dsp/lec.c from the
+ * frames that it passes in and gets back. It smooths them as the canceller
+ * does (LEC_ERLE_ALPHA):
+ * - the path-change escape reads the live residual over the live
+ *   microphone, on every frame;
+ * - the coherence escape reads the cross-correlation of the residual with
+ *   the estimate, on frames whose own reference is active. The estimate is
+ *   the microphone less the output.
+ * The output is saturated, so the rebuilt estimate equals the canceller's
+ * within half an LSB per sample.
+ */
+#define LOUDER_CONVERGE_FRAMES	400u
+#define LOUDER_AFTER_FRAMES	400u
+#define LOUDER_BLOCK_FRAMES	25u
+#define LOUDER_BAR_DB		20.0
+#define LOUDER_TO_ERL_DB	12.0
+#define LOUDER_ALPHA		0.1
+/* LEC_COHERE_BAR and LEC_COHERE_SHARE_MAX of dsp/lec.c. The run rebuilds
+ * cohere_get. An active frame counts when it follows a held frame, carries no
+ * talker and has both readings at or under their bars. Any other active frame
+ * clears the run. */
+#define LOUDER_COHERE_BAR	-0.10
+#define LOUDER_SHARE_MAX	0.5
+
+struct louder_track {
+	double mic;
+	double res;
+	double cross;
+	double res_power;
+	double est_power;
+};
+
+struct louder_result {
+	double ratio;
+	double ncc;
+	double erle_1s;
+	double settle_ms;
+	unsigned arm;
+	unsigned start;
+	unsigned held;
+	unsigned longest;
+	unsigned trials;
+	unsigned resets;
+};
+
+static void louder_track_add(struct louder_track *t, const int16_t *mic,
+			     const int16_t *out, unsigned frame, bool active)
+{
+	double mic_e = 0.0;
+	double res_e = 0.0;
+	double est_e = 0.0;
+	double cross = 0.0;
+	unsigned i;
+
+	for (i = 0; i < frame; i++) {
+		double est = (double)mic[i] - out[i];
+
+		mic_e += (double)mic[i] * mic[i];
+		res_e += (double)out[i] * out[i];
+		est_e += est * est;
+		cross += (double)out[i] * est;
+	}
+	t->mic += (mic_e / frame - t->mic) * LOUDER_ALPHA;
+	t->res += (res_e / frame - t->res) * LOUDER_ALPHA;
+	if (!active)
+		return;
+	t->cross += (cross / frame - t->cross) * LOUDER_ALPHA;
+	t->res_power += (res_e / frame - t->res_power) * LOUDER_ALPHA;
+	t->est_power += (est_e / frame - t->est_power) * LOUDER_ALPHA;
+}
+
+static double louder_ncc_get(const struct louder_track *t)
+{
+	if (!(t->res_power > 0.0) || !(t->est_power > 0.0))
+		return NAN;
+	return t->cross / sqrt(t->res_power * t->est_power);
+}
+
+/* The estimate energy over the microphone energy, the residual plus the
+ * estimate. */
+static double louder_share_get(const struct louder_track *t)
+{
+	double mic = t->res_power + t->est_power + 2.0 * t->cross;
+
+	return mic > 0.0 ? t->est_power / mic : NAN;
+}
+
+/* One active frame after the change into the rebuilt coherence run. */
+static void louder_run_add(struct louder_result *r, unsigned *run,
+			   const struct louder_track *t, bool held_before,
+			   bool talker)
+{
+	double ncc = louder_ncc_get(t);
+
+	r->held += held_before;
+	if (!held_before || talker) {
+		*run = 0;
+		return;
+	}
+	if (isnan(ncc))
+		return;
+	if (ncc <= LOUDER_COHERE_BAR &&
+	    louder_share_get(t) <= LOUDER_SHARE_MAX)
+		(*run)++;
+	else
+		*run = 0;
+	if (*run > r->longest)
+		r->longest = *run;
+}
+
+static void louder_ref_fill(enum source_kind kind, struct word_source *w,
+			    int16_t *ref, unsigned frame, uint32_t *state,
+			    unsigned long *phase, unsigned line_rate)
+{
+	if (kind == SOURCE_CSS)
+		css_fill(ref, frame, -10.0, state, phase, line_rate);
+	else if (kind == SOURCE_WORDS)
+		word_fill(w, ref, frame);
+	else
+		noise_fill(ref, frame, -10.0, state);
+}
+
+static void louder_run(enum source_kind kind, double step_db,
+		       unsigned line_rate, struct louder_result *r)
+{
+	unsigned frame = line_rate / 100u;
+	struct udsp_ec *ec = bench_ec_create(0, line_rate);
+	struct udsp_ec_nlms_frame reading;
+	struct udsp_ec_nlms_info info;
+	struct louder_track t = { 0.0, 0.0, 0.0, 0.0, 0.0 };
+	struct word_source words;
+	struct echo_path flat;
+	struct echo_path late;
+	uint32_t state = 0x13572468u;
+	uint32_t floor_state = 0x2468acefu;
+	unsigned long phase = 0;
+	double block[2] = { 0.0, 0.0 };
+	double first[2] = { 0.0, 0.0 };
+	unsigned active = 0;
+	unsigned run = 0;
+	uint32_t probes = 0;
+	bool held = false;
+	unsigned f;
+
+	memset(r, 0, sizeof(*r));
+	r->settle_ms = NAN;
+	r->ratio = NAN;
+	r->ncc = NAN;
+	udsp_ec_nlms.nlp(ec, false);
+	word_source_init(&words, line_rate, -20.0, 0x13572468u);
+	path_flat_init(&flat, line_rate, 8, LOUDER_TO_ERL_DB + step_db);
+	path_late_init(&late, line_rate, LOUDER_TO_ERL_DB);
+	for (f = 0; f < LOUDER_CONVERGE_FRAMES + LOUDER_AFTER_FRAMES; f++) {
+		struct echo_path *path = f < LOUDER_CONVERGE_FRAMES ? &flat :
+								      &late;
+		int16_t ref[UDSP_FRAME_MAX];
+		int16_t echo[UDSP_FRAME_MAX];
+		int16_t hiss[UDSP_FRAME_MAX];
+		int16_t mic[UDSP_FRAME_MAX];
+		int16_t out[UDSP_FRAME_MAX];
+		unsigned i;
+		bool after = f >= LOUDER_CONVERGE_FRAMES;
+
+		if (f == LOUDER_CONVERGE_FRAMES) {
+			path_history_carry(&late, &flat);
+			udsp_ec_nlms_info_get(ec, &info);
+			probes = info.probes;
+		}
+		louder_ref_fill(kind, &words, ref, frame, &state, &phase,
+				line_rate);
+		path_run(path, ref, echo);
+		noise_fill(hiss, frame, -70.0, &floor_state);
+		for (i = 0; i < frame; i++)
+			mic[i] = sample_clamp((double)echo[i] + hiss[i]);
+		memcpy(out, mic, frame * sizeof(*mic));
+		bench_ec_run(ec, out, ref, frame);
+		udsp_ec_nlms_frame_get(ec, &reading);
+		udsp_ec_nlms_info_get(ec, &info);
+		if (after && !r->start && info.probes != probes) {
+			r->arm = reading.trial_arm;
+			r->start = active + 1u;
+		}
+		louder_track_add(&t, mic, out, frame,
+				 reading.ref_power >= reading.ref_bar);
+		if (!after) {
+			held = info.double_talk;
+			continue;
+		}
+		if (reading.ref_power >= reading.ref_bar) {
+			active++;
+			if (!r->start)
+				louder_run_add(r, &run, &t, held,
+					       reading.talker);
+		}
+		held = info.double_talk;
+		if (!r->start) {
+			r->ratio = t.mic > 0.0 ? t.res / t.mic : NAN;
+			r->ncc = louder_ncc_get(&t);
+		}
+		for (i = 0; i < frame; i++) {
+			double e = (double)echo[i] * echo[i];
+			double o = (double)out[i] * out[i];
+
+			block[0] += e;
+			block[1] += o;
+			if (f < LOUDER_CONVERGE_FRAMES + FRAMES_PER_SECOND) {
+				first[0] += e;
+				first[1] += o;
+			}
+		}
+		if ((f + 1u - LOUDER_CONVERGE_FRAMES) % LOUDER_BLOCK_FRAMES)
+			continue;
+		if (isnan(r->settle_ms) &&
+		    erle_get(block[0], block[1]) >= LOUDER_BAR_DB)
+			r->settle_ms = 10.0 * (f + 1u - LOUDER_CONVERGE_FRAMES);
+		block[0] = block[1] = 0.0;
+	}
+	r->erle_1s = erle_get(first[0], first[1]);
+	r->trials = info.probes - probes;
+	r->resets = info.diverge_resets;
+	udsp_ec_nlms.destroy(ec);
+}
+
+static void louder_print(unsigned line_rate)
+{
+	static const enum source_kind kinds[] = {
+		SOURCE_NOISE, SOURCE_CSS, SOURCE_WORDS,
+	};
+	static const char *const names[] = { "white", "css", "words" };
+	static const double steps[] = { 0.0, 6.0, 10.0, 12.0 };
+	struct udsp_ec *ec = bench_ec_create(0, line_rate);
+	unsigned tail_ms = udsp_ec_nlms_tail_get(ec);
+	unsigned k;
+	unsigned s;
+
+	udsp_ec_nlms.destroy(ec);
+	printf("\nlouder-path rows at %u Hz, tail %u ms: a flat hybrid at 8 ms "
+	       "converges for %u s,\n", line_rate, tail_ms,
+	       LOUDER_CONVERGE_FRAMES / FRAMES_PER_SECOND);
+	printf("then the late 28 ms hybrid at %.0f dB ERL replaces it, the "
+	       "step louder;\n", LOUDER_TO_ERL_DB);
+	printf("white and css far ends at -10 dBm0, words at -20 dBm0, "
+	       "near-end floor -70 dBm0\n");
+	printf("ratio is the live residual over the live microphone and ncc "
+	       "the smoothed\n");
+	printf("cross-correlation of the residual with the estimate, both on "
+	       "the frame before the\n");
+	printf("first trial after the change; frame counts the active frames "
+	       "from the change to\n");
+	printf("its start; ERLE 1 s is the first second after the change; "
+	       "reconverge is the end\n");
+	printf("of the first block of %u frames at %.0f dB or more; trials "
+	       "and resets cover %u s;\n", LOUDER_BLOCK_FRAMES, LOUDER_BAR_DB,
+	       LOUDER_AFTER_FRAMES / FRAMES_PER_SECOND);
+	printf("held counts the active frames after a held frame and run the "
+	       "longest coherence run,\nboth up to the first trial\n");
+	printf("  %-6s | %4s | %6s | %6s | %6s | %5s | %5s | %4s | %8s | "
+	       "%10s | %6s | %6s\n", "source", "step", "ratio", "ncc", "arm",
+	       "frame", "held", "run", "ERLE 1 s", "reconverge", "trials",
+	       "resets");
+	printf("  %-6s | %4s | %6s | %6s | %6s | %5s | %5s | %4s | %8s | "
+	       "%10s | %6s | %6s\n", "", "dB", "", "", "", "", "", "", "dB",
+	       "ms", "", "");
+	for (k = 0; k < sizeof(kinds) / sizeof(kinds[0]); k++) {
+		for (s = 0; s < sizeof(steps) / sizeof(steps[0]); s++) {
+			struct louder_result r;
+
+			louder_run(kinds[k], steps[s], line_rate, &r);
+			printf("  %-6s | %4.0f | ", names[k], steps[s]);
+			if (r.start)
+				printf("%6.3f | %6.3f | %6s | %5u | ", r.ratio,
+				       r.ncc, lecr_trial_arm_name(r.arm),
+				       r.start);
+			else
+				printf("%6s | %6s | %6s | %5s | ", "-", "-",
+				       "none", "-");
+			printf("%5u | %4u | %8.2f | ", r.held, r.longest,
+			       r.erle_1s);
+			if (isnan(r.settle_ms))
+				printf("%10s", "never");
+			else
+				printf("%10.0f", r.settle_ms);
+			printf(" | %6u | %6u\n", r.trials, r.resets);
+		}
+	}
 }
 
 /*
@@ -3088,6 +3390,7 @@ int main(int argc, char **argv)
 	field_print(line_rate);
 	talk_print(line_rate);
 	far_noise_print(line_rate);
+	louder_print(line_rate);
 	path_table_print(line_rate, seed_first);
 
 	path_composite_init(&path, line_rate, 12.0);
