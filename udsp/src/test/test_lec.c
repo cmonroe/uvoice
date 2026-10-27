@@ -21947,12 +21947,66 @@ static int16_t dt_sample_get(struct css_annex *s, unsigned long n,
 	return v;
 }
 
+/* 18 dB: LEC_HOLD_GUARD_RATIO of dsp/lec.c, as the same float. */
+#define DT_GUARD_RATIO		63.095734f
+
+/*
+ * The frames of a dt line in the short hangover of a thin onset verdict
+ * (dsp/lec.c hold_guard_apply), from the frame readings. Such a frame comes
+ * q frames after a verdict on the first frame of an active window on the
+ * classic arm. Its hangover reads 5 - q at the frame start, and no trial
+ * runs. The counts:
+ * - held: these frames;
+ * - guarded: held frames whose estimate stands DT_GUARD_RATIO or more over
+ *   the microphone; emitted: guarded frames that output the microphone;
+ * - under: held frames whose estimate stands at or over the microphone but
+ *   under DT_GUARD_RATIO; under_emitted: under frames that output the
+ *   microphone.
+ */
+struct dt_guard_count {
+	unsigned since;
+	bool onset;
+	unsigned held;
+	unsigned guarded;
+	unsigned emitted;
+	unsigned under;
+	unsigned under_emitted;
+};
+
+static void dt_guard_frame(struct dt_guard_count *g, struct udsp_ec *ec,
+			   const int16_t *in, const int16_t *out,
+			   unsigned frame)
+{
+	struct udsp_ec_nlms_frame fr;
+	unsigned q;
+	bool same;
+
+	udsp_ec_nlms_frame_get(ec, &fr);
+	q = ++g->since;
+	if (g->onset && q <= 4u && fr.hold_left == 5u - q && !fr.probing) {
+		g->held++;
+		same = !memcmp(in, out, sizeof(*in) * frame);
+		if (fr.estimate_power >= fr.mic_power * DT_GUARD_RATIO) {
+			g->guarded++;
+			g->emitted += same;
+		} else if (fr.estimate_power >= fr.mic_power &&
+			   fr.mic_power > 0.0f) {
+			g->under++;
+			g->under_emitted += same;
+		}
+	}
+	if (fr.dt_fired) {
+		g->onset = fr.classic_arm && fr.window_run == 1u;
+		g->since = 0;
+	}
+}
+
 /* The figures of the line at far_dbm0 with a near end x_db under it. They
  * follow converge periods of the far end alone. The far end starts phase
- * samples into a frame. */
-static void dt_line_run(unsigned rate, double far_dbm0, double x_db,
-			unsigned converge, unsigned phase,
-			struct dt_line_result *r)
+ * samples into a frame. A non-NULL g takes the counts of dt_guard_frame. */
+static void dt_line_watch(unsigned rate, double far_dbm0, double x_db,
+			  unsigned converge, unsigned phase,
+			  struct dt_line_result *r, struct dt_guard_count *g)
 {
 	struct udsp_ec_nlms_info info;
 	struct css_annex far_src;
@@ -21992,6 +22046,7 @@ static void dt_line_run(unsigned rate, double far_dbm0, double x_db,
 		int16_t hiss[UDSP_FRAME_MAX];
 		int16_t near[UDSP_FRAME_MAX];
 		int16_t mic[UDSP_FRAME_MAX];
+		int16_t in[UDSP_FRAME_MAX];
 
 		for (i = 0; i < frame; i++) {
 			unsigned long n = (unsigned long)f * frame + i;
@@ -22006,7 +22061,10 @@ static void dt_line_run(unsigned rate, double far_dbm0, double x_db,
 		for (i = 0; i < frame; i++)
 			mic[i] = sample_clamp((double)echo[i] + hiss[i] +
 					      near[i]);
+		memcpy(in, mic, sizeof(*mic) * frame);
 		udsp_ec_nlms.run(ec, mic, ref);
+		if (g)
+			dt_guard_frame(g, ec, in, mic, frame);
 		udsp_ec_nlms_info_get(ec, &info);
 		if ((unsigned long)f * frame >= dt0 &&
 		    (unsigned long)f * frame < dt1 && info.double_talk)
@@ -22028,6 +22086,14 @@ static void dt_line_run(unsigned rate, double far_dbm0, double x_db,
 	r->trials = info.probes;
 	r->resets = info.diverge_resets;
 	udsp_ec_nlms.destroy(ec);
+}
+
+/* dt_line_watch without the count of dt_guard_frame. */
+static void dt_line_run(unsigned rate, double far_dbm0, double x_db,
+			unsigned converge, unsigned phase,
+			struct dt_line_result *r)
+{
+	dt_line_watch(rate, far_dbm0, x_db, converge, phase, r, NULL);
 }
 
 static void dt_line_print(unsigned rate, const char *what,
@@ -22122,6 +22188,58 @@ static void dt3a_phase_test(unsigned rate)
 	dt_line_print(rate, "test 3A, tail frame", &r);
 	CHECK(r.l_res_dbm0 <= r.l_sgen_act);
 	CHECK(r.held <= DT_HELD_MAX);
+}
+
+/* The far onset of the second leg of dt3a_guard_test, in samples at 16 kHz
+ * before a frame end. At -25 dBm0 its holds carry frames whose estimate
+ * stands 18 to 24 dB over the microphone. */
+#define DT_GUARD_SAMPLES_WB	12u
+
+/* The figures and checks of one leg of dt3a_guard_test at far_dbm0, with
+ * the far onset at phase. */
+static void dt_guard_check(unsigned rate, double far_dbm0, unsigned phase,
+			   const struct dt_guard_count *g,
+			   const struct dt_line_result *r)
+{
+	printf("# %u Hz, %.0f dBm0, far onset at sample %u of the frame: %u "
+	       "frames in the hold of a thin onset, %u of them 18 dB or more "
+	       "over the microphone, %u emit it; %u under 18 dB, %u emit it\n",
+	       rate, far_dbm0, phase, g->held, g->guarded, g->emitted, g->under,
+	       g->under_emitted);
+	dt_line_print(rate, "test 3A, guard of a thin-onset hold", r);
+	CHECK(g->guarded > 0u);
+	CHECK(g->emitted == g->guarded);
+	CHECK(g->under_emitted == 0u);
+	CHECK(r->l_res_dbm0 <= r->l_sgen_act);
+}
+
+/*
+ * G.168 test 3A with a thin far onset. A frame in the short hangover of a thin
+ * onset emits the microphone when its estimate stands DT_GUARD_RATIO or more
+ * over it (dsp/lec.c hold_guard_apply). A held frame under that margin emits
+ * the filter output. The first leg runs at -10 dBm0 with the far onset of
+ * dt3a_phase_test. The second runs at -25 dBm0 with the far onset
+ * DT_GUARD_SAMPLES_WB before a frame end. Each leg must hold guarded frames,
+ * and l_res_dbm0 must stay at L_Sgen,act or under.
+ */
+static void dt3a_guard_test(unsigned rate)
+{
+	struct dt_guard_count g;
+	struct dt_line_result r;
+	unsigned phase;
+
+	phase = dt_thin_phase_get(rate);
+	memset(&g, 0, sizeof(g));
+	dt_line_watch(rate, -10.0, 15.0, 0u, phase, &r, &g);
+	case_rate(rate, "lec emits the microphone on the held frames of a thin "
+		  "onset whose estimate stands over it");
+	dt_guard_check(rate, -10.0, phase, &g, &r);
+	phase = rate / 100u - dt_samples_get(DT_GUARD_SAMPLES_WB, rate);
+	memset(&g, 0, sizeof(g));
+	dt_line_watch(rate, -25.0, 15.0, 0u, phase, &r, &g);
+	case_rate(rate, "lec emits the microphone on the held frames of a thin "
+		  "onset at -25 dBm0");
+	dt_guard_check(rate, -25.0, phase, &g, &r);
 }
 
 /* The bounds of dt3b_test on the rise over the line of G.168 Figure 11: 10 dB
@@ -28854,6 +28972,8 @@ int main(int argc, char **argv)
 	resume_zero_cut_test(UDSP_SAMPLE_RATE);
 	resume_zero_cut_test(UDSP_SAMPLE_RATE_WB);
 	replay_gap_test();
+	dt3a_guard_test(UDSP_SAMPLE_RATE);
+	dt3a_guard_test(UDSP_SAMPLE_RATE_WB);
 	failed = tu_summary("lec");
 	printf("# lec per-tap path: %s\n",
 	       udsp_ec_nlms_path_name(udsp_ec_nlms_path_get()));

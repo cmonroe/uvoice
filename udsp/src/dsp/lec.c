@@ -128,6 +128,9 @@
 /* 6 dB: the bar bound of a thin pair. A tail frame's bar falls with the window
  * maximum (hangover_get). */
 #define LEC_GEIGEL_PAIR_RATIO	4.0f
+/* 18 dB: a frame in the short hangover of a thin onset emits its microphone
+ * when its estimate stands this far over it (hold_guard_apply). */
+#define LEC_HOLD_GUARD_RATIO	63.095734f
 /* 12 dB: a window-active frame whose microphone exceeds the guard window by
  * this is a near talker (talker_get). No path of the
  * suite returns its echo that far over; talker_ratio adds the loss. */
@@ -344,6 +347,9 @@ struct lec_belief {
 	/* The running hangover is the short one of a verdict on a thin
 	 * frame. */
 	bool dt_thin;
+	/* The running hangover is the short one of a verdict on a thin
+	 * onset frame (hold_guard_apply). */
+	bool dt_onset;
 	/* The running hangover is a short one (nlp_hold_update). */
 	bool dt_short;
 	/* The trust count (LEC_GEIGEL_TRUST_FRAMES), saturating at UINT16_MAX;
@@ -1600,6 +1606,7 @@ static void probe_finish(struct udsp_ec *ec)
 	noise_rise_reacquire(ec);
 	ec->belief.dt_hangover = 0;
 	ec->belief.dt_thin = false;
+	ec->belief.dt_onset = false;
 	ec->belief.dt_short = false;
 	runs_clear(ec);
 }
@@ -2201,6 +2208,8 @@ static void doubletalk_update(struct udsp_ec *ec, struct lec_tick *t)
 		ec->belief.dt_thin =
 			ec->belief.dt_hangover == LEC_GEIGEL_HANGOVER_SHORT &&
 			thin_frame_get(ec, t);
+		ec->belief.dt_onset = ec->belief.dt_thin &&
+				      t->classic_arm && ec->window_run == 1u;
 		ec->belief.dt_short =
 			ec->belief.dt_hangover == LEC_GEIGEL_HANGOVER_SHORT;
 		/* A short verdict on a thin frame leaves the repeat count
@@ -3115,6 +3124,20 @@ static const int16_t *nlp_fade_source_get(const struct udsp_ec *ec,
 	return in_energy < out_energy ? t->input : out;
 }
 
+/*
+ * The short hangover of a verdict on a thin onset frame holds the frames
+ * before the echo, and the estimate of the held taps reaches the output.
+ * ec_run calls the guard last, on
+ * a frame that the processor left as the residual. No state reads the
+ * output, so every tracker reads the frame as it does without the guard.
+ */
+static void hold_guard_apply(const struct udsp_ec *ec,
+			     const struct lec_tick *t, int16_t *out)
+{
+	if (t->estimate_power >= t->mic_power * LEC_HOLD_GUARD_RATIO)
+		memcpy(out, t->input, sizeof(*out) * ec->frame);
+}
+
 static void nlp_apply(struct udsp_ec *ec, struct lec_tick *t, int16_t *out)
 {
 	enum nlp_verdict verdict;
@@ -3426,6 +3449,8 @@ static void ec_run(struct udsp_ec *ec, int16_t *mic, const int16_t *ref)
 	unsigned peak0;
 	bool onset_plain;
 	bool zero;
+	bool onset_hold;
+	bool nlp_was;
 	bool adapt;
 
 	memset(&t, 0, sizeof(t));
@@ -3460,6 +3485,9 @@ static void ec_run(struct udsp_ec *ec, int16_t *mic, const int16_t *ref)
 	ref_floor_add(&ec->ref_floor, t.ref_power);
 	t.active = t.ref_power >= t.ref_bar;
 	t.probing = ec->probe_frames != 0u;
+	/* The frame starts inside the short hangover of a thin onset
+	 * (hold_guard_apply). */
+	onset_hold = double_talk_get(ec) && ec->belief.dt_onset;
 	adapt = t.active && !ec->freeze_on && !t.held &&
 		(t.probing || (!double_talk_get(ec) && !ec->drop_hold));
 	/* The denominator floor of this frame: power_floor plus the tracked
@@ -3597,7 +3625,10 @@ static void ec_run(struct udsp_ec *ec, int16_t *mic, const int16_t *ref)
 		onset_peak_update(ec, &t, peak0, onset_plain && adapt);
 	}
 	tone_tail_update(ec, &t);
+	nlp_was = ec->nlp_active;
 	nlp_apply(ec, &t, mic);
+	if (onset_hold && !adapt && !nlp_was && !ec->nlp_active)
+		hold_guard_apply(ec, &t, mic);
 	ec->frames++;
 	reading_fill(ec, &t);
 }
@@ -3743,6 +3774,7 @@ void udsp_ec_nlms_reset(struct udsp_ec *ec)
 	ec->hist_energy = 0.0;
 	ec->belief.dt_hangover = 0;
 	ec->belief.dt_thin = false;
+	ec->belief.dt_onset = false;
 	ec->belief.dt_short = false;
 	ec->dt_run = 0;
 	ec->dt_gap = LEC_GEIGEL_REPEAT_FRAMES;
