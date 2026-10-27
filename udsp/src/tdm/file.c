@@ -92,6 +92,7 @@ static struct udsp_tdm *tdm_file_open(const char *play_dev,
 	t->geom.capture_periods = want->prefill_periods;
 	t->geom.paced = false;	/* virtual clock */
 	t->geom.tx_restarts = false;	/* got-only: no playback DMA */
+	t->geom.pointer_exact = false;	/* got-only: no pointer */
 	/* A virtual clock runs at any rate, so the grant is the request with
 	 * the zero normalised to 8000. */
 	t->geom.rate = want->rate ? want->rate : 8000u;

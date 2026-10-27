@@ -329,6 +329,7 @@ int udsp_engine_create(struct udsp *s)
 				      memory_order_relaxed);
 	}
 	atomic_store_explicit(&s->lec_loop, 0u, memory_order_relaxed);
+	atomic_store_explicit(&s->lec_exact, false, memory_order_relaxed);
 
 	memset(&opts, 0, sizeof(opts));
 	opts.max_ticks = s->max_ticks;
@@ -2096,6 +2097,7 @@ static struct udsp *udsp_alloc(const struct udsp_config *cfg, int event_fd)
 		atomic_init(&s->lec_delay[i], 0u);
 	}
 	atomic_init(&s->lec_loop, 0u);
+	atomic_init(&s->lec_exact, false);
 	atomic_init(&s->ack_drop_op, 0u);
 	atomic_init(&s->prep_fail, 0u);
 	atomic_init(&s->debug, 0u);

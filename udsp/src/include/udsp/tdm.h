@@ -87,6 +87,23 @@ struct udsp_tdm_geom {
 	 * field makes the struct larger, so a back end or a caller built
 	 * apart from libudsp must be rebuilt against this header. */
 	bool tx_restarts;
+	/* got only: the pointers of both directions count samples, so a
+	 * delay or avail reading follows the physical loop to the sample
+	 * (the MediaTek AFE parts MT7981, MT7986, MT7987, MT7988, MT7622).
+	 * False when either pointer moves in whole periods
+	 * (SNDRV_PCM_INFO_BATCH, AN7581). The engine sizes the canceller's
+	 * causal guard by it (core/chan.c chan_lec_margin).
+	 *
+	 * The bool sits in the tail padding after tx_restarts, so it adds no
+	 * size and moves no offset. Every tdm back end is inside libudsp; the
+	 * library loads a SLIC and a fax plug-in, never a tdm back end. A test
+	 * back end that udsp_tdm_override injects builds against this header.
+	 * As for tx_restarts, a back end or a caller built apart from libudsp
+	 * must be rebuilt against this header. Each built-in back end sets the
+	 * field after its last whole-struct copy. The engine zeroes got before
+	 * the open, so a back end that copies the request reads false, the
+	 * period-granular rule that holds on every part. */
+	bool pointer_exact;
 };
 
 /* The direction a refusal belongs to; NONE for the pair or the arguments. */

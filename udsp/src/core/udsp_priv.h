@@ -390,9 +390,11 @@ struct udsp {
 	 * is the slic thread, and the reader never met it. */
 	_Atomic uint_least32_t lec_delay[UDSP_LINE_MAX];
 	atomic_bool lec_ready[UDSP_LINE_MAX];
-	/* The loop the echo of a played digit crosses (chan.h loop_last). The
-	 * tick publishes it for chan_digit_hold_arm. */
+	/* The loop the echo of a played digit crosses (chan.h loop_last), and
+	 * whether the pointers of the engine count samples (chan.h exact). The
+	 * tick publishes both for chan_digit_hold_arm. */
 	_Atomic uint_least32_t lec_loop;
+	atomic_bool lec_exact;
 	/* The per-line canceller state the tick publishes and
 	 * udsp_line_lec_stats copies. lec_valid says a publish succeeded for a
 	 * canceller the line runs right now, the "not for this configuration

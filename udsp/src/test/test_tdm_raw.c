@@ -969,6 +969,61 @@ int main(void)
 		CHECK_UINT(tdm_raw_sample_offset_get(1280, 2, 3), 1286);
 	}
 
+	/* geom.pointer_exact follows the BATCH bit of both directions: a
+	 * sample-accurate pointer on the MediaTek front ends, a
+	 * period-granular one on AN7581, on the interleaved BATCH model
+	 * and on a pair that sets the bit on one direction alone. */
+	CASE("raw open grants a sample-accurate pointer where both directions "
+	     "clear BATCH");
+	{
+		static const struct {
+			const struct fk_profile *prof;
+			unsigned rate;
+			bool exact;
+		} part[] = {
+			{ &fk_an7581, 16000, false },
+			{ &fk_mt7986, 16000, true },
+			{ &fk_mt2701, 8000, true },
+			{ &fk_batch_mmap, 8000, false },
+			{ &fk_mixed_play_batch, 16000, false },
+			{ &fk_mixed_capture_batch, 16000, false },
+		};
+		struct udsp_tdm_geom want, got;
+		struct udsp_tdm *t;
+
+		for (unsigned i = 0; i < sizeof(part) / sizeof(part[0]); i++) {
+			fk_reset(part[i].prof);
+			t = fk_pair_open(part[i].rate, part[i].rate / 100u,
+					 2, 4, &got);
+			CHECK(t != NULL);
+			CHECK(got.pointer_exact == part[i].exact);
+			if (t)
+				udsp_tdm_alsa_raw.close(t);
+		}
+
+		/* The grant is a whole-struct copy of the geometry the back end
+		 * keeps, and geom_fill sets the field in that geometry. A grant
+		 * whose bytes start as a fill pattern, and a request that asks
+		 * the opposite, therefore read what the device states. */
+		for (unsigned i = 0; i < sizeof(part) / sizeof(part[0]); i++) {
+			memset(&want, 0, sizeof(want));
+			want.frames_per_period = part[i].rate / 100u;
+			want.channels = 2;
+			want.prefill_periods = 4;
+			want.layout = UDSP_TDM_INTERLEAVED;
+			want.rate = part[i].rate;
+			want.pointer_exact = !part[i].exact;
+			memset(&got, 0xa5, sizeof(got));
+			fk_reset(part[i].prof);
+			t = udsp_tdm_alsa_raw.open("hw:0,0", "hw:0,1", &want,
+						   &got, NULL);
+			CHECK(t != NULL);
+			CHECK(got.pointer_exact == part[i].exact);
+			if (t)
+				udsp_tdm_alsa_raw.close(t);
+		}
+	}
+
 	CASE("raw open grants a geometry on each driver profile");
 	{
 		struct udsp_tdm_geom got;

@@ -66,9 +66,11 @@ static enum udsp_tdm_layout tdm_alsa_layout(snd_pcm_access_t access)
 	return UDSP_TDM_INTERLEAVED;
 }
 
+/* batch takes SND_PCM_INFO_BATCH of the granted setup: the pointer of the
+ * direction moves in period steps (tdm.h pointer_exact). */
 static int tdm_alsa_configure(snd_pcm_t *pcm, const struct udsp_tdm_geom *want,
-			      struct udsp_tdm_geom *got, enum udsp_tdm_dir dir,
-			      struct udsp_tdm_fail *fail)
+			      struct udsp_tdm_geom *got, bool *batch,
+			      enum udsp_tdm_dir dir, struct udsp_tdm_fail *fail)
 {
 	snd_pcm_hw_params_t *hw;
 	/* The token and the class of the call under way, so the record written
@@ -189,6 +191,7 @@ static int tdm_alsa_configure(snd_pcm_t *pcm, const struct udsp_tdm_geom *want,
 	got->prefill_periods = (unsigned)(buffer / period);
 	got->layout = tdm_alsa_layout(access);
 	got->rate = got_rate;
+	*batch = snd_pcm_hw_params_is_batch(hw) == 1;
 	err = 0;
 out:
 	snd_pcm_hw_params_free(hw);
@@ -280,11 +283,12 @@ static struct udsp_tdm *tdm_alsa_open(const char *play_dev,
 	}
 
 	struct udsp_tdm_geom pg = {0}, cg = {0};
-	if (tdm_alsa_configure(t->play, want, &pg, UDSP_TDM_DIR_PLAYBACK,
-			       fail) < 0)
+	bool play_batch = true, capture_batch = true;
+	if (tdm_alsa_configure(t->play, want, &pg, &play_batch,
+			       UDSP_TDM_DIR_PLAYBACK, fail) < 0)
 		goto fail;
-	if (tdm_alsa_configure(t->capture, want, &cg, UDSP_TDM_DIR_CAPTURE,
-			       fail) < 0)
+	if (tdm_alsa_configure(t->capture, want, &cg, &capture_batch,
+			       UDSP_TDM_DIR_CAPTURE, fail) < 0)
 		goto fail;
 
 	/* AN7581 shares DCHENR between both DMA rings and rewrites CHBFOSR at
@@ -341,6 +345,9 @@ static struct udsp_tdm *tdm_alsa_open(const char *play_dev,
 	 * completes. */
 	got->prefill_periods = pg.prefill_periods;
 	got->capture_periods = cg.prefill_periods;
+	/* The loop the engine measures sums both directions, so both
+	 * pointers must count samples. */
+	got->pointer_exact = !play_batch && !capture_batch;
 	return t;
 fail:
 	tdm_alsa_close(t);

@@ -121,6 +121,29 @@ int main(void)
 		unlink(path);
 	}
 
+	/* The back end copies the request into its geometry. It must then
+	 * set the field itself, so a request that carries true and a grant
+	 * whose bytes start as a fill pattern still read false. */
+	CASE("file open grants a period-granular pointer whatever the request "
+	     "and the grant carried");
+	{
+		char path[64];
+		tmp_path(path);
+		struct udsp_tdm_geom want = t_want;
+		struct udsp_tdm_geom got;
+
+		want.pointer_exact = true;
+		memset(&got, 0xa5, sizeof(got));
+		struct udsp_tdm *t = udsp_tdm_file.open(NULL, path, &want, &got,
+							NULL);
+		CHECK(t != NULL);
+		if (t) {
+			CHECK(!got.pointer_exact);
+			udsp_tdm_file.close(t);
+		}
+		unlink(path);
+	}
+
 	CASE("file grants the requested rate at both rates");
 	{
 		char path[64];

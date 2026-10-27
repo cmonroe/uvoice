@@ -159,6 +159,13 @@ struct engine_stats {
 	unsigned period_us;
 	unsigned channels;
 	bool paced;			/* the backend clocks the tick itself */
+	/* The pointers of the opened device count samples (MT7981, MT7986,
+	 * MT7987, MT7988, MT7622), so a loop_ref reading follows the physical
+	 * loop to the sample.
+	 * False when a pointer moves in whole periods (AN7581), or when the
+	 * back end leaves the field unset (tdm.h pointer_exact). chan.c sizes
+	 * the canceller's causal guard by it (chan_lec_margin). */
+	bool pointer_exact;
 	int last_errno;
 	bool running;
 	bool stopped_fatal;

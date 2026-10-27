@@ -199,6 +199,13 @@ static long tc_hold_bias;
  * reads a loop of 240 at rest and 400 after any hold. */
 #define TC_HOLD_SHIFT	160L
 
+/* The next open of tc_ops or tc_hold_ops grants a sample-accurate pointer
+ * (tdm.h pointer_exact). tc_backend_reset leaves it alone, because
+ * every up helper resets the back end before its open. A case sets it before
+ * its up and clears it after. Left false, the model reads period-granular,
+ * the AN7581 rule. */
+static atomic_bool tc_open_exact;
+
 static void tc_backend_reset(void)
 {
 	eh_be_reset(true);
@@ -240,6 +247,8 @@ static struct udsp_tdm *tc_open(const char *play, const char *cap,
 				struct udsp_tdm_geom *got,
 				struct udsp_tdm_fail *fail)
 {
+	struct udsp_tdm *t;
+
 	tc_be.opens++;
 	/* A device that will not take this rate at all, which is the first
 	 * half of the settle: the back end's own geometry answer (tdm.h
@@ -248,8 +257,10 @@ static struct udsp_tdm *tc_open(const char *play, const char *cap,
 		tdm_fail_set(fail, UDSP_TDM_DIR_PLAYBACK, true, -EINVAL, "rate");
 		return NULL;
 	}
+	t = eh_open_geom(want, got);
+	got->pointer_exact = atomic_load(&tc_open_exact);
 
-	return eh_open_geom(want, got);
+	return t;
 }
 
 static int tc_start_be(struct udsp_tdm *t) { return tc_be.start_err; }
@@ -6258,6 +6269,139 @@ static void case_lec_ref_rule(void)
 }
 
 /*
+ * The reference rule on a sample-accurate pointer (core/chan.c
+ * chan_lec_margin), on line 0 of a tracker at 16 kHz. Its margin is 2.5 ms,
+ * 40 samples. That margin is both the guard under the loop and the tolerance
+ * of a sticky reference. Values that case_lec_ref_rule reads on the AN7581
+ * model therefore differ on this pointer. The reach clamp and its floor of
+ * one frame do not depend on the pointer.
+ */
+static void case_lec_ref_rule_exact(void)
+{
+	struct chan_lec_track tr;
+	struct engine_stats st;
+	uint32_t delay = 0;
+
+	memset(&st, 0, sizeof(st));
+	st.prefill_periods = 3;
+	st.frames_per_period = TC_REF_FRAME;
+	st.pointer_exact = true;
+
+	CASE("a sample-accurate pointer stands the reference 40 samples under "
+	     "the loop at 16 kHz");
+	{
+		/* One period of guard would apply 320 to this loop. */
+		tc_ref_seed(&tr, &st, 1, 480);
+		CHECK(tr.exact);
+		CHECK_UINT(tr.line[0].delay, 440);
+
+		/* 40 above is inside the tolerance, inclusive, and 41 is a
+		 * move. The same holds on the way down. */
+		st.loop_ref = 520;
+		st.cal_restarts = 1;
+		tc_ref_check(&tr, &st, CHAN_LEC_KEEP, 0, 440);
+		st.loop_ref = 521;
+		tc_ref_check(&tr, &st, CHAN_LEC_RETIME, 1, 481);
+		st.loop_ref = 481;
+		tc_ref_check(&tr, &st, CHAN_LEC_KEEP, 0, 481);
+		st.loop_ref = 480;
+		tc_ref_check(&tr, &st, CHAN_LEC_RETIME, 1, 440);
+
+		/* A move of one period up re-times. A tolerance of one period
+		 * would keep the value. */
+		st.loop_ref = 640;
+		tc_ref_check(&tr, &st, CHAN_LEC_RETIME, 1, 600);
+
+		/* The reach bound, and the floor of one frame. */
+		tc_ref_seed(&tr, &st, 2, 4160);
+		CHECK_UINT(tr.line[0].delay, 3936);
+		tc_ref_seed(&tr, &st, 3, 180);
+		CHECK_UINT(tr.line[0].delay, TC_REF_FRAME);
+	}
+
+	CASE("a sample-accurate pointer stands the reference 20 samples under "
+	     "the loop at 8 kHz");
+	{
+		memset(&tr, 0, sizeof(tr));
+		st.serial = 4;
+		st.cal_restarts = 0;
+		st.delay_calibrated = true;
+		st.frames_per_period = 80;
+		st.loop_ref = 240;
+		chan_lec_measure(&tr, &st);
+		CHECK_UINT(chan_lec_line_decide(&tr, 0, 8000, 80, &delay),
+			   CHAN_LEC_KEEP);
+		CHECK_UINT(delay, 220);
+		st.loop_ref = 260;
+		chan_lec_measure(&tr, &st);
+		CHECK_UINT(chan_lec_line_decide(&tr, 0, 8000, 80, &delay),
+			   CHAN_LEC_KEEP);
+		CHECK_UINT(delay, 220);
+		st.loop_ref = 261;
+		chan_lec_measure(&tr, &st);
+		CHECK_UINT(chan_lec_line_decide(&tr, 0, 8000, 80, &delay),
+			   CHAN_LEC_RETIME);
+		CHECK_UINT(delay, 241);
+		st.frames_per_period = TC_REF_FRAME;
+	}
+
+	CASE("the pointer kind follows the engine");
+	{
+		/* A replacement engine on a period-granular pointer applies
+		 * one period of guard to the same loop. */
+		tc_ref_seed(&tr, &st, 5, 480);
+		CHECK_UINT(tr.line[0].delay, 440);
+		st.serial = 6;
+		st.pointer_exact = false;
+		tc_ref_check(&tr, &st, CHAN_LEC_KEEP, 1, 320);
+		CHECK(!tr.exact);
+	}
+
+	CASE("a 100 sample move at 16 kHz re-times on a sample-accurate "
+	     "pointer and keeps on a period-granular one");
+	{
+		st.pointer_exact = true;
+		tc_ref_seed(&tr, &st, 7, 480);
+		st.loop_ref = 580;
+		st.cal_restarts = 1;
+		tc_ref_check(&tr, &st, CHAN_LEC_RETIME, 1, 540);
+		st.pointer_exact = false;
+		tc_ref_seed(&tr, &st, 8, 480);
+		st.loop_ref = 580;
+		st.cal_restarts = 1;
+		tc_ref_check(&tr, &st, CHAN_LEC_KEEP, 0, 320);
+	}
+
+	/* The nominal prefill is no reading of the loop, so it keeps one
+	 * period of margin on a sample-accurate pointer too (core/chan.c
+	 * chan_lec_loop_pick). The first window more than one period from it
+	 * moves the line onto the measured loop and the 40-sample margin. */
+	CASE("the nominal prefill keeps one period of margin on a "
+	     "sample-accurate pointer");
+	{
+		memset(&tr, 0, sizeof(tr));
+		st.pointer_exact = true;
+		st.serial = 9;
+		st.cal_restarts = 0;
+		st.delay_calibrated = false;
+		tc_ref_check(&tr, &st, CHAN_LEC_HOLD, 1, 0);
+		CHECK(tr.nominal);
+		st.cal_restarts = 3;
+		tc_ref_check(&tr, &st, CHAN_LEC_KEEP, 0, 320);
+		CHECK(tr.line[0].nominal);
+		/* 80 from the nominal: inside its one period, so it stands. */
+		st.delay_calibrated = true;
+		st.loop_ref = 560;
+		tc_ref_check(&tr, &st, CHAN_LEC_KEEP, 0, 320);
+		CHECK(!tr.nominal);
+		CHECK(tr.line[0].nominal);
+		st.loop_ref = 800;
+		tc_ref_check(&tr, &st, CHAN_LEC_RETIME, 1, 760);
+		CHECK(!tr.line[0].nominal);
+	}
+}
+
+/*
  * The canceller against a hold. Every episode restarts the delay calibration,
  * so the canceller freezes until the new window completes; a window that
  * completes must not spend the allowance the fallback counts, or a run of
@@ -6439,20 +6583,28 @@ static bool tc_lec_frames_wait(struct eh *t, struct udsp_lec_stats *ls,
 
 /*
  * The peak tap of a filter on the model hybrid. The hybrid returns the
- * playback of three ticks before, a loop of 240 samples at 8 kHz. The
- * reference stands one period under the loop at 160, so the echo sits at tap
- * 80. A dial tone does not pin the solution to that tap. A delay of 91
- * samples is within half a sample of four periods of 350 Hz and of five
- * periods of 440 Hz, so tap 171 carries almost the same echo, and the filter
- * can hold its largest coefficient on either lobe. A window of 8 taps around
- * each lobe takes the neighbor taps of an onset. It still refuses a peak
- * counted from the loop (160) and the 0 of an empty filter. The check holds on
- * the plain backend only: on the ring model of tc_lec_hold_up, tap 0 grows
- * larger than tap 80 under the same tone (case_lec_verdicts).
+ * playback of three ticks before, a loop of 240 samples at 8 kHz. The model
+ * reads period-granular unless tc_open_exact is set. Its reference then
+ * stands one period under the loop at 160, so the echo sits at tap 80. A dial
+ * tone does not pin the solution to that tap. A delay of 91 samples is within
+ * half a sample of four periods of 350 Hz and of five periods of 440 Hz, so
+ * tap 171 carries almost the same echo, and the filter can hold its largest
+ * coefficient on either lobe. A window of 8 taps around each lobe takes the
+ * neighbor taps of an onset. It still refuses a peak counted from the loop
+ * (160) and the 0 of an empty filter. The check holds on the plain backend
+ * only: on the ring model of tc_lec_hold_up, tap 0 grows larger than tap 80
+ * under the same tone (case_lec_verdicts).
+ *
+ * gained is the tail that a smaller margin gives back: both lobes stand that
+ * many taps earlier. On a sample-accurate pointer the reference stands at
+ * 220, and gained is TC_LEC_EXACT_GAIN.
  */
-static bool tc_lec_lobe_match(uint32_t tap)
+#define TC_LEC_EXACT_GAIN	60u
+
+static bool tc_lec_lobe_match(uint32_t tap, uint32_t gained)
 {
-	return (tap >= 72u && tap <= 88u) || (tap >= 163u && tap <= 179u);
+	return (tap + gained >= 72u && tap + gained <= 88u) ||
+	       (tap + gained >= 163u && tap + gained <= 179u);
 }
 
 static bool tc_lec_fallback_watch(struct eh *t, unsigned ms)
@@ -6686,6 +6838,91 @@ static void case_lec_hold(void)
 						memory_order_relaxed), 160u);
 		CHECK(udsp_line_lec_stats(t.s, 0, &ls) == UDSP_OK);
 		CHECK_UINT(ls.retimes, 0);
+		CHECK(tc_stream_down(&t, &w, 0));
+		tc_down(&t);
+	}
+}
+
+/* tc_lec_hold_up with the open granting a sample-accurate pointer. */
+static bool tc_lec_hold_up_exact(struct eh *t, struct tc_stream *w)
+{
+	bool up;
+
+	atomic_store(&tc_open_exact, true);
+	up = tc_lec_hold_up(t, w);
+	atomic_store(&tc_open_exact, false);
+
+	return up;
+}
+
+/*
+ * The hold cases of case_lec_hold on a sample-accurate pointer. They use that
+ * ring model, with an open that grants a sample-accurate pointer. Its margin
+ * at 8 kHz is 20 samples (core/chan.c chan_lec_margin). The reference stands
+ * at 220 under a loop of 240 at rest, and at 380 under the 400 that a hold
+ * leaves. That margin is also the tolerance. A hold that leaves the loop one
+ * period from the standing value therefore re-times the canceller, where a
+ * period-granular model keeps its taps.
+ */
+static void case_lec_hold_exact(void)
+{
+	struct engine_stats st;
+	struct eh t;
+
+	CASE("on a sample-accurate pointer three hold episodes re-time the "
+	     "canceller once");
+	{
+		struct udsp_lec_stats before, first, ls;
+		struct tc_stream w;
+
+		if (!tc_lec_hold_up_exact(&t, &w)) {
+			CHECK(false);
+			return;
+		}
+		CHECK(tc_lec_converge(&t, &before));
+		/* A completed window stands, so the hold of a played digit
+		 * takes the margin too (core/chan.c chan_lec_delay_track). */
+		CHECK(atomic_load(&t.s->lec_exact));
+		CHECK_UINT(before.ref_delay_samples, 220u);
+		CHECK_UINT(before.retimes, 0);
+		CHECK(tc_lec_window_watch(&t, NULL));
+		CHECK(tc_lec_settled(&t, &first));
+		CHECK_UINT(first.retimes, 1);
+		CHECK_UINT(first.ref_delay_samples, 380u);
+		for (unsigned i = 0; i < 2; i++)
+			CHECK(tc_lec_window_watch(&t, NULL));
+		CHECK(tc_lec_settled(&t, &ls));
+		CHECK_UINT(ls.retimes, 1);
+		CHECK_UINT(ls.ref_delay_samples, 380u);
+		tc_engine_stats(&t, &st);
+		CHECK(st.pointer_exact);
+		CHECK_UINT(st.holds, 3);
+		CHECK(tc_stream_down(&t, &w, 0));
+		tc_down(&t);
+	}
+
+	CASE("on a sample-accurate pointer a hold one period away re-times the "
+	     "canceller");
+	{
+		struct udsp_lec_stats before, ls;
+		struct tc_stream w;
+
+		if (!tc_lec_hold_up_exact(&t, &w)) {
+			CHECK(false);
+			return;
+		}
+		CHECK(tc_lec_converge(&t, &before));
+		CHECK_UINT(before.ref_delay_samples, 220u);
+		/* The bias of the period-granular case: the hold latches 320
+		 * against the 240 that the taps stand on. */
+		atomic_store_explicit(&tc_be.delay_bias, -80L,
+				      memory_order_release);
+		CHECK(tc_lec_window_watch(&t, NULL));
+		CHECK(tc_lec_settled(&t, &ls));
+		CHECK_UINT(ls.ref_delay_samples, 300u);
+		CHECK_UINT(ls.retimes, 1);
+		tc_engine_stats(&t, &st);
+		CHECK_UINT((uint64_t)st.loop_ref, 320u);
 		CHECK(tc_stream_down(&t, &w, 0));
 		tc_down(&t);
 	}
@@ -7042,7 +7279,7 @@ static void case_lec_stats(void)
 		CHECK_UINT(ls.tail_ms, 32);
 		CHECK_UINT(ls.diverge_resets, 0);
 		printf("# coef_peak_tap %u\n", ls.coef_peak_tap);
-		CHECK(tc_lec_lobe_match(ls.coef_peak_tap));
+		CHECK(tc_lec_lobe_match(ls.coef_peak_tap, 0));
 		/* The record carries what the tick published for the line,
 		 * not a constant of its own. */
 		CHECK_UINT(ls.ref_ready, 1);
@@ -7169,6 +7406,59 @@ static void case_lec_stats(void)
 		tc_stream_down(&t, &w, 0);
 		tc_down(&t);
 	}
+}
+
+/*
+ * The peak tap on a sample-accurate pointer: the plain backend and hybrid of
+ * case_lec_stats, with an open that grants a sample-accurate pointer. The
+ * reference stands 20 samples under a loop of 240 at 8 kHz, at 220, so the
+ * echo sits at tap 20. That margin gives back 60 samples of tail against one
+ * period of guard. Both lobes of tc_lec_lobe_match stand that many taps
+ * earlier.
+ */
+static void case_lec_peak_exact(void)
+{
+	struct udsp_lec_stats ls;
+	struct udsp_chan_cfg ccfg;
+	struct tc_stream w;
+	struct eh t;
+	bool up;
+
+	CASE("on a sample-accurate pointer the peak tap moves by the tail that "
+	     "the margin gives back");
+	atomic_store(&tc_open_exact, true);
+	up = tc_up(&t, "USA");
+	atomic_store(&tc_open_exact, false);
+	if (!up) {
+		CHECK(false);
+		return;
+	}
+	CHECK(eh_hook_seize(&t));
+	memset(&ccfg, 0, sizeof(ccfg));
+	ccfg.ec_enable = true;
+	ccfg.ec_nlp_enable = true;
+	ccfg.ec_tail_ms = 32;
+	CHECK(udsp_chan_config(t.s, 0, &ccfg) == UDSP_OK);
+	if (!tc_stream_config(&t, &w, 0)) {
+		CHECK(false);
+		tc_down(&t);
+		return;
+	}
+	CHECK(udsp_stream_start(t.s, 0, 0) == UDSP_OK);
+	eh_wait_ms(&t, 300);
+	tc_be.echo_periods = 3;
+	tc_be.echo_shift = 2;
+	CHECK(udsp_tone_play(t.s, 0, UDSP_TONE_DIAL, 3000) == UDSP_OK);
+	eh_wait_ms(&t, 800);
+	CHECK(udsp_line_lec_stats(t.s, 0, &ls) == UDSP_OK);
+	CHECK_UINT(ls.ref_delay_samples, 220u);
+	CHECK(ls.coef_energy_micro > 0);
+	printf("# coef_peak_tap %u\n", ls.coef_peak_tap);
+	CHECK(tc_lec_lobe_match(ls.coef_peak_tap, TC_LEC_EXACT_GAIN));
+	tc_be.echo_periods = 0;
+	tc_be.echo_shift = 0;
+	tc_stream_down(&t, &w, 0);
+	tc_down(&t);
 }
 
 #define TC_REGION_DIR_STR	UDSP_REGION_DIR
@@ -13887,13 +14177,12 @@ static unsigned tc_lec_same_count(const uint32_t *v, unsigned n)
 /*
  * The processor verdicts and the peak tap travel from the stopped instance to
  * the record. Once the processor acts, 40 frames of far end, 20 of near-end
- * tone over the echo and 60 of silence follow. A field swap fails only on
- * unequal values, so the case prints whether the seven values differ, with no
- * assert. Two values can match: the wait count reads 7 after one engage run,
- * and the not-echo-like count follows the far-end start tick. On the
- * tc_lec_hold_up ring model, tap 0 outgrows tap 80 (tc_lec_lobe_match), so the
- * peak tap reads 0 and an omitted copy passes. The case "a canceller that ran
- * against a hybrid reports what it learned" proves the peak copy at tap 80.
+ * tone over echo, 40 more of far end and 60 of silence follow. The far
+ * end after the tone waits 7 frames. A field swap fails only on unequal
+ * values, so the case prints whether the seven values differ, with no
+ * assert. On the tc_lec_hold_up ring model the peak tap reads 0
+ * (tc_lec_lobe_match), so an omitted copy passes. The case "a canceller that
+ * ran against a hybrid reports what it learned" proves the copy at tap 80.
  */
 static void case_lec_verdicts(void)
 {
@@ -13913,13 +14202,15 @@ static void case_lec_verdicts(void)
 	}
 	CHECK(tc_lec_converge(&t, &ls));
 	CHECK(tc_lec_nlp_wait(&t, &ls));
-	/* The three phases spread the counts: the far end alone puts the
-	 * active count well above the others, the near-end tone adds double
-	 * talk, and a far-end pause puts the quiet count above the rest. */
+	/* The phases spread the counts. The far end alone puts the active
+	 * count well above the others, and the near-end tone adds double
+	 * talk. The far end after the tone adds the wait, and a far-end pause
+	 * puts the quiet count above the rest. */
 	CHECK(tc_lec_frames_wait(&t, &ls, 40u));
 	atomic_store(&tc_be.tone_hz, 1000u);
 	CHECK(tc_lec_frames_wait(&t, &ls, 20u));
 	atomic_store(&tc_be.tone_hz, 0u);
+	CHECK(tc_lec_frames_wait(&t, &ls, 40u));
 	CHECK(udsp_tone_stop(t.s, 0) == UDSP_OK);
 	CHECK(tc_lec_frames_wait(&t, &ls, 60u));
 	/* A SYNC-TICK op: the filter runs no frame from its tick on, so the
@@ -15499,6 +15790,10 @@ static unsigned tc_cap_skip_new_check(struct eh *t, struct tc_stream *w,
  * carries NEW and the next generation. The allocator decides the address, so
  * the case tries a bounded number of times and skips when no try gave the
  * address back. Stream 0 of line 0 is configured and not started.
+ *
+ * The deactivation of the stop comes before the END of the earlier instance
+ * (tc_cap_lost_ack_check), so a FEED of that instance can follow the mark.
+ * The case passes over the records of its generation up to its END.
  */
 static void tc_cap_reuse_check(struct eh *t, struct tc_stream *w,
 			       struct tc_cap *k)
@@ -15507,6 +15802,7 @@ static void tc_cap_reuse_check(struct eh *t, struct tc_stream *w,
 	bool reused = false;
 	unsigned from = k->n;
 	unsigned i, tries;
+	uint16_t gen;
 
 	for (tries = 0; tries < TC_CAP_REUSE_TRIES && !reused; tries++) {
 		tc_cap_wait(t, k, 30);
@@ -15527,7 +15823,16 @@ static void tc_cap_reuse_check(struct eh *t, struct tc_stream *w,
 	CHECK(i < k->n);
 	if (i >= k->n)
 		return;
+	gen = k->rec[i].gen;
+	while (i < k->n && k->rec[i].gen == gen &&
+	       !(k->rec[i].flags & UDSP_LEC_CAPTURE_NEW) &&
+	       k->rec[i].kind != UDSP_LEC_CAPTURE_END)
+		i = tc_cap_first_find(k, i + 1u, 0);
+	CHECK(i < k->n);
+	if (i >= k->n)
+		return;
 	CHECK_UINT(k->rec[i].kind, UDSP_LEC_CAPTURE_END);
+	CHECK_UINT(k->rec[i].gen, gen);
 	from = i;
 	i = tc_cap_first_find(k, i + 1u, 0);
 	CHECK(i < k->n);
@@ -17322,8 +17627,8 @@ static void case_ul_offset(void)
  * 8 kHz and 5.1 LSB at 16 kHz. */
 #define TC_UL_FLOOR_DC_MILLI	7100
 #define TC_UL_FLOOR_DC_WB_MILLI	5100
-/* With the removal, the coefficient energy of a run stands within 0.3 percent
- * of the twin. Without it, the energy reads 19 to 29 percent under the twin.
+/* With the removal, the coefficient energy of a run stands within 0.7 percent
+ * of the twin. Without it, the energy reads 19 to 30 percent under the twin.
  * A factor of 1.1 separates the two at both rates. */
 #define TC_UL_COEF_FACTOR	1.1
 
@@ -17372,10 +17677,31 @@ static double tc_cap_cn_db(const struct tc_cap *k, unsigned from,
 }
 
 /*
+ * Waits until the engine calibrated its echo loop, 5 s at most. A canceller
+ * that starts inside the open window holds its adaptation on a delay of one
+ * frame (chan_lec_run), and its start then depends on the tick that completes
+ * the window, so its coefficient energy depends on the test thread's latency.
+ */
+static bool tc_ul_loop_wait(struct eh *t)
+{
+	uint64_t end = eh_mono_us() + 5000000u;
+
+	for (;;) {
+		eh_ev_poll(t);
+		if (tc_cap_loop(t) >= 0)
+			return true;
+		if (eh_mono_us() >= end)
+			return false;
+		eh_sleep_ms(1);
+	}
+}
+
+/*
  * One run of the floor case at the rate given: the busy tone as the far end
  * through a 12 dB hybrid, the room, and the line offset dc_milli. The busy
  * tone pauses every half second, and the canceller measures its floor in the
- * pauses.
+ * pauses. The canceller and the tone start after the engine calibrated its
+ * loop (tc_ul_loop_wait), so the reference stands from the first frame.
  */
 static bool tc_ul_floor_run(struct tc_cap *k, unsigned rate, int dc_milli,
 			    struct tc_ul_floor *out)
@@ -17398,7 +17724,8 @@ static bool tc_ul_floor_run(struct tc_cap *k, unsigned rate, int dc_milli,
 	ccfg.ec_enable = true;
 	ccfg.ec_nlp_enable = true;
 	ccfg.ec_tail_ms = 32;
-	ok = eh_hook_seize(&t) && udsp_chan_config(t.s, 0, &ccfg) == UDSP_OK;
+	ok = eh_hook_seize(&t) && tc_ul_loop_wait(&t) &&
+	     udsp_chan_config(t.s, 0, &ccfg) == UDSP_OK;
 	atomic_store(&tc_be.echo_periods, 3u);
 	atomic_store(&tc_be.echo_shift, 2u);
 	ok = ok && udsp_lec_capture_enable(t.s, true) == 0;
@@ -17795,11 +18122,11 @@ static void case_ul_offset_partial(void)
 
 /*
  * The hold of a played digit (core/chan.c chan_digit_hold_arm) reads the loop
- * that the engine measured last. The one-period guard and the reach clamp of
- * the reference apply to it, and four ticks follow. Before the first window of
- * an engine completes, the loop is the nominal prefill. A line without a
- * canceller gets the same hold, because the echo of the digit crosses the loop
- * either way.
+ * that the engine measured last. The canceller's reference guard
+ * (chan_lec_margin) and reach clamp apply to that loop, and four ticks
+ * follow. Before an engine completes its first window, the loop is the
+ * nominal prefill. A line without a canceller gets an equal hold, because a
+ * digit's echo crosses the loop either way.
  */
 static void case_lec_digit_hold(void)
 {
@@ -17818,6 +18145,29 @@ static void case_lec_digit_hold(void)
 		{ 2000u, 28u },
 		{ 30000u, 28u },
 		{ 240u, UDSP_DL_DIGIT_HOLD_TICKS },
+	};
+	/* The same line on a sample-accurate pointer, 20 samples of guard:
+	 *
+	 * - 1000 guards to 980, which is 12 ticks plus 4;
+	 * - 1100 guards to 1080, 13 ticks plus 4, where one period gives 16;
+	 * - 30000 clamps to the reach, 1968, which is 24 ticks plus 4;
+	 * - 240 guards to 220, and 2 ticks plus 4 stand under the floor. */
+	static const struct {
+		uint32_t loop;
+		unsigned ticks;
+	} arm_exact[] = {
+		{ 1000u, 16u },
+		{ 1100u, 17u },
+		{ 30000u, 28u },
+		{ 240u, UDSP_DL_DIGIT_HOLD_TICKS },
+	};
+	static const struct {
+		uint32_t loop;
+		unsigned period;
+		unsigned exact;
+	} arm_wb[] = {
+		{ 2000u, 15u, 16u },
+		{ 30000u, 28u, 28u },
 	};
 	struct chan_lec_track tr;
 	struct engine_stats st;
@@ -17884,10 +18234,42 @@ static void case_lec_digit_hold(void)
 			atomic_init(&s->lec_delay[i], 0u);
 		}
 		atomic_init(&s->lec_loop, 0u);
+		atomic_init(&s->lec_exact, false);
 		for (unsigned i = 0; i < sizeof(arm) / sizeof(arm[0]); i++) {
 			atomic_store(&s->lec_loop, arm[i].loop);
 			chan_digit_hold_arm(s, c);
 			CHECK_UINT(c->dl_digit_hold, arm[i].ticks);
+		}
+
+		/* The hold follows the guard of the reference: on a
+		 * sample-accurate pointer the loop stands 20 samples under,
+		 * not one period. */
+		CASE("a played digit holds the detector for the loop under the "
+		     "margin of a sample-accurate pointer");
+		atomic_store(&s->lec_exact, true);
+		for (unsigned i = 0;
+		     i < sizeof(arm_exact) / sizeof(arm_exact[0]); i++) {
+			atomic_store(&s->lec_loop, arm_exact[i].loop);
+			chan_digit_hold_arm(s, c);
+			CHECK_UINT(c->dl_digit_hold, arm_exact[i].ticks);
+		}
+
+		/* A 16 kHz line, 160 samples a tick, reach 3936: 2000 guards to
+		 * 1840 (11 ticks plus 4) under one period and to 1960 (12 plus
+		 * 4) under 40 samples; 30000 clamps to 3936 (24 plus 4). */
+		CASE("a played digit at 16 kHz holds the detector for the loop "
+		     "under the margin of each pointer");
+		c->rate = UDSP_SAMPLE_RATE_WB;
+		c->frame = UDSP_SAMPLE_RATE_WB / 100u;
+		for (unsigned i = 0; i < sizeof(arm_wb) / sizeof(arm_wb[0]);
+		     i++) {
+			atomic_store(&s->lec_loop, arm_wb[i].loop);
+			atomic_store(&s->lec_exact, false);
+			chan_digit_hold_arm(s, c);
+			CHECK_UINT(c->dl_digit_hold, arm_wb[i].period);
+			atomic_store(&s->lec_exact, true);
+			chan_digit_hold_arm(s, c);
+			CHECK_UINT(c->dl_digit_hold, arm_wb[i].exact);
 		}
 		free(s);
 	}
@@ -18302,6 +18684,7 @@ int main(void)
 	case_log_sink();
 	case_rt_line();
 	case_lec_stats();
+	case_lec_peak_exact();
 	case_region();
 	case_line_test_cap();
 	case_line_test_result();
@@ -18331,7 +18714,9 @@ int main(void)
 	case_skip_clock();
 	case_playout_skip();
 	case_lec_ref_rule();
+	case_lec_ref_rule_exact();
 	case_lec_hold();
+	case_lec_hold_exact();
 	case_engine_diag();
 	case_engine_diag_hold();
 	case_engine_diag_deferred();

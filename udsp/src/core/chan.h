@@ -69,6 +69,7 @@ struct chan_lec_line {
 	uint32_t gen;		/* moves on a re-time and on an engine swap */
 	uint32_t ran_gen;	/* the gen the instance last ran against */
 	bool applied;		/* a value stands */
+	bool nominal;		/* the value is the nominal prefill */
 };
 
 /*
@@ -107,6 +108,13 @@ struct chan_lec_track {
 	 * or the nominal prefill until one completes. The hold of a played
 	 * digit reads it (chan.c chan_digit_hold_arm). */
 	uint32_t loop_last;
+	/* The pointers of this engine's back end count samples (engine.h
+	 * pointer_exact). It selects the margin of chan.c chan_lec_margin. */
+	bool exact;
+	/* loop_last is the nominal prefill: this engine completed no window
+	 * yet. A nominal value takes one period of margin on every pointer
+	 * (chan.c chan_lec_line_margin). */
+	bool nominal;
 	/* The applied reference of each line. */
 	struct chan_lec_line line[UDSP_LINE_MAX];
 };
@@ -913,10 +921,11 @@ void chan_hook_pulse_apply(struct udsp_chan *c, const struct udsp_region *r);
  * them directly, which is why the whole decision lives here and the wrappers
  * carry only the atomics.
  *
- * A line keeps its standing value while the offer stays within one period of
- * it, in either direction. The taps of the line are aligned to the value that
- * stands. The compare is on the unclamped loop, so a move the reach clamp
- * would fold into its bound still counts as a move.
+ * A line keeps its standing value while the offer stays within the margin of
+ * it, in either direction: one period on a period-granular pointer, 2.5 ms on
+ * a sample-accurate one (chan.c chan_lec_margin). The taps of the line are
+ * aligned to the value that stands. The compare is on the unclamped loop, so
+ * a move the reach clamp would fold into its bound still counts as a move.
  */
 struct engine_stats;
 

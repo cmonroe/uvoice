@@ -178,8 +178,11 @@ struct fk_profile {
 	bool shared_geometry;
 	bool tx_ack;
 	/* SNDRV_PCM_INFO_BATCH in the granted setup. It is the kernel's own
-	 * statement that the pointer moves in period steps. */
+	 * statement that the pointer moves in period steps. batch sets it on
+	 * both directions; batch_play and batch_capture set it on one. */
 	bool batch;
+	bool batch_play;
+	bool batch_capture;
 	/* The AN7581 reports the pointer once per period; the MediaTek front
 	 * end reports the sample the DMA reached. */
 	bool pointer_period_granular;
@@ -258,6 +261,39 @@ static const struct fk_profile fk_mt2701 = {
 	.periods_min = 2,
 	.periods_max = 1024,
 	.capture_periods_min = 3,
+};
+
+/* The mt7986 profile with BATCH on one direction alone. No supported board
+ * has such a pair. The two profiles let a case prove that a pointer counts
+ * as sample-accurate only when both directions clear the bit. */
+static const struct fk_profile fk_mixed_play_batch = {
+	.name = "mixed-play-batch",
+	.access = (unsigned)SNDRV_PCM_ACCESS_MMAP_INTERLEAVED,
+	.period_bytes_min = 256,
+	.period_bytes_max = 4 * 48 * 1024,
+	.period_frames_min = 1,
+	.period_frames_max = 65536,
+	.buffer_bytes_max = 8 * 48 * 1024,
+	.buffer_bytes_step = 16,
+	.periods_min = 2,
+	.periods_max = 256,
+	.capture_periods_min = 3,
+	.batch_play = true,
+};
+
+static const struct fk_profile fk_mixed_capture_batch = {
+	.name = "mixed-capture-batch",
+	.access = (unsigned)SNDRV_PCM_ACCESS_MMAP_INTERLEAVED,
+	.period_bytes_min = 256,
+	.period_bytes_max = 4 * 48 * 1024,
+	.period_frames_min = 1,
+	.period_frames_max = 65536,
+	.buffer_bytes_max = 8 * 48 * 1024,
+	.buffer_bytes_step = 16,
+	.periods_min = 2,
+	.periods_max = 256,
+	.capture_periods_min = 3,
+	.batch_capture = true,
 };
 
 struct fk_stream {
@@ -1036,7 +1072,8 @@ static inline int fk_hw_resolve(struct fk_stream *s,
 }
 
 static inline void fk_hw_write(struct snd_pcm_hw_params *p,
-			       const struct fk_hw *hw, bool choose)
+			       const struct fk_hw *hw, bool choose,
+			       bool capture)
 {
 	fkp_mask_one(p, SNDRV_PCM_HW_PARAM_ACCESS, fk_prof->access);
 	fkp_mask_one(p, SNDRV_PCM_HW_PARAM_FORMAT,
@@ -1064,7 +1101,8 @@ static inline void fk_hw_write(struct snd_pcm_hw_params *p,
 	p->info = SNDRV_PCM_INFO_MMAP_VALID;
 	if (!fk_info_no_mmap)
 		p->info |= SNDRV_PCM_INFO_MMAP;
-	if (fk_prof->batch)
+	if (fk_prof->batch ||
+	    (capture ? fk_prof->batch_capture : fk_prof->batch_play))
 		p->info |= SNDRV_PCM_INFO_BATCH;
 	if (fk_prof->tx_ack)
 		p->info |= SNDRV_PCM_INFO_SYNC_APPLPTR;
@@ -1101,7 +1139,7 @@ static inline int fk_hw_refine(struct fk_stream *s, struct snd_pcm_hw_params *p)
 	rc = fk_hw_resolve(s, p, false, &hw);
 	if (rc < 0)
 		return fk_fail(-rc);
-	fk_hw_write(p, &hw, false);
+	fk_hw_write(p, &hw, false, s->capture);
 
 	return 0;
 }
@@ -1160,7 +1198,7 @@ static inline int fk_hw_params(struct fk_stream *s, struct snd_pcm_hw_params *p)
 	s->dma_frames = 0;
 	s->hw_set = true;
 	s->state = SNDRV_PCM_STATE_SETUP;
-	fk_hw_write(p, &hw, true);
+	fk_hw_write(p, &hw, true, s->capture);
 
 	return 0;
 }

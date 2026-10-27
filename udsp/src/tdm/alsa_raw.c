@@ -82,7 +82,8 @@
  * pointer moves in period steps. A device that sets the bit carries a whole
  * period per wake, so the read asks for nothing extra. The playback threshold
  * stays one period on both. Its wake only matters in the back-pressure branch,
- * which reads the pointer first.
+ * which reads the pointer first. The open also reports the bit of both
+ * directions to the engine as geom.pointer_exact.
  *
  * One tick on a device that sets BATCH costs one ppoll and three SYNC_PTR
  * calls: the capture push in the read, the playback push in the write, and one
@@ -1069,6 +1070,10 @@ static void geom_fill(struct udsp_tdm *t)
 	t->geom.rate = t->capture.rate;
 	t->geom.tx_restarts = t->play.batch && t->play.sync_applptr &&
 			      tdm_raw_driver_known(t);
+	/* BATCH is the kernel's statement that a pointer moves in period
+	 * steps. The loop the engine measures sums both directions, so both
+	 * must count samples. */
+	t->geom.pointer_exact = !t->play.batch && !t->capture.batch;
 }
 
 static int pair_open(struct udsp_tdm *t, const char *play_dev,

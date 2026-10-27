@@ -753,7 +753,7 @@ struct udsp_lec_stats {
 	 * and not of the instance. The engine measures one loop delay per
 	 * handle. A line takes the current measurement verbatim on the first
 	 * frame of a new canceller. While that canceller stands, the line keeps
-	 * its value within one period of the measurement. Two lines can
+	 * its value within the margin of the measurement. Two lines can
 	 * therefore read different values. A line whose canceller starts
 	 * inside an open window, a fresh engine included, applies no reference
 	 * yet. It publishes ref_delay_samples 0 and ref_ready 0 until a window
@@ -761,22 +761,25 @@ struct udsp_lec_stats {
 	 * or the nominal prefill before the first one. The tick itself reads
 	 * one frame there.
 	 * ref_delay_samples is the reference the tick applied, in samples at
-	 * the line rate. It is the loop the line stands on less one period of
-	 * causal margin. At 8 kHz, 160 is therefore a loop of 240 (30 ms) under
-	 * an 80-sample guard; divide by rate/1000 for milliseconds. It is the
-	 * applied value and not the engine's last measurement. The rule
-	 * compares the unclamped measurement against the applied value, keeps
-	 * it within one period, and publishes the clamp of what stands under
-	 * the guard. The tolerance keeps a value up to one period from the
-	 * measurement. The published value therefore stands zero to two
-	 * periods under loop_ref inside the reach, and more where the clamp
-	 * engages. A re-time can leave it unchanged (retimes below). ref_ready
-	 * is 1 once the measurement stands. While it is 0 the engine holds
-	 * adaptation, because a canceller that adapts against a reference
-	 * timed wrong diverges instead of converging. A canceller with frames
-	 * of its own, a ref_ready of 1 and no coefficient energy saw the line
-	 * and learned nothing from it. The same reading with ref_ready 0 is a
-	 * filter that was never let adapt. */
+	 * the line rate. It is the loop the line stands on less the causal
+	 * margin of the engine's pointer. The margin is one period on a
+	 * period-granular pointer (AN7581), and 2.5 ms on a sample-accurate
+	 * one (MT7981, MT7986, MT7987, MT7988, MT7622). At 8 kHz, 160 is
+	 * therefore a loop of 240 (30 ms) under an 80-sample guard, and 220 is
+	 * the same loop under a 20-sample guard. Divide by rate/1000 for
+	 * milliseconds. It is the applied value and not the engine's last
+	 * measurement. The rule compares the unclamped measurement against
+	 * the applied value, keeps it within the margin, and publishes the
+	 * clamp of what stands under the guard. The tolerance keeps a value up
+	 * to one margin from the measurement. The published value therefore
+	 * stands zero to two margins under loop_ref inside the reach, and more
+	 * where the clamp engages. A re-time can leave it unchanged (retimes
+	 * below). ref_ready is 1 once the measurement stands. While it is 0
+	 * the engine holds adaptation, because a canceller that adapts against
+	 * a reference timed wrong diverges instead of converging. A canceller
+	 * with frames of its own, a ref_ready of 1 and no coefficient energy
+	 * saw the line and learned nothing from it. The same reading with
+	 * ref_ready 0 is a filter that was never let adapt. */
 	uint32_t ref_delay_samples;
 	uint8_t ref_ready;
 	/* The non-linear processor's switch, appended: 1 when the policy
@@ -813,8 +816,10 @@ struct udsp_lec_stats {
 	 * imposed on the filter (core/chan.c chan_lec_run). Two causes reset
 	 * it. The first is a measured reference that moved beyond the
 	 * tolerance. The engine re-latches the loop delay after every hold
-	 * episode. A re-latch within one period of the standing reference
+	 * episode. A re-latch within the margin of the standing reference
 	 * keeps the taps, so the count follows the moves and not the episodes.
+	 * The margin is one period on a period-granular pointer and 2.5 ms on
+	 * a sample-accurate one.
 	 * The second is a replacement engine (udsp_stop then udsp_start). It
 	 * re-times the reference whatever it goes on to measure, because the
 	 * new ring is not the one the taps were aligned to.
@@ -844,12 +849,14 @@ struct udsp_lec_stats {
 	uint32_t nlp_dt_frames;
 	uint32_t nlp_quiet_frames;
 	/* The index of the largest coefficient, appended, counted from tap 0 of
-	 * the applied reference (ref_delay_samples). The reference stands one
-	 * period under the loop, so an echo that arrives at the loop reads one
-	 * period in: 80 at 8 kHz, 160 at 16 kHz. A live line reads later by
-	 * the lag of the path outside the engine rings. It reads 0 while the
-	 * filter holds no energy. Read it beside coef_energy_micro, because a
-	 * filter aligned on its first tap also reads 0. */
+	 * the applied reference (ref_delay_samples). The reference stands the
+	 * margin under the loop, so an echo that arrives at the loop reads the
+	 * margin in. That is 80 at 8 kHz and 160 at 16 kHz on a
+	 * period-granular pointer, and 20 and 40 on a sample-accurate one. A
+	 * live line reads later by the lag of the path outside the engine
+	 * rings. It reads 0 while the filter holds no energy. Read it beside
+	 * coef_energy_micro, because a filter aligned on its first tap also
+	 * reads 0. */
 	uint32_t coef_peak_tap;
 	/* 1 when the tick held the filter because the loop was open, appended.
 	 * The run reads the level that the previous tick consumed, so the flag

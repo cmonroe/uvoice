@@ -114,6 +114,9 @@ struct t_script {
 	unsigned write_hold_periods;
 	unsigned skip_err_n;		/* capture_skip calls that fail */
 	int skip_err;			/* the errno they fail with */
+	/* The open grants a sample-accurate pointer (tdm.h pointer_exact).
+	 * Left false, the open leaves the field as the request carries it. */
+	bool pointer_exact;
 };
 
 static struct t_script t_script;
@@ -191,6 +194,8 @@ static struct udsp_tdm *t_open(const char *play, const char *cap,
 		got->rate = t_script.grant_rate;
 	if (t_script.grant_rate_zero)
 		got->rate = 0;
+	if (t_script.pointer_exact)
+		got->pointer_exact = true;
 	t_geom = *got;
 
 	return (struct udsp_tdm *)&t_token;
@@ -1994,6 +1999,66 @@ static void case_phased_transitions(void)
 		ph_row_run(&holds[i]);
 }
 
+/*
+ * The pointer kind reaches the engine as geom.pointer_exact of its grant
+ * (tdm.h). The raw back end grants a sample-accurate pointer when both
+ * directions clear BATCH. Both MediaTek front ends do. AN7581, the
+ * interleaved BATCH model and a pair with BATCH on one direction do not. A
+ * back end that leaves the field unset reads period-granular, because the
+ * engine zeroes each grant before its open.
+ */
+static void case_pointer_exact(void)
+{
+	static const struct {
+		const struct fk_profile *prof;
+		unsigned rate;
+		bool kick;
+		bool exact;
+	} part[] = {
+		{ &fk_an7581, 16000, true, false },
+		{ &fk_an7581, 8000, true, false },
+		{ &fk_mt7986, 16000, false, true },
+		{ &fk_mt7986, 8000, false, true },
+		{ &fk_mt2701, 8000, false, true },
+		{ &fk_batch_mmap, 8000, false, false },
+		{ &fk_mixed_play_batch, 16000, false, false },
+		{ &fk_mixed_capture_batch, 16000, false, false },
+	};
+	struct engine_opts opts = { .loopback = true, .max_ticks = 5 };
+	struct udsp_config cfg;
+	struct engine_stats st;
+
+	CASE("the raw back end gives the engine a sample-accurate pointer "
+	     "where both directions clear BATCH");
+	for (unsigned i = 0; i < sizeof(part) / sizeof(part[0]); i++) {
+		struct ph_cfg c = {
+			.prof = part[i].prof, .rate = part[i].rate,
+			.prefill = 3, .ticks = 40, .kick = part[i].kick,
+		};
+		struct ph_out o;
+
+		CHECK(ph_run(&c, &o));
+		CHECK(o.st.pointer_exact == part[i].exact);
+	}
+
+	CASE("a back end that leaves the field unset gives the engine a "
+	     "period-granular pointer");
+	{
+		cfg_init(&cfg, NULL, NULL);
+		t_reset();
+		t_script.pointer_exact = true;
+		CHECK(engine_run_ops(&t_ops, &cfg, &opts, &st));
+		CHECK(st.pointer_exact);
+		/* t_open copies the request, which the engine leaves false. */
+		t_reset();
+		CHECK(engine_run_ops(&t_ops, &cfg, &opts, &st));
+		CHECK(!st.pointer_exact);
+		/* The file back end has no pointer. */
+		CHECK(engine_run(&cfg, &opts, &st));
+		CHECK(!st.pointer_exact);
+	}
+}
+
 int main(void)
 {
 	/* mlockall(MCL_FUTURE) succeeding here would lock every later mapping,
@@ -3582,6 +3647,7 @@ int main(void)
 
 	case_phased_hold();
 	case_phased_transitions();
+	case_pointer_exact();
 
 	return tu_summary("engine");
 }

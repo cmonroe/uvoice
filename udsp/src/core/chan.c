@@ -377,8 +377,8 @@ static void lec_capture_end(struct udsp *s, struct udsp_chan *c,
  * chan_lec_track). */
 static struct chan_lec_track lec_track;
 
-/* The published value is the applied one, one period under the loop the line
- * stands on. It is never the raw measurement, so
+/* The published value is the applied one, the margin under the loop the line
+ * stands on (chan_lec_margin). It is never the raw measurement, so
  * udsp_lec_stats.ref_delay_samples reads what the taps are aligned to.
  * chan_lec_ref_take clamps again, which is then a no-op. */
 static void chan_lec_line_apply(struct udsp *s, unsigned line)
@@ -736,12 +736,10 @@ static void chan_lec_run(struct udsp *s, struct udsp_chan *c, int16_t *frame,
 		reset = true;
 	}
 	/*
-	 * Adaptation waits until the line's reference stands. The tone
-	 * disabler's latch holds adaptation too. A latch is set on a tone
-	 * alone, so the filter would otherwise adapt against a pure tone and
-	 * diverge. The fax kind of a description is call control saying a fax
-	 * call stands. There fax_active freezes the carrier bursts themselves,
-	 * and the speech between them still adapts.
+	 * Adaptation waits until the line's reference stands. A latch of the
+	 * tone disabler also holds it; a plain 2100 Hz sets no latch
+	 * (chan_fax_latch). fax_active freezes the filter on a fax tone or
+	 * carrier burst.
 	 */
 	hold = !atomic_load_explicit(&s->lec_ready[c->line],
 				     memory_order_relaxed) ||
@@ -857,9 +855,10 @@ static void chan_lec_publish(struct udsp *s, struct udsp_chan *c)
 	 * record therefore carries the reference this tick applied, and the
 	 * readiness that decided whether the tick let the filter adapt at all.
 	 *
-	 * While the instance stands, the line keeps its value within one period
-	 * of the measurement. It can therefore differ from the engine's
-	 * loop_ref by that much, and two lines can read different values.
+	 * While the instance stands, the line keeps its value within the margin
+	 * of the measurement (chan_lec_margin). It can therefore differ from
+	 * the engine's loop_ref by that much, and two lines can read different
+	 * values.
 	 */
 	out.ref_delay_samples =
 		(uint32_t)atomic_load_explicit(&s->lec_delay[c->line],
@@ -1028,21 +1027,12 @@ static enum udsp_lec_reason chan_fax_latch_reason(enum udsp_passthrough was,
 }
 
 /*
- * The tone disabler, G.168 clause 7 applied to a start row from either
- * direction: the called fax answers on the wire and the calling one on the
- * phone side, and the recommendation asks a disabler to honour both paths.
- *
- * The kind ladder is the mapping of 7.1. Phase reversals are the one signal
- * the recommendation lets a disabler answer with a full disable, so they take
- * the modem policy; a plain 2100 Hz takes the fax policy, which is the
- * sanctioned optional behaviour for it, unless the caller asked for the full
- * disable on it too. A plain tone never demotes a latch the reversals
- * established, and a V.21 preamble does: it is the fax confirming itself,
- * which is the super G3 tone followed by a G3 fallback.
- *
- * A generic modem carrier row neither promotes nor demotes. The page carriers
- * of a fax fall in the modem bank, and the policy of a page in flight is the
- * one its handshake chose.
+ * The tone disabler, G.168 clause 7, on a start row from either direction.
+ * Phase reversals (ANSBAR) take the modem policy, and ANSam the fax policy. A
+ * plain 2100 Hz latches no kind, so the canceller converges on it (G.168 7.1
+ * and Test 10A, ITU-T V.25). ec_tone_force_disable takes it to the modem
+ * policy instead. A V.21 preamble demotes a modem latch to fax and latches
+ * nothing.
  */
 static void chan_fax_latch(struct udsp *s, struct udsp_chan *c, uint16_t tone,
 			   uint8_t direction, uint32_t now_ms)
@@ -1055,6 +1045,9 @@ static void chan_fax_latch(struct udsp *s, struct udsp_chan *c, uint16_t tone,
 		want = UDSP_PASSTHROUGH_MODEM;
 		break;
 	case UDSP_TONE_DET_CED:
+		if (kind == UDSP_PASSTHROUGH_OFF && c->cfg.ec_tone_force_disable)
+			want = UDSP_PASSTHROUGH_MODEM;
+		break;
 	case UDSP_TONE_DET_ANSAM:
 		if (kind == UDSP_PASSTHROUGH_OFF)
 			want = c->cfg.ec_tone_force_disable ?
@@ -2272,7 +2265,8 @@ static void chan_dtmf_arm(struct udsp_chan *c)
 	udsp_resamp_reset(&c->rs_ul_pre);
 }
 
-static uint32_t chan_lec_ref_guard(uint32_t loop, unsigned frame);
+static unsigned chan_lec_margin(bool exact, unsigned rate, unsigned frame);
+static uint32_t chan_lec_ref_guard(uint32_t loop, unsigned margin);
 
 /*
  * The tail of the hold a digit playing toward the line takes, re-armed on
@@ -2280,7 +2274,7 @@ static uint32_t chan_lec_ref_guard(uint32_t loop, unsigned frame);
  * outlast the loop, and four ticks cover the span the detector decides over.
  * The arm reads the loop the engine last measured, not the applied reference
  * of a canceller. The echo crosses that loop whether or not the line runs a
- * canceller. The tolerance can also keep the applied reference one period
+ * canceller. The tolerance can also keep the applied reference one margin
  * away from the loop. The guard and the clamp of the reference still apply,
  * so a reference that stands on the latest window gives the same tail. A
  * converged canceller is not enough on its own, because it subtracts its
@@ -2290,9 +2284,11 @@ void chan_digit_hold_arm(struct udsp *s, struct udsp_chan *c)
 {
 	uint32_t loop = (uint32_t)atomic_load_explicit(&s->lec_loop,
 						       memory_order_relaxed);
+	bool exact = atomic_load_explicit(&s->lec_exact, memory_order_relaxed);
+	unsigned margin = chan_lec_margin(exact, c->rate, c->frame);
 	unsigned delay, ticks;
 
-	delay = chan_lec_delay_clamp(chan_lec_ref_guard(loop, c->frame),
+	delay = chan_lec_delay_clamp(chan_lec_ref_guard(loop, margin),
 				     c->rate, c->frame);
 	ticks = delay / c->frame + 4u;
 	if (ticks < UDSP_DL_DIGIT_HOLD_TICKS)
@@ -3508,6 +3504,7 @@ void chan_lec_line_drop(struct chan_lec_track *t, unsigned line)
 	l->loop = 0;
 	l->delay = 0;
 	l->applied = false;
+	l->nominal = false;
 }
 
 enum chan_lec_offer chan_lec_measure(struct chan_lec_track *t,
@@ -3530,11 +3527,15 @@ enum chan_lec_offer chan_lec_measure(struct chan_lec_track *t,
 	 *
 	 * The new engine holds no measured loop yet, so the hold of a played
 	 * digit reads the nominal prefill until its first window completes.
+	 * The pointer kind belongs to the back end of the engine, so it
+	 * changes with the serial alone.
 	 */
 	if (st->serial != t->serial) {
 		t->serial = st->serial;
 		t->restarts_done = st->cal_restarts;
 		t->loop_last = st->prefill_periods * st->frames_per_period;
+		t->exact = st->pointer_exact;
+		t->nominal = true;
 		for (unsigned i = 0; i < UDSP_LINE_MAX; i++) {
 			chan_lec_line_drop(t, i);
 			t->line[i].gen++;
@@ -3557,6 +3558,7 @@ enum chan_lec_offer chan_lec_measure(struct chan_lec_track *t,
 		t->offer = CHAN_LEC_OFFER_WINDOW;
 		t->offer_loop = (uint32_t)(st->loop_ref < 0 ? 0 : st->loop_ref);
 		t->loop_last = t->offer_loop;
+		t->nominal = false;
 		return CHAN_LEC_OFFER_WINDOW;
 	}
 	/* An open window inside the allowance offers nothing, so adaptation
@@ -3584,7 +3586,8 @@ enum chan_lec_offer chan_lec_measure(struct chan_lec_track *t,
  * back end with no backlog. A reference past the true loop is non-causal,
  * which no tap can cancel, while a short one only spends tail. Underestimate
  * on purpose; chan_lec_ref_guard applies the same rule to every value that
- * stands on a line.
+ * stands on a line. The nominal is no reading of the loop, so it takes one
+ * period of margin on every pointer (chan_lec_line_margin).
  */
 static uint32_t chan_lec_loop_pick(const struct chan_lec_track *t,
 				   const struct chan_lec_line *l)
@@ -3596,43 +3599,92 @@ static uint32_t chan_lec_loop_pick(const struct chan_lec_track *t,
 }
 
 /*
- * One period of tolerance, inclusive, in either direction. The reason is the
- * quantized reading of the AN7581. Its pointer is period-granular, so after a
- * hold the reading at 16 kHz flips between 640 and 800. By its peak, the echo
- * stands at 687 to 791 samples in the 640 state, and at 875 to 927 in the
- * 800 state. A strict bound re-times on every flip. Inside the tolerance
- * the standing value wins, because the taps are aligned to it. A move of the
- * reference without a move of the taps misaligns them by up to one period.
- * That costs a reconvergence and keeps the stale taps through it.
- *
- * The limit: a hold inside a call moves the physical loop, by one period on
- * the MT7988. The tolerance then keeps taps that stand one period off.
+ * The margin on a sample-accurate pointer: 40 samples at 16 kHz, 20 at
+ * 8 kHz. Reason: it is well over the jitter of a sample-accurate loop
+ * reading, about 2 samples at 16 kHz on MT7988. The jitter at 8 kHz is not
+ * measured. With this margin, the MT7988 onset, 58 samples past loop_ref at
+ * 16 kHz and 59 at 8 kHz, stays past tap 0.
  */
-static bool chan_lec_ref_moved(uint32_t loop, uint32_t applied, unsigned frame)
-{
-	uint32_t step = loop > applied ? loop - applied : applied - loop;
+#define CHAN_LEC_MARGIN_US	2500u
 
-	return step > frame;
+/*
+ * The margin of the reference rule, in samples at the line rate. It is the
+ * causal guard under the loop a line stands on (chan_lec_ref_guard) and the
+ * tolerance of the sticky reference (chan_lec_ref_moved). One value serves
+ * both, so the applied reference never stands past the loop that the engine
+ * last measured.
+ *
+ * - A period-granular pointer (AN7581) gets one period. Its reading moves in
+ *   whole periods, and its two readings after a hold stand one period apart.
+ * - A sample-accurate pointer (the MediaTek AFE parts MT7981, MT7986,
+ *   MT7987, MT7988 and MT7622, which clear BATCH) gets CHAN_LEC_MARGIN_US.
+ *   Its reading follows the physical loop, so a whole period of margin only
+ *   spends tail. On MT7988 at 16 kHz, one period puts the hybrid onset
+ *   13.6 ms into the 64 ms tail.
+ */
+static unsigned chan_lec_margin(bool exact, unsigned rate, unsigned frame)
+{
+	if (!exact)
+		return frame;
+
+	return rate * CHAN_LEC_MARGIN_US / 1000000u;
+}
+
+/* The margin of one line's value. A nominal value takes one period, so the
+ * low estimate of chan_lec_loop_pick stays low on every pointer. */
+static unsigned chan_lec_line_margin(const struct chan_lec_track *t,
+				     const struct chan_lec_line *l,
+				     unsigned rate, unsigned frame)
+{
+	return chan_lec_margin(t->exact && !l->nominal, rate, frame);
 }
 
 /*
- * One period of causal margin under the loop a line stands on. A fit of
- * captured echo paths puts the echo onset at -20 dB past loop_ref at the base
- * delay:
+ * The tolerance of the sticky reference: the margin, inclusive, in either
+ * direction. Inside it the standing value wins, because the taps are aligned
+ * to it. A move of the reference without a move of the taps misaligns them by
+ * up to the margin. That costs a reconvergence and keeps the stale taps
+ * through it.
+ *
+ * On a period-granular pointer the reason is the quantized reading of the
+ * AN7581. After a hold its reading at 16 kHz flips between 640 and 800. By
+ * its peak, the echo stands at 687 to 791 samples in the 640 state, and at
+ * 875 to 927 in the 800 state. A strict bound re-times on every flip.
+ *
+ * On a sample-accurate pointer a kept value stands one margin short of the
+ * loop at most. A tolerance of one period would let a value stand one period
+ * short. On MT7988 at 16 kHz, a call with such a value keeps 37 ms of the
+ * 64 ms tail past the hybrid.
+ *
+ * The limit: a hold inside a call can move the physical loop. A move inside
+ * the tolerance keeps taps that stand up to the margin off.
+ */
+static bool chan_lec_ref_moved(uint32_t loop, uint32_t applied,
+			       unsigned margin)
+{
+	uint32_t step = loop > applied ? loop - applied : applied - loop;
+
+	return step > margin;
+}
+
+/*
+ * The applied reference: the loop a line stands on, less the margin
+ * (chan_lec_margin). A fit of captured echo paths puts the echo onset at
+ * -20 dB past loop_ref at the base delay:
  *
  * - on the AN7581, 3 samples: 0.2 ms at 16 kHz and 0.4 ms at 8 kHz;
  * - on the MT7988, 58 samples (3.6 ms) at 16 kHz and 59 (7.4 ms) at 8 kHz.
  *
  * The guard stays, because a reference past the onset is non-causal. A filter
  * cannot cancel what sits before its first tap. An ideal filter on those
- * paths loses 4 to 6 dB per millisecond the onset stands ahead of it. The
- * period of margin
- * spends tail the measured responses do not use. The tolerance compare stays
- * on the measurement, so the guard moves nothing else.
+ * paths loses 4 to 6 dB per millisecond the onset stands ahead of it. On
+ * MT7988 the margin puts tap 0 6.1 ms ahead of the onset at 16 kHz and 9.9 ms
+ * at 8 kHz. The tolerance compare stays on the measurement, so the guard
+ * moves nothing else.
  */
-static uint32_t chan_lec_ref_guard(uint32_t loop, unsigned frame)
+static uint32_t chan_lec_ref_guard(uint32_t loop, unsigned margin)
 {
-	return loop > frame ? loop - frame : 0;
+	return loop > margin ? loop - margin : 0;
 }
 
 enum chan_lec_verdict chan_lec_line_decide(struct chan_lec_track *t,
@@ -3641,6 +3693,8 @@ enum chan_lec_verdict chan_lec_line_decide(struct chan_lec_track *t,
 {
 	struct chan_lec_line *l = &t->line[line];
 	uint32_t gen = l->gen;
+	unsigned margin;
+	bool nominal;
 	uint32_t loop;
 
 	if (t->offer == CHAN_LEC_OFFER_NONE) {
@@ -3648,14 +3702,20 @@ enum chan_lec_verdict chan_lec_line_decide(struct chan_lec_track *t,
 		return CHAN_LEC_HOLD;
 	}
 	loop = chan_lec_loop_pick(t, l);
+	nominal = t->offer == CHAN_LEC_OFFER_FALLBACK && t->nominal;
+	/* The tolerance is the margin of the value that stands. */
+	margin = chan_lec_line_margin(t, l, rate, frame);
 	if (!l->applied) {
 		l->loop = loop;
 		l->applied = true;
-	} else if (chan_lec_ref_moved(loop, l->loop, frame)) {
+		l->nominal = nominal;
+	} else if (chan_lec_ref_moved(loop, l->loop, margin)) {
 		l->loop = loop;
+		l->nominal = nominal;
 		l->gen++;
 	}
-	l->delay = chan_lec_delay_clamp(chan_lec_ref_guard(l->loop, frame),
+	margin = chan_lec_line_margin(t, l, rate, frame);
+	l->delay = chan_lec_delay_clamp(chan_lec_ref_guard(l->loop, margin),
 					rate, frame);
 	*delay = l->delay;
 
@@ -3687,6 +3747,11 @@ static void chan_lec_delay_track(struct udsp *s)
 	engine_stats_get(e, &st);
 	chan_lec_measure(&lec_track, &st);
 	atomic_store_explicit(&s->lec_loop, lec_track.loop_last,
+			      memory_order_relaxed);
+	/* The hold reads loop_last, so a nominal loop_last takes one period of
+	 * margin there too. */
+	atomic_store_explicit(&s->lec_exact,
+			      lec_track.exact && !lec_track.nominal,
 			      memory_order_relaxed);
 	for (unsigned i = 0; i < lines; i++) {
 		if (s->chan[i].lec_cap_for)

@@ -661,8 +661,9 @@ static enum engine_catchup engine_trim_run(struct engine *e, long avail)
  * starts again: the queues the canceller's reference is measured from are not
  * the ones the window latched before the hold. The restart moves the window
  * and nothing else. What the canceller does with the new measurement is the
- * consumer's decision (chan.c chan_lec_line_decide). A value within one period
- * of the applied reference keeps the taps. A value beyond it re-times them.
+ * consumer's decision (chan.c chan_lec_line_decide). A value within the margin
+ * of the applied reference (chan.c chan_lec_margin) keeps the taps. A value
+ * beyond it re-times them.
  * chan_lec_delay_track holds the canceller for the ENGINE_DELAY_CAL
  * ticks the new window takes: the filter does not adapt while no measurement
  * stands. That cost is accepted, because a reference that names the wrong
@@ -1572,6 +1573,7 @@ static void engine_stats_init(struct engine *e)
 	e->live.period_us = e->period_us;
 	e->live.channels = e->geom.channels;
 	e->live.paced = engine_paced(e, &e->geom);
+	e->live.pointer_exact = e->geom.pointer_exact;
 	e->live.rt.cpu = -1;
 	e->live.rt.prio = e->prio;
 	engine_publish(e);
