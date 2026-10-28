@@ -130,12 +130,15 @@ void slic_jobq_supersede(struct slic_jobq *q)
 /*
  * A queued line test is superseded like a start: a stop asks the lines to go
  * safe, and a test that has not begun would instead drive one of them for
- * seconds afterwards. A test already inside the plug-in is not reached here,
- * because the check runs once, when the job is taken from the queue.
+ * seconds afterwards. A queued SLIC dump goes too: the stop ends the started
+ * state, and a dump reads the part only in that state. A job already inside
+ * the plug-in is not reached here, because the check runs once, when the job
+ * is taken from the queue.
  */
 bool slic_job_superseded(const struct slic_jobq *q, const struct slic_job *j)
 {
-	if (j->kind != SLIC_JOB_START && j->kind != SLIC_JOB_LINE_TEST)
+	if (j->kind != SLIC_JOB_START && j->kind != SLIC_JOB_LINE_TEST &&
+	    j->kind != SLIC_JOB_SLIC_DUMP)
 		return false;
 
 	return j->cancel_seen != (uint32_t)atomic_load_explicit(&q->cancel_gen,
@@ -1709,30 +1712,44 @@ static void slic_test_result_clear(struct udsp *s, unsigned line)
 }
 
 /*
- * The record first, the generation after it, so a reader that sees a nonzero
- * generation sees a whole record (udsp_priv.h struct udsp_line_test_slot).
- *
- * The publisher steps aside while a reader copies (core/snap.h). This thread
- * is the SLOW worker and may wait, so it waits for that reader instead of
- * dropping the result of a test that took seconds. The only exit is a handle
- * that is closing, which is exactly when nobody is left to read the record.
+ * The publisher of a job record steps aside while a reader copies
+ * (core/snap.h). This thread is the SLOW worker and can wait, so it waits for
+ * that reader instead of dropping a record that took seconds. It returns false
+ * once the handle is closing, which is exactly when nobody is left to read the
+ * record.
  */
+static bool slic_publish_wait(struct udsp *s)
+{
+	struct timespec nap = { .tv_sec = 0, .tv_nsec = 1000000L };
+
+	if (atomic_load_explicit(&s->slic_quit, memory_order_acquire))
+		return false;
+	nanosleep(&nap, NULL);
+
+	return true;
+}
+
+/* The generation goes after the record, so a reader that sees a nonzero
+ * generation sees a whole record. *next skips zero, the value that means "no
+ * record". */
+static void slic_gen_publish(_Atomic uint_least32_t *gen, uint32_t *next)
+{
+	if (!++*next)
+		*next = 1u;
+	atomic_store_explicit(gen, *next, memory_order_release);
+}
+
+/* udsp_priv.h struct udsp_line_test_slot states the generation rule. */
 static void slic_test_result_store(struct udsp *s, unsigned line,
 				   const struct udsp_slic_mlt_result *rec)
 {
 	struct udsp_line_test_slot *slot = &s->line_test[line];
 
 	while (!line_test_snap_publish(&slot->snap, rec)) {
-		struct timespec nap = { .tv_sec = 0, .tv_nsec = 1000000L };
-
-		if (atomic_load_explicit(&s->slic_quit, memory_order_acquire))
+		if (!slic_publish_wait(s))
 			return;
-		nanosleep(&nap, NULL);
 	}
-	if (!++s->line_test_gen)
-		s->line_test_gen = 1u;
-	atomic_store_explicit(&slot->gen, s->line_test_gen,
-			      memory_order_release);
+	slic_gen_publish(&slot->gen, &s->line_test_gen);
 }
 
 /* The one claim libudsp can check, because it decodes none of the bytes
@@ -1832,6 +1849,66 @@ static int slic_job_line_test(struct udsp *s, const struct slic_job *job)
 	if (!slic_test_len_ok(&rec))
 		return -EPROTO;
 	slic_test_result_store(s, job->line, &rec);
+
+	return 0;
+}
+
+/* --- the SLIC dump ------------------------------------------------------- */
+
+static void slic_dump_result_clear(struct udsp *s)
+{
+	atomic_store_explicit(&s->dump.gen, 0u, memory_order_release);
+}
+
+/* udsp_priv.h struct udsp_dump_slot states the generation rule. */
+static void slic_dump_result_store(struct udsp *s)
+{
+	while (!dump_snap_publish(&s->dump.snap, &s->dump_scratch)) {
+		if (!slic_publish_wait(s))
+			return;
+	}
+	slic_gen_publish(&s->dump.gen, &s->dump_gen);
+}
+
+/* The claims libudsp can check, because it decodes no value (slic.h): two
+ * counts that fit their arrays, and the kind it asked for. */
+static bool slic_dump_len_ok(const struct udsp_slic_dump_result *rec,
+			     uint8_t kind)
+{
+	return rec->count <= UDSP_SLIC_DUMP_WORDS &&
+	       rec->skipped <= UDSP_SLIC_DUMP_SKIP_MAX && rec->kind == kind;
+}
+
+/*
+ * One SLIC dump. The step clears the slot first, so a reader between this step
+ * and the completion finds no record, and a dump that ends without one leaves
+ * none.
+ *
+ * A stop can complete and a loop can arm between the submission and this
+ * step, so the step tests both again, and either completes -EBUSY. The dump
+ * takes no line hold: it drives nothing, and a hold would zero the published
+ * hook level of a line in a call. The hook samples and the fault poll of
+ * every line stall for the op, as they do for a line test.
+ */
+static int slic_job_slic_dump(struct udsp *s, const struct slic_job *job)
+{
+	struct udsp_slic_dump_result *rec = &s->dump_scratch.r;
+	int rc;
+
+	slic_dump_result_clear(s);
+	if (!atomic_load_explicit(&s->started, memory_order_acquire) ||
+	    udsp_line_loop_armed(s, job->line))
+		return -EBUSY;
+
+	slic_slow_enter(s);
+	rc = s->ops->dump(s->slic, job->line, job->dump, rec);
+	slic_slow_leave(s);
+	if (rc)
+		return rc;
+	if (!slic_dump_len_ok(rec, job->dump))
+		return -EPROTO;
+	s->dump_scratch.line = job->line;
+	slic_dump_result_store(s);
 
 	return 0;
 }
@@ -2203,12 +2280,15 @@ static void slic_dead_retry_step(struct udsp *s)
 
 /* The counts drop before the completion is published, or the caller that
  * reacts to JOB_DONE would still be refused UDSP_TRANSIENT by a job that has
- * already finished. udsp_close reads the second count to choose how long it
- * waits (udsp_priv.h UDSP_STOP_TEST_MS). */
+ * already finished. udsp_close reads the count of each kind to choose how
+ * long it waits (udsp_priv.h UDSP_STOP_TEST_MS, UDSP_STOP_DUMP_MS). */
 static void slic_job_retire(struct udsp *s, const struct slic_job *job)
 {
 	if (job->kind == SLIC_JOB_LINE_TEST)
 		atomic_fetch_sub_explicit(&s->line_test_jobs, 1u,
+					  memory_order_acq_rel);
+	if (job->kind == SLIC_JOB_SLIC_DUMP)
+		atomic_fetch_sub_explicit(&s->dump_jobs, 1u,
 					  memory_order_acq_rel);
 	atomic_fetch_sub_explicit(&s->job_inflight, 1u, memory_order_acq_rel);
 }
@@ -2252,6 +2332,9 @@ static void slic_job_step(struct udsp *s)
 		break;
 	case SLIC_JOB_LINE_TEST:
 		rc = slic_job_line_test(s, &job);
+		break;
+	case SLIC_JOB_SLIC_DUMP:
+		rc = slic_job_slic_dump(s, &job);
 		break;
 	default:
 		rc = -ENOTSUP;

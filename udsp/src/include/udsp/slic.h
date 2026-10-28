@@ -48,7 +48,7 @@
 
 /* libudsp accepts only this exact version (slic/plugin_load.h), so the
  * plug-in and libudsp ship in one image. */
-#define UDSP_SLIC_ABI_VERSION	8
+#define UDSP_SLIC_ABI_VERSION	9
 #define UDSP_SLIC_SAFE_MAX	256	/* bytes of the pre-framed safe transfer */
 
 enum udsp_linefeed {
@@ -167,6 +167,34 @@ struct udsp_slic_converter {
 	uint32_t pd_dcdc;
 	uint32_t dcdc_status;
 	uint8_t lcrrtp;
+};
+
+/* The kinds of dump. dump takes the kind as a uint8_t, as mlt_run takes its
+ * test id. RAM_BRIEF is a list of named RAM words that the plug-in chooses. */
+#define UDSP_SLIC_DUMP_REG		0
+#define UDSP_SLIC_DUMP_RAM_BRIEF	1
+#define UDSP_SLIC_DUMP_RAM		2
+/* One entry per address of the part's 11-bit indirect RAM address space. */
+#define UDSP_SLIC_DUMP_WORDS		2048
+#define UDSP_SLIC_DUMP_SKIP_MAX		8
+
+/*
+ * One dump of one channel, which dump fills. The record holds count
+ * (addr, value) pairs in ascending address order. skip lists the skipped
+ * addresses inside the range of the kind: the plug-in reads none of them,
+ * because a read changes the part. width is the bit count of a value: 8 for
+ * a register, 29 for a RAM word. The entries past count and past skipped are
+ * undefined. libudsp checks the two counts against their arrays and decodes
+ * no value.
+ */
+struct udsp_slic_dump_result {
+	uint8_t kind;
+	uint8_t width;
+	uint16_t count;
+	uint16_t skipped;
+	uint16_t skip[UDSP_SLIC_DUMP_SKIP_MAX];
+	uint16_t addr[UDSP_SLIC_DUMP_WORDS];
+	uint32_t value[UDSP_SLIC_DUMP_WORDS];
 };
 
 struct udsp_slic;
@@ -308,6 +336,19 @@ struct udsp_slic_ops {
 	 * hook_read. Runs on the slic thread (rule 1). */
 	int (*hook_read_moved)(struct udsp_slic *s, unsigned chan,
 			       bool *offhook, bool *moved);
+
+	/* Nullable. One dump of the channel's registers or RAM words into
+	 * *out, kind a UDSP_SLIC_DUMP_* value. All or nothing: 0 with the
+	 * record filled. -EINVAL for a kind, a channel or a record that the
+	 * plug-in does not have, and for a channel that init did not bring
+	 * up. Else the errno of the first read that failed, or -ETIMEDOUT at
+	 * the plug-in's deadline; *out is then undefined. Writes nothing the
+	 * part keeps: a RAM read writes the indirect address registers, and
+	 * the plug-in skips an address whose read changes the part. SLOW: a
+	 * RAM word costs eight bus frames, so a whole RAM takes seconds on a
+	 * bit-banged bus. Runs on the slic thread (rule 1). */
+	int (*dump)(struct udsp_slic *s, unsigned chan, uint8_t kind,
+		    struct udsp_slic_dump_result *out);
 };
 
 /* The exported, versioned descriptor libudsp dlsym's and validates. */

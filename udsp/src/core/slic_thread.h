@@ -180,12 +180,14 @@ enum slic_job_kind {
 	SLIC_JOB_STOP,
 	SLIC_JOB_REGION,
 	SLIC_JOB_LINE_TEST,
+	SLIC_JOB_SLIC_DUMP,
 };
 
 struct slic_job {
 	uint8_t kind;		/* enum slic_job_kind */
-	uint8_t line;		/* SLIC_JOB_LINE_TEST only */
+	uint8_t line;		/* SLIC_JOB_LINE_TEST and SLIC_JOB_SLIC_DUMP */
 	uint8_t test;		/* SLIC_JOB_LINE_TEST only: udsp.h line test */
+	uint8_t dump;		/* SLIC_JOB_SLIC_DUMP only: slic.h dump kind */
 	uint32_t token;
 	uint32_t cancel_seen;	/* the queue generation at enqueue */
 	struct cmd_ack *ack;	/* ATTACH only: udsp_open blocks on it */
@@ -202,9 +204,10 @@ struct slic_jobq {
 void slic_jobq_init(struct slic_jobq *q);
 bool slic_jobq_push(struct slic_jobq *q, const struct slic_job *j);
 bool slic_jobq_pop(struct slic_jobq *q, struct slic_job *out);
-/* Supersedes every START and every line test still in the queue; one already
- * executing completes first, because a running metallic line test carries no
- * cancel. The generation counter is what the consumer compares. */
+/* Supersedes every START, every line test and every SLIC dump still in the
+ * queue; one already executing completes first, because a running metallic
+ * line test or dump carries no cancel. The generation counter is what the
+ * consumer compares. */
 void slic_jobq_supersede(struct slic_jobq *q);
 bool slic_job_superseded(const struct slic_jobq *q, const struct slic_job *j);
 

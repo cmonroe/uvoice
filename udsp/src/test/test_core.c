@@ -8631,6 +8631,583 @@ static void case_line_test_hook(void)
 	}
 }
 
+/*
+ * The SLIC dump. The fake carries the dump op and fills a fixed pattern
+ * (slic/fake.h). The registers are 0 to 127, less the four interrupt registers
+ * 18 to 21. The RAM words are 0 to 1644, less the patch data port 1359. The
+ * brief kind holds eleven named RAM words. A case checks every entry against
+ * a restatement of that pattern.
+ */
+static struct udsp_dump tc_dump;
+
+static uint32_t tc_dump_value(const struct udsp_dump *d, unsigned addr)
+{
+	if (d->kind == UDSP_DUMP_REG)
+		return (uint8_t)(addr ^ ((unsigned)d->line << 4));
+
+	return ((addr << 13) | d->line) & 0x1fffffffu;
+}
+
+static unsigned tc_dump_bad(const struct udsp_dump *d)
+{
+	unsigned bad = 0;
+
+	for (unsigned i = 0; i < d->count && i < UDSP_DUMP_WORDS; i++) {
+		if (i && d->addr[i] <= d->addr[i - 1])
+			bad++;
+		if (d->value[i] != tc_dump_value(d, d->addr[i]))
+			bad++;
+	}
+
+	return bad;
+}
+
+static void tc_dump_delay(struct eh *t, unsigned ms)
+{
+	udsp_slic_fake_delay_set(t->s->slic, UDSP_SLIC_FAKE_DUMP, ms);
+}
+
+/*
+ * Waits until the slic thread is inside the job step of a dump. The step
+ * clears the generation before it calls the op, and the job count drops only
+ * after the op returns. A zero generation with a dump in flight is therefore
+ * the signal. The caller must first run a dump that completes, because a slot
+ * that never held a record reads zero already. A fixed sleep proves nothing
+ * under load.
+ */
+static bool tc_dump_entered(struct eh *t)
+{
+	uint64_t end = eh_mono_us() + 5000000u;
+
+	while (eh_mono_us() < end) {
+		if (!atomic_load_explicit(&t->s->dump.gen,
+					  memory_order_acquire) &&
+		    atomic_load_explicit(&t->s->dump_jobs,
+					 memory_order_acquire))
+			return true;
+		eh_sleep_ms(1);
+	}
+
+	return false;
+}
+
+static bool tc_dump_run(struct eh *t, unsigned line, enum udsp_dump_kind kind,
+			int32_t *status)
+{
+	struct udsp_job job = { 0 };
+
+	if (udsp_slic_dump(t->s, line, kind, &job) != UDSP_OK)
+		return false;
+
+	return eh_job_wait(t, job.token, 5000, status);
+}
+
+static void case_slic_dump_cap(void)
+{
+	struct udsp_config cfg;
+	struct eh t;
+
+	CASE("the capability carries the dump bit with the fake, "
+	     "and a plug-in without the op takes no dump");
+	{
+		tc_backend_reset();
+		udsp_slic_fake_reset();
+		udsp_tdm_override(&tc_ops);
+		tc_cfg(&cfg, "tc", NULL);
+		CHECK(tc_open_handle(&t, &cfg));
+		if (t.s)
+			CHECK(t.s->cap.features & UDSP_FEAT_SLIC_DUMP);
+		tc_free(&t);
+
+		tc_backend_reset();
+		udsp_slic_fake_reset();
+		udsp_slic_fake_optional_set(UDSP_SLIC_FAKE_OPT_ALL &
+					    ~(uint32_t)UDSP_SLIC_FAKE_OPT_DUMP);
+		tc_cfg(&cfg, "tc", NULL);
+		CHECK(tc_open_handle(&t, &cfg));
+		if (t.s) {
+			struct udsp_job job = { 0 };
+
+			CHECK_UINT(t.s->cap.features & UDSP_FEAT_SLIC_DUMP, 0);
+			/* The op test comes before the lifecycle guard, so a
+			 * handle that never started answers UDSP_UNSUPPORTED
+			 * too. */
+			CHECK(udsp_slic_dump(t.s, 0, UDSP_DUMP_REG, &job) ==
+			      UDSP_UNSUPPORTED);
+			CHECK_UINT(job.token, 0);
+		}
+		tc_free(&t);
+		udsp_tdm_override(NULL);
+	}
+}
+
+static void case_slic_dump_result(void)
+{
+	struct udsp_config cfg;
+	struct eh t;
+
+	CASE("a register dump completes and its record reads back whole");
+	{
+		int32_t status = -1;
+
+		if (!tc_up(&t, "USA")) {
+			CHECK(false);
+			return;
+		}
+		CHECK(udsp_slic_dump_result(t.s, 0, &tc_dump) ==
+		      UDSP_UNSUPPORTED);
+		CHECK(tc_dump_run(&t, 0, UDSP_DUMP_REG, &status));
+		CHECK_UINT((uint32_t)status, UDSP_OK);
+		memset(&tc_dump, 0xa5, sizeof(tc_dump));
+		CHECK(udsp_slic_dump_result(t.s, 0, &tc_dump) == UDSP_OK);
+		CHECK_UINT(tc_dump.kind, UDSP_DUMP_REG);
+		CHECK_UINT(tc_dump.line, 0);
+		CHECK_UINT(tc_dump.width, 8);
+		CHECK_UINT(tc_dump.count, 124);
+		CHECK_UINT(tc_dump.skipped, 4);
+		for (unsigned i = 0; i < 4; i++)
+			CHECK_UINT(tc_dump.skip[i], 18u + i);
+		CHECK_UINT(tc_dump.addr[17], 17);
+		CHECK_UINT(tc_dump.addr[18], 22);
+		CHECK_UINT(tc_dump.addr[123], 127);
+		CHECK_UINT(tc_dump_bad(&tc_dump), 0);
+		CHECK(udsp_slic_dump_result(t.s, 1, &tc_dump) ==
+		      UDSP_UNSUPPORTED);
+		tc_down(&t);
+	}
+
+	CASE("a RAM dump on line 1 takes the one slot from line 0");
+	{
+		int32_t status = -1;
+
+		if (!tc_up(&t, "USA")) {
+			CHECK(false);
+			return;
+		}
+		CHECK(tc_dump_run(&t, 0, UDSP_DUMP_REG, NULL));
+		CHECK(udsp_slic_dump_result(t.s, 0, &tc_dump) == UDSP_OK);
+		CHECK(tc_dump_run(&t, 1, UDSP_DUMP_RAM, &status));
+		CHECK_UINT((uint32_t)status, UDSP_OK);
+		CHECK(udsp_slic_dump_result(t.s, 0, &tc_dump) ==
+		      UDSP_UNSUPPORTED);
+		CHECK(udsp_slic_dump_result(t.s, 1, &tc_dump) == UDSP_OK);
+		CHECK_UINT(tc_dump.kind, UDSP_DUMP_RAM);
+		CHECK_UINT(tc_dump.line, 1);
+		CHECK_UINT(tc_dump.width, 29);
+		CHECK_UINT(tc_dump.count, 1644);
+		CHECK_UINT(tc_dump.skipped, 1);
+		CHECK_UINT(tc_dump.skip[0], 1359);
+		CHECK_UINT(tc_dump.addr[1358], 1358);
+		CHECK_UINT(tc_dump.addr[1359], 1360);
+		CHECK_UINT(tc_dump.addr[1643], 1644);
+		CHECK_UINT(tc_dump_bad(&tc_dump), 0);
+		CHECK(tc_dump_run(&t, 1, UDSP_DUMP_RAM_BRIEF, &status));
+		CHECK_UINT((uint32_t)status, UDSP_OK);
+		CHECK(udsp_slic_dump_result(t.s, 1, &tc_dump) == UDSP_OK);
+		CHECK_UINT(tc_dump.kind, UDSP_DUMP_RAM_BRIEF);
+		CHECK_UINT(tc_dump.count, 11);
+		CHECK_UINT(tc_dump.skipped, 0);
+		CHECK_UINT(tc_dump.addr[0], 3);
+		CHECK_UINT(tc_dump.addr[10], 1551);
+		CHECK_UINT(tc_dump_bad(&tc_dump), 0);
+		tc_down(&t);
+	}
+
+	CASE("a dump in flight leaves no record until it completes");
+	{
+		struct udsp_job job = { 0 };
+
+		if (!tc_up(&t, "USA")) {
+			CHECK(false);
+			return;
+		}
+		CHECK(tc_dump_run(&t, 0, UDSP_DUMP_REG, NULL));
+		CHECK(udsp_slic_dump_result(t.s, 0, &tc_dump) == UDSP_OK);
+
+		tc_dump_delay(&t, 200);
+		CHECK(udsp_slic_dump(t.s, 0, UDSP_DUMP_RAM, &job) == UDSP_OK);
+		CHECK(tc_dump_entered(&t));
+		CHECK(udsp_slic_dump_result(t.s, 0, &tc_dump) ==
+		      UDSP_UNSUPPORTED);
+		/* The count drops only after the new record stands, so the
+		 * refusal above fell inside the job. */
+		CHECK(atomic_load_explicit(&t.s->dump_jobs,
+					   memory_order_acquire) != 0);
+		CHECK(eh_job_wait(&t, job.token, 5000, NULL));
+		tc_dump_delay(&t, 0);
+		CHECK(udsp_slic_dump_result(t.s, 0, &tc_dump) == UDSP_OK);
+		CHECK_UINT(tc_dump.kind, UDSP_DUMP_RAM);
+		CHECK_UINT(tc_dump.count, 1644);
+		tc_down(&t);
+	}
+
+	CASE("a dump before the start is transient");
+	{
+		struct udsp_job job = { 0 };
+
+		tc_backend_reset();
+		udsp_slic_fake_reset();
+		udsp_tdm_override(&tc_ops);
+		tc_cfg(&cfg, "tc", NULL);
+		CHECK(tc_open_handle(&t, &cfg));
+		if (t.s) {
+			CHECK(udsp_slic_dump(t.s, 0, UDSP_DUMP_REG, &job) ==
+			      UDSP_TRANSIENT);
+			CHECK_UINT(job.token, 0);
+		}
+		tc_free(&t);
+		udsp_tdm_override(NULL);
+	}
+}
+
+static void case_slic_dump_gate(void)
+{
+	struct tc_stream w;
+	struct eh t;
+
+	CASE("a dump and a line test refuse each other, and a start is "
+	     "refused during a dump");
+	{
+		struct udsp_job job = { 0 };
+		struct udsp_job other = { 0 };
+
+		if (!tc_up(&t, "USA")) {
+			CHECK(false);
+			return;
+		}
+		tc_mlt_delay(&t, 200);
+		CHECK(udsp_line_test(t.s, 0, UDSP_TEST_GR909, &job) == UDSP_OK);
+		CHECK(udsp_slic_dump(t.s, 1, UDSP_DUMP_REG, &other) ==
+		      UDSP_TRANSIENT);
+		CHECK_UINT(other.token, 0);
+		CHECK(eh_job_wait(&t, job.token, 5000, NULL));
+		tc_mlt_delay(&t, 0);
+
+		tc_dump_delay(&t, 200);
+		CHECK(udsp_slic_dump(t.s, 0, UDSP_DUMP_REG, &job) == UDSP_OK);
+		CHECK(udsp_line_test(t.s, 1, UDSP_TEST_GR909, &other) ==
+		      UDSP_TRANSIENT);
+		CHECK_UINT(other.token, 0);
+		/* A start skips the guard of the SYNC-SLIC class, so only the
+		 * job post refuses it: a start is an exclusive kind, and the
+		 * dump is in flight. */
+		CHECK(udsp_start(t.s, &other) == UDSP_TRANSIENT);
+		CHECK_UINT(other.token, 0);
+		CHECK(udsp_slic_dump(t.s, 1, UDSP_DUMP_REG, &other) ==
+		      UDSP_TRANSIENT);
+		CHECK(eh_job_wait(&t, job.token, 5000, NULL));
+		tc_dump_delay(&t, 0);
+		CHECK(tc_test_run(&t, 1, UDSP_TEST_GR909, NULL));
+		CHECK(tc_dump_run(&t, 1, UDSP_DUMP_REG, NULL));
+		tc_down(&t);
+	}
+
+	CASE("a dump on a line with a delayed loop is transient");
+	{
+		int32_t status = -1;
+		struct udsp_job job = { 0 };
+
+		if (!tc_up(&t, "USA")) {
+			CHECK(false);
+			return;
+		}
+		CHECK(udsp_line_loop(t.s, 0, UDSP_LOOP_SELF, 0, 100) ==
+		      UDSP_OK);
+		CHECK(udsp_slic_dump(t.s, 0, UDSP_DUMP_REG, &job) ==
+		      UDSP_TRANSIENT);
+		CHECK_UINT(job.token, 0);
+		/* The loop holds its own line alone. */
+		CHECK(tc_dump_run(&t, 1, UDSP_DUMP_REG, &status));
+		CHECK_UINT((uint32_t)status, UDSP_OK);
+		CHECK(udsp_line_loop(t.s, 0, UDSP_LOOP_OFF, 0, 0) == UDSP_OK);
+		CHECK(tc_dump_run(&t, 0, UDSP_DUMP_REG, &status));
+		CHECK_UINT((uint32_t)status, UDSP_OK);
+		tc_down(&t);
+	}
+
+	CASE("a loop armed before the job step completes the dump transient "
+	     "and leaves no record");
+	{
+		struct udsp_job job = { 0 };
+		int32_t status = -1;
+
+		if (!tc_up(&t, "USA")) {
+			CHECK(false);
+			return;
+		}
+		/* A record stands first, so the case sees the refused dump
+		 * below clear it. */
+		CHECK(tc_dump_run(&t, 0, UDSP_DUMP_REG, &status));
+		CHECK_UINT((uint32_t)status, UDSP_OK);
+		CHECK(udsp_slic_dump_result(t.s, 0, &tc_dump) == UDSP_OK);
+		eh_wait_ms(&t, 50);
+		/* The slic thread waits in a hook read, so the dump is still in
+		 * the queue when the arm arrives. A queued dump refuses no
+		 * arm. */
+		udsp_slic_fake_delay_set(t.s->slic,
+					 UDSP_SLIC_FAKE_HOOK_READ, 400);
+		eh_sleep_ms(20);
+		CHECK(udsp_slic_dump(t.s, 0, UDSP_DUMP_RAM, &job) == UDSP_OK);
+		CHECK(udsp_line_loop(t.s, 0, UDSP_LOOP_SELF, 0, 100) ==
+		      UDSP_OK);
+		udsp_slic_fake_delay_set(t.s->slic,
+					 UDSP_SLIC_FAKE_HOOK_READ, 0);
+		status = -1;
+		CHECK(eh_job_wait(&t, job.token, 5000, &status));
+		CHECK_UINT((uint32_t)status, UDSP_TRANSIENT);
+		CHECK_UINT(atomic_load_explicit(&t.s->dump.gen,
+						memory_order_acquire), 0);
+		CHECK(udsp_slic_dump_result(t.s, 0, &tc_dump) ==
+		      UDSP_UNSUPPORTED);
+		CHECK(udsp_line_loop(t.s, 0, UDSP_LOOP_OFF, 0, 0) == UDSP_OK);
+		tc_down(&t);
+	}
+
+	CASE("a stop supersedes a dump that is still queued");
+	{
+		struct udsp_slic_fake_chan_state st;
+		struct udsp_job stop = { 0 };
+		struct udsp_job job = { 0 };
+		int32_t status = -1;
+
+		if (!tc_up(&t, "USA")) {
+			CHECK(false);
+			return;
+		}
+		eh_wait_ms(&t, 50);
+		udsp_slic_fake_delay_set(t.s->slic,
+					 UDSP_SLIC_FAKE_HOOK_READ, 400);
+		eh_sleep_ms(20);
+		CHECK(udsp_slic_dump(t.s, 0, UDSP_DUMP_RAM, &job) == UDSP_OK);
+		CHECK(udsp_stop(t.s, &stop) == UDSP_OK);
+		udsp_slic_fake_delay_set(t.s->slic,
+					 UDSP_SLIC_FAKE_HOOK_READ, 0);
+		CHECK(eh_job_wait(&t, job.token, 5000, &status));
+		CHECK_UINT((uint32_t)status, UDSP_TRANSIENT);
+		status = -1;
+		CHECK(eh_job_wait(&t, stop.token, 5000, &status));
+		CHECK_UINT((uint32_t)status, UDSP_OK);
+		CHECK(tc_state(&t, 0, &st));
+		CHECK_UINT(st.dump_count, 0);
+		tc_free(&t);
+		udsp_tdm_override(NULL);
+	}
+
+	CASE("a dump on a line with a stream or a ring session completes");
+	{
+		struct udsp_ring ring;
+		int32_t status = -1;
+
+		if (!tc_up(&t, "USA")) {
+			CHECK(false);
+			return;
+		}
+		CHECK(tc_stream_up(&t, &w, 0));
+		CHECK(tc_dump_run(&t, 0, UDSP_DUMP_REG, &status));
+		CHECK_UINT((uint32_t)status, UDSP_OK);
+		CHECK(udsp_slic_dump_result(t.s, 0, &tc_dump) == UDSP_OK);
+		tc_stream_down(&t, &w, 0);
+
+		memset(&ring, 0, sizeof(ring));
+		ring.cadence[0].on_ms = 2000;
+		ring.cadence[0].off_ms = 4000;
+		ring.cadence_count = 1;
+		CHECK(udsp_ring_start(t.s, 1, &ring) == UDSP_OK);
+		status = -1;
+		CHECK(tc_dump_run(&t, 1, UDSP_DUMP_RAM_BRIEF, &status));
+		CHECK_UINT((uint32_t)status, UDSP_OK);
+		CHECK(udsp_ring_stop(t.s, 1) == UDSP_OK);
+		tc_down(&t);
+	}
+
+	CASE("a sync slic op is transient during a dump, "
+	     "and the hook level stays published");
+	{
+		struct udsp_job job = { 0 };
+		bool before = true;
+
+		if (!tc_up(&t, "USA")) {
+			CHECK(false);
+			return;
+		}
+		CHECK(tc_hook_boot_wait(&t));
+		CHECK(udsp_line_hook_query(t.s, 0, &before) == UDSP_OK);
+		CHECK(tc_dump_run(&t, 0, UDSP_DUMP_REG, NULL));
+		tc_dump_delay(&t, 200);
+		CHECK(udsp_slic_dump(t.s, 0, UDSP_DUMP_RAM, &job) == UDSP_OK);
+		CHECK(tc_dump_entered(&t));
+		CHECK(udsp_line_state(t.s, 1, UDSP_LINE_OHT) == UDSP_TRANSIENT);
+		/* A line test hold would invalidate the published pair. The
+		 * dump holds no line, so the level stays readable for the
+		 * whole op. */
+		for (unsigned i = 0; i < 5; i++) {
+			bool level = !before;
+
+			CHECK(udsp_line_hook_query(t.s, 0, &level) == UDSP_OK);
+			CHECK(level == before);
+			eh_sleep_ms(10);
+		}
+		/* The dump is still in flight, so every query above fell
+		 * inside the op. */
+		CHECK(atomic_load_explicit(&t.s->dump_jobs,
+					   memory_order_acquire) != 0);
+		CHECK(eh_job_wait(&t, job.token, 5000, NULL));
+		tc_dump_delay(&t, 0);
+		CHECK(udsp_line_state(t.s, 1, UDSP_LINE_OHT) == UDSP_OK);
+		tc_down(&t);
+	}
+}
+
+static void case_slic_dump_fail(void)
+{
+	struct eh t;
+
+	CASE("a bus error completes fatal and leaves no record");
+	{
+		int32_t status = -1;
+
+		if (!tc_up(&t, "USA")) {
+			CHECK(false);
+			return;
+		}
+		CHECK(tc_dump_run(&t, 0, UDSP_DUMP_REG, NULL));
+		CHECK(udsp_slic_dump_result(t.s, 0, &tc_dump) == UDSP_OK);
+		udsp_slic_fake_error_set(t.s->slic, UDSP_SLIC_FAKE_DUMP, -EIO);
+		CHECK(tc_dump_run(&t, 0, UDSP_DUMP_REG, &status));
+		CHECK_UINT((uint32_t)status, UDSP_FATAL);
+		CHECK_UINT(atomic_load_explicit(&t.s->dump.gen,
+						memory_order_acquire), 0);
+		CHECK(udsp_slic_dump_result(t.s, 0, &tc_dump) ==
+		      UDSP_UNSUPPORTED);
+		tc_down(&t);
+	}
+
+	CASE("a plug-in deadline completes transient and a refused kind "
+	     "unsupported");
+	{
+		int32_t status = -1;
+
+		if (!tc_up(&t, "USA")) {
+			CHECK(false);
+			return;
+		}
+		udsp_slic_fake_error_set(t.s->slic, UDSP_SLIC_FAKE_DUMP,
+					 -ETIMEDOUT);
+		CHECK(tc_dump_run(&t, 0, UDSP_DUMP_RAM, &status));
+		CHECK_UINT((uint32_t)status, UDSP_TRANSIENT);
+		CHECK(udsp_slic_dump_result(t.s, 0, &tc_dump) ==
+		      UDSP_UNSUPPORTED);
+		udsp_slic_fake_error_set(t.s->slic, UDSP_SLIC_FAKE_DUMP,
+					 -EINVAL);
+		status = -1;
+		CHECK(tc_dump_run(&t, 0, UDSP_DUMP_RAM, &status));
+		CHECK_UINT((uint32_t)status, UDSP_UNSUPPORTED);
+		CHECK(udsp_slic_dump_result(t.s, 0, &tc_dump) ==
+		      UDSP_UNSUPPORTED);
+		tc_down(&t);
+	}
+
+	CASE("a count past the record fails the job");
+	{
+		int32_t status = -1;
+
+		if (!tc_up(&t, "USA")) {
+			CHECK(false);
+			return;
+		}
+		udsp_slic_fake_dump_count_set(UDSP_SLIC_DUMP_WORDS + 1);
+		CHECK(tc_dump_run(&t, 0, UDSP_DUMP_REG, &status));
+		CHECK_UINT((uint32_t)status, UDSP_FATAL);
+		CHECK(udsp_slic_dump_result(t.s, 0, &tc_dump) ==
+		      UDSP_UNSUPPORTED);
+		udsp_slic_fake_dump_count_set(-1);
+		status = -1;
+		CHECK(tc_dump_run(&t, 0, UDSP_DUMP_REG, &status));
+		CHECK_UINT((uint32_t)status, UDSP_OK);
+		CHECK(udsp_slic_dump_result(t.s, 0, &tc_dump) == UDSP_OK);
+		tc_down(&t);
+	}
+
+	CASE("closing the handle joins a dump in flight, and the next open "
+	     "succeeds");
+	{
+		const struct udsp_event *ev;
+		struct udsp_job job = { 0 };
+		uint64_t at, took;
+
+		if (!tc_up(&t, "USA")) {
+			CHECK(false);
+			return;
+		}
+		CHECK(tc_dump_run(&t, 0, UDSP_DUMP_REG, NULL));
+		tc_dump_delay(&t, 300);
+		CHECK(udsp_slic_dump(t.s, 0, UDSP_DUMP_RAM, &job) == UDSP_OK);
+		CHECK(tc_dump_entered(&t));
+		at = eh_mono_us();
+		udsp_close(t.s);
+		took = eh_mono_us() - at;
+		t.s = NULL;
+		/* The op carries no cancel, so the close waits for the rest of
+		 * the delay. The case does not reach UDSP_STOP_DUMP_MS: the
+		 * ordinary bounded stop alone would join a 300 ms op. */
+		CHECK(took > 100000u);
+		CHECK(took < 5000000u);
+		eh_ev_poll(&t);
+		ev = tc_job_find(job.token);
+		CHECK(ev != NULL);
+		if (ev)
+			CHECK_UINT((uint32_t)ev->u.job.status, UDSP_OK);
+		tc_free(&t);
+		udsp_tdm_override(NULL);
+		/* A close that left the slic thread behind keeps the handle
+		 * guard taken, and this open would fail. */
+		CHECK(tc_up(&t, "USA"));
+		tc_down(&t);
+	}
+
+	CASE("a NULL job, a NULL output and bad arguments submit nothing "
+	     "and spend no armed error");
+	{
+		struct udsp_slic_fake_chan_state st;
+		struct udsp_job job = { 0 };
+		int32_t status = -1;
+
+		if (!tc_up(&t, "USA")) {
+			CHECK(false);
+			return;
+		}
+		udsp_slic_fake_error_set(t.s->slic, UDSP_SLIC_FAKE_DUMP, -EIO);
+		CHECK(udsp_slic_dump(NULL, 0, UDSP_DUMP_REG, &job) ==
+		      UDSP_UNSUPPORTED);
+		CHECK(udsp_slic_dump(t.s, 0, UDSP_DUMP_REG, NULL) ==
+		      UDSP_UNSUPPORTED);
+		CHECK(udsp_slic_dump(t.s, 2, UDSP_DUMP_REG, &job) ==
+		      UDSP_UNSUPPORTED);
+		CHECK(udsp_slic_dump(t.s, 0, (enum udsp_dump_kind)3, &job) ==
+		      UDSP_UNSUPPORTED);
+		CHECK_UINT(job.token, 0);
+		CHECK(udsp_slic_dump_result(NULL, 0, &tc_dump) ==
+		      UDSP_UNSUPPORTED);
+		CHECK(udsp_slic_dump_result(t.s, 0, NULL) == UDSP_UNSUPPORTED);
+		CHECK(udsp_slic_dump_result(t.s, UDSP_LINE_MAX, &tc_dump) ==
+		      UDSP_UNSUPPORTED);
+		CHECK_UINT(atomic_load_explicit(&t.s->dump_jobs,
+						memory_order_acquire), 0);
+		/* The armed error is still standing for the first real
+		 * dump. */
+		CHECK(tc_dump_run(&t, 0, UDSP_DUMP_REG, &status));
+		CHECK_UINT((uint32_t)status, UDSP_FATAL);
+		status = -1;
+		CHECK(tc_dump_run(&t, 0, UDSP_DUMP_REG, &status));
+		CHECK_UINT((uint32_t)status, UDSP_OK);
+		CHECK(tc_stop(&t));
+		CHECK(tc_state(&t, 0, &st));
+		CHECK_UINT(st.dump_count, 1);
+		tc_free(&t);
+		udsp_tdm_override(NULL);
+	}
+}
+
 static void case_sync(void)
 {
 	struct udsp_counters before, after;
@@ -18691,6 +19268,10 @@ int main(void)
 	case_line_test_gate();
 	case_line_test_fail();
 	case_line_test_hook();
+	case_slic_dump_cap();
+	case_slic_dump_result();
+	case_slic_dump_gate();
+	case_slic_dump_fail();
 	case_sync();
 	case_ack();
 	case_confirmed_state();

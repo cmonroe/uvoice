@@ -21,10 +21,11 @@
  * bits and the probed channel count, so the engine's paths run with no
  * hardware.
  *
- * Threads. Ten entry points are safe while another thread runs the ops.
+ * Threads. Eleven entry points are safe while another thread runs the ops.
  * udsp_slic_fake_fault_set, udsp_slic_fake_error_set,
- * udsp_slic_fake_error_repeat_set, udsp_slic_fake_delay_set and
- * udsp_slic_fake_mlt_len_set write atomic injection cells that the ops load.
+ * udsp_slic_fake_error_repeat_set, udsp_slic_fake_delay_set,
+ * udsp_slic_fake_mlt_len_set and udsp_slic_fake_dump_count_set write atomic
+ * injection cells that the ops load.
  * An engine test therefore injects from its control thread while the slic
  * thread samples. udsp_slic_fake_hook_set and udsp_slic_fake_hook_inject write
  * the hook level and its toggle count under the instance lock that the ops
@@ -78,6 +79,7 @@ enum udsp_slic_fake_call {
 	UDSP_SLIC_FAKE_MONITOR_READ,
 	UDSP_SLIC_FAKE_CONVERTER_READ,
 	UDSP_SLIC_FAKE_HOOK_READ_MOVED,
+	UDSP_SLIC_FAKE_DUMP,
 	UDSP_SLIC_FAKE_CALL_MAX,
 };
 
@@ -103,7 +105,8 @@ enum udsp_slic_fake_opt {
 	/* A cleared bit is the shape of a plug-in with no change record,
 	 * which the engine samples by level alone. */
 	UDSP_SLIC_FAKE_OPT_HOOK_MOVED	= (1u << 11),
-	UDSP_SLIC_FAKE_OPT_ALL		= 0xfffu,
+	UDSP_SLIC_FAKE_OPT_DUMP		= (1u << 12),
+	UDSP_SLIC_FAKE_OPT_ALL		= 0x1fffu,
 };
 
 /* One journal row. arg0 and arg1 carry the op's own arguments: the linefeed,
@@ -170,6 +173,10 @@ struct udsp_slic_fake_chan_state {
 	 * the shape of a pair of transitions inside one sample interval or of
 	 * the part's race between its two reads. */
 	unsigned hook_moved_count;
+	/* The kind of the last dump and the count of dumps. The journal row
+	 * of a dump carries the kind in arg0 and the reported count in arg1. */
+	uint8_t dump_kind;
+	unsigned dump_count;
 };
 
 extern const struct udsp_slic_descriptor udsp_slic_fake_descriptor;
@@ -238,6 +245,24 @@ void udsp_slic_fake_delay_set(struct udsp_slic *s, enum udsp_slic_fake_call op,
  * that length is reachable. A negative value, the reset default, reports the
  * true length. */
 void udsp_slic_fake_mlt_len_set(int len);
+
+/*
+ * The record of dump follows a fixed pattern, so a caller can check every
+ * entry that crossed the interface:
+ * - UDSP_SLIC_DUMP_REG: addresses 0 to 127 less 18 to 21, skip {18, 19, 20,
+ *   21}, width 8, value (uint8_t)(addr ^ (chan << 4));
+ * - UDSP_SLIC_DUMP_RAM: addresses 0 to 1644 less 1359, skip {1359}, width 29,
+ *   value ((addr << 13) | chan) & 0x1fffffff;
+ * - UDSP_SLIC_DUMP_RAM_BRIEF: the eleven addresses 3, 367, 770, 1006, 1007,
+ *   1458, 1459, 1476, 1477, 1538 and 1551, the value of the RAM kind, width
+ *   29, no skip.
+ * The entries past count and past skipped read zero.
+ *
+ * udsp_slic_fake_dump_count_set makes dump report a count it did not write,
+ * so a caller's bound check on that count is reachable. A negative value, the
+ * reset default, reports the true count.
+ */
+void udsp_slic_fake_dump_count_set(int count);
 
 /* What monitor_read copies out for chan, and what converter_read copies its
  * three words from; safe from another thread (the cell is written under the

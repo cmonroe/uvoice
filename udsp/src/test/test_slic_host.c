@@ -26,7 +26,7 @@
 #include "plugin_load.h"
 #include "util.h"
 
-#define OPS_SLOTS	24
+#define OPS_SLOTS	25
 #define TPATH_MAX	256
 #define SEG_SPEED	500000
 #define SEG_BITS	8
@@ -104,7 +104,8 @@ static bool stub_build_named(const char *name, unsigned abi, size_t struct_size,
 	/* Explicit slots expose a member inserted in the middle of the ABI.
 	 * Order: name, nine mandatory ops, five nullable ops, safe_xfer,
 	 * part_name, region_set, caps_get, reinit, converter_restart,
-	 * monitor_read, converter_read. */
+	 * monitor_read, converter_read. The initializer leaves the two slots
+	 * after converter_read, hook_read_moved and dump, at zero. */
 	snprintf(body, sizeof(body),
 		 "static void stub_op(void) { }\n"
 		 "static const char stub_name[] = \"stub\";\n"

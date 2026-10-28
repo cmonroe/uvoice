@@ -60,6 +60,13 @@
 _Static_assert(sizeof(((struct udsp_engine_diag *)0)->interval) /
 	       sizeof(uint64_t) == ENGINE_HIST_BUCKETS,
 	       "engine diagnostics carry every interval bucket");
+_Static_assert(UDSP_DUMP_REG == UDSP_SLIC_DUMP_REG &&
+	       UDSP_DUMP_RAM_BRIEF == UDSP_SLIC_DUMP_RAM_BRIEF &&
+	       UDSP_DUMP_RAM == UDSP_SLIC_DUMP_RAM,
+	       "the dump kinds of udsp.h equal those of slic.h");
+_Static_assert(UDSP_DUMP_WORDS == UDSP_SLIC_DUMP_WORDS &&
+	       UDSP_DUMP_SKIP_MAX == UDSP_SLIC_DUMP_SKIP_MAX,
+	       "the dump arrays of udsp.h hold those of slic.h");
 
 /* Signal dispositions, the safe-state block and the sigaltstack are process
  * wide, so exactly one handle may live at a time. */
@@ -808,13 +815,15 @@ static void cmd_line_init(struct udsp_cmd *cmd, enum udsp_cmd_type type,
 
 /* --- SLOW jobs ----------------------------------------------------------- */
 
-/* One job at a time reaches the slic thread for the two kinds that hold it for
- * seconds and drive the lines. A region load and a stop are not gated here:
+/* One job at a time reaches the slic thread for the kinds that hold it for
+ * seconds: a start and a line test drive the lines, and a SLIC dump owns the
+ * one dump slot of the handle. A region load and a stop are not gated here:
  * the stop supersedes instead, and the region job is the shape the caller
  * repeats. */
 static bool job_kind_exclusive(uint8_t kind)
 {
-	return kind == SLIC_JOB_START || kind == SLIC_JOB_LINE_TEST;
+	return kind == SLIC_JOB_START || kind == SLIC_JOB_LINE_TEST ||
+	       kind == SLIC_JOB_SLIC_DUMP;
 }
 
 static enum udsp_status udsp_job_post(struct udsp *s,
@@ -836,8 +845,8 @@ static enum udsp_status udsp_job_post(struct udsp *s,
 	j.token = ++s->job_token;
 	if (!j.token)
 		j.token = s->job_token = 1u;
-	/* A stop supersedes a start and a line test that have not begun; one
-	 * already executing completes first. */
+	/* A stop supersedes a start, a line test and a SLIC dump that have not
+	 * begun; one already executing completes first. */
 	if (j.kind == SLIC_JOB_STOP)
 		slic_jobq_supersede(&s->jobs);
 	if (!slic_jobq_push(&s->jobs, &j)) {
@@ -848,6 +857,9 @@ static enum udsp_status udsp_job_post(struct udsp *s,
 	atomic_fetch_add_explicit(&s->job_inflight, 1u, memory_order_acq_rel);
 	if (j.kind == SLIC_JOB_LINE_TEST)
 		atomic_fetch_add_explicit(&s->line_test_jobs, 1u,
+					  memory_order_acq_rel);
+	if (j.kind == SLIC_JOB_SLIC_DUMP)
+		atomic_fetch_add_explicit(&s->dump_jobs, 1u,
 					  memory_order_acq_rel);
 	pthread_mutex_unlock(&s->ctl_lock);
 
@@ -1748,6 +1760,71 @@ enum udsp_status udsp_line_test_result(udsp_t *s, unsigned line, void *buf,
 	return UDSP_OK;
 }
 
+/*
+ * SLOW, in the refusal order of udsp.h. Unlike udsp_line_test, this op does
+ * not read udsp_line_busy, because the dump drives nothing: a call, a ring
+ * session or a burst on the line refuses nothing. A delayed loop refuses it,
+ * by project decision: a dump and the manufacturing loop test exclude each
+ * other. The slic thread reads the loop and the started state again at the job
+ * step.
+ */
+enum udsp_status udsp_slic_dump(udsp_t *s, unsigned line,
+				enum udsp_dump_kind kind, struct udsp_job *job)
+{
+	struct slic_job j = { .kind = SLIC_JOB_SLIC_DUMP,
+			      .line = (uint8_t)line, .dump = (uint8_t)kind };
+	enum udsp_status g;
+
+	if (!s || !job || line >= s->cap.lines || kind > UDSP_DUMP_RAM)
+		return UDSP_UNSUPPORTED;
+	if (!s->ops->dump)
+		return UDSP_UNSUPPORTED;
+	g = udsp_guard(s, line, true);
+	if (g != UDSP_OK)
+		return g;
+	if (udsp_line_loop_armed(s, line))
+		return UDSP_TRANSIENT;
+
+	return udsp_job_post(s, &j, job);
+}
+
+/*
+ * FASTPATH: no lock and no cross-thread wait, the udsp_line_test_result
+ * shape. The getter reads the generation on both sides of the copy. The line
+ * check reads the copy and never the slot, because a dump of another line can
+ * replace the slot between any two reads of it.
+ */
+enum udsp_status udsp_slic_dump_result(udsp_t *s, unsigned line,
+				       struct udsp_dump *out)
+{
+	struct udsp_dump_rec rec;
+	uint_least32_t gen;
+
+	if (!s || !out || line >= s->cap.lines)
+		return UDSP_UNSUPPORTED;
+
+	gen = atomic_load_explicit(&s->dump.gen, memory_order_acquire);
+	if (!gen)
+		return UDSP_UNSUPPORTED;
+
+	dump_snap_get(&s->dump.snap, &rec);
+	if (atomic_load_explicit(&s->dump.gen, memory_order_acquire) != gen)
+		return UDSP_UNSUPPORTED;
+	if (rec.line != line)
+		return UDSP_UNSUPPORTED;
+
+	out->kind = rec.r.kind;
+	out->line = rec.line;
+	out->width = rec.r.width;
+	out->count = rec.r.count;
+	out->skipped = rec.r.skipped;
+	memcpy(out->skip, rec.r.skip, sizeof(out->skip));
+	memcpy(out->addr, rec.r.addr, sizeof(out->addr));
+	memcpy(out->value, rec.r.value, sizeof(out->value));
+
+	return UDSP_OK;
+}
+
 /* --- capability and counters --------------------------------------------- */
 
 const struct udsp_cap *udsp_cap(udsp_t *s)
@@ -1866,6 +1943,8 @@ static void udsp_cap_fill(struct udsp *s)
 		s->cap.features |= UDSP_FEAT_MWI_LAMP;
 	if (s->ops->mlt_run)
 		s->cap.features |= UDSP_FEAT_LINE_TEST;
+	if (s->ops->dump)
+		s->cap.features |= UDSP_FEAT_SLIC_DUMP;
 	s->cap.codecs = (1u << UDSP_SEL_PCMU) | (1u << UDSP_SEL_PCMA) |
 			(1u << UDSP_SEL_G726_16) | (1u << UDSP_SEL_G726_24) |
 			(1u << UDSP_SEL_G726_32) | (1u << UDSP_SEL_G726_40) |
@@ -2122,6 +2201,7 @@ static struct udsp *udsp_alloc(const struct udsp_config *cfg, int event_fd)
 	atomic_init(&s->job_inflight, 0u);
 	atomic_init(&s->line_test_jobs, 0u);
 	atomic_init(&s->recover_jobs, 0u);
+	atomic_init(&s->dump_jobs, 0u);
 	atomic_init(&s->recover_ack_drop, false);
 	atomic_init(&s->slic_armed, false);
 	atomic_init(&s->slic_policy, -1);
@@ -2446,6 +2526,19 @@ fail:
 	return NULL;
 }
 
+static void udsp_jobs_wait(atomic_uint *jobs, unsigned ms)
+{
+	uint64_t end = udsp_mono_us() + (uint64_t)ms * 1000u;
+
+	while (atomic_load_explicit(jobs, memory_order_acquire)) {
+		struct timespec nap = { .tv_sec = 0, .tv_nsec = 1000000L };
+
+		if (udsp_mono_us() >= end)
+			return;
+		nanosleep(&nap, NULL);
+	}
+}
+
 /*
  * A metallic line test carries no cancel, so a close that arrives during one
  * has to let it finish. The plug-in stops its poll loops at 90 seconds for the
@@ -2458,15 +2551,7 @@ fail:
  */
 static void udsp_line_test_wait(struct udsp *s)
 {
-	uint64_t end = udsp_mono_us() + (uint64_t)UDSP_STOP_TEST_MS * 1000u;
-
-	while (atomic_load_explicit(&s->line_test_jobs, memory_order_acquire)) {
-		struct timespec nap = { .tv_sec = 0, .tv_nsec = 1000000L };
-
-		if (udsp_mono_us() >= end)
-			return;
-		nanosleep(&nap, NULL);
-	}
+	udsp_jobs_wait(&s->line_test_jobs, UDSP_STOP_TEST_MS);
 }
 
 /* A recovery op holds the slic thread and carries no cancel, so a close waits
@@ -2474,15 +2559,14 @@ static void udsp_line_test_wait(struct udsp *s)
  * and releases the line (core/slic_thread.c). */
 static void udsp_recover_wait(struct udsp *s)
 {
-	uint64_t end = udsp_mono_us() + (uint64_t)UDSP_STOP_RECOVER_MS * 1000u;
+	udsp_jobs_wait(&s->recover_jobs, UDSP_STOP_RECOVER_MS);
+}
 
-	while (atomic_load_explicit(&s->recover_jobs, memory_order_acquire)) {
-		struct timespec nap = { .tv_sec = 0, .tv_nsec = 1000000L };
-
-		if (udsp_mono_us() >= end)
-			return;
-		nanosleep(&nap, NULL);
-	}
+/* A SLIC dump carries no cancel either, and a whole RAM takes seconds, so a
+ * close waits for it as for a line test (udsp_priv.h UDSP_STOP_DUMP_MS). */
+static void udsp_dump_wait(struct udsp *s)
+{
+	udsp_jobs_wait(&s->dump_jobs, UDSP_STOP_DUMP_MS);
 }
 
 static void udsp_release(struct udsp *s)
@@ -2543,6 +2627,7 @@ void udsp_close(udsp_t *s)
 		atomic_store_explicit(&s->slic_quit, true, memory_order_release);
 		slic_wake(s);
 		udsp_line_test_wait(s);
+		udsp_dump_wait(s);
 		udsp_recover_wait(s);
 		if (udsp_thread_stop_bounded(&s->slic_thread, UDSP_STOP_SLIC_MS))
 			atomic_store_explicit(&s->dead, true,

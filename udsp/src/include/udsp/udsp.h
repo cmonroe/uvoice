@@ -27,11 +27,12 @@
  *              cid_send arms the OHT linefeed on the slic thread and the FSK
  *              burst on the engine, and its ack is the arm, not the burst.
  *   FASTPATH   A FAST op answered from cached state with no cross-thread wait
- *              (line_hook_query, counters, cap, stream_stats, line_test_result).
- *   SLOW       start/stop/region_load/line_test. Returns UDSP_OK once accepted
- *              and fills *token; the result arrives as UDSP_EV_JOB_DONE and the
- *              backend then calls the hal_job callback. The op is named "slow"
- *              in its doc line.
+ *              (line_hook_query, counters, cap, stream_stats, line_test_result,
+ *              slic_dump_result).
+ *   SLOW       start/stop/region_load/line_test/slic_dump. Returns UDSP_OK once
+ *              accepted and fills *token; the result arrives as
+ *              UDSP_EV_JOB_DONE and the backend then calls the hal_job
+ *              callback. The op is named "slow" in its doc line.
  *
  * Worst-case bound. A SYNC-TICK ack costs up to one period (10 ms) plus the
  * PREEMPT_NONE wakeup. A SYNC-SLIC ack costs one tick boundary plus the slic
@@ -149,6 +150,9 @@ enum udsp_feature {
 	 * plug-in for nothing.
 	 */
 	UDSP_FEAT_LOOP		= (1 << 11),
+	/* The SLIC plug-in carries the dump op, so udsp_slic_dump reads the
+	 * registers and RAM words of a line on demand. */
+	UDSP_FEAT_SLIC_DUMP	= (1 << 12),
 };
 
 enum udsp_codec_sel {
@@ -1511,7 +1515,9 @@ enum udsp_status udsp_conf(udsp_t *s, unsigned line, enum udsp_conf_mode mode);
  * While a loop stands on a line, udsp_line_test, udsp_stream_config and
  * udsp_stream_start on that line answer UDSP_TRANSIENT, so the two exclude
  * each other in both directions. An arm that a metallic line test wins at the
- * tick boundary answers UDSP_TRANSIENT as well. udsp_stop disarms every loop.
+ * tick boundary answers UDSP_TRANSIENT as well. udsp_slic_dump on that line
+ * answers UDSP_TRANSIENT too, but a dump in flight refuses no arm, because the
+ * dump drives nothing. udsp_stop disarms every loop.
  */
 enum udsp_status udsp_line_loop(udsp_t *s, unsigned line,
 				enum udsp_loop_mode mode, unsigned peer,
@@ -1524,6 +1530,75 @@ enum udsp_status udsp_line_test(udsp_t *s, unsigned line, enum udsp_line_test te
  * JOB_DONE. The reserved interface: a line test adds no field later. */
 enum udsp_status udsp_line_test_result(udsp_t *s, unsigned line, void *buf,
 				       size_t cap, size_t *out_len);
+
+/* The kinds of SLIC dump. The values equal the UDSP_SLIC_DUMP_* values of
+ * slic.h; core/udsp.c checks the two sets at compile time. */
+enum udsp_dump_kind {
+	UDSP_DUMP_REG = 0,	/* the direct registers */
+	UDSP_DUMP_RAM_BRIEF,	/* named RAM words that the plug-in chooses */
+	UDSP_DUMP_RAM,		/* the whole RAM */
+};
+#define UDSP_DUMP_WORDS		2048
+#define UDSP_DUMP_SKIP_MAX	8
+
+/*
+ * One SLIC dump of one line, the record udsp_slic_dump_result copies out.
+ * count (addr, value) pairs come in ascending address order. skip lists the
+ * skipped addresses inside the range of the kind: the plug-in reads none of
+ * them, because a read changes the part. width is the bit count of a value:
+ * 8 for a register, 29 for a RAM word. The entries past count and past
+ * skipped are undefined. libudsp decodes no value.
+ */
+struct udsp_dump {
+	uint8_t kind;			/* enum udsp_dump_kind */
+	uint8_t line;			/* the line the dump read */
+	uint8_t width;
+	uint16_t count;
+	uint16_t skipped;
+	uint16_t skip[UDSP_DUMP_SKIP_MAX];
+	uint16_t addr[UDSP_DUMP_WORDS];
+	uint32_t value[UDSP_DUMP_WORDS];
+};
+
+/*
+ * slow: one dump of the SLIC registers or RAM words of a line
+ * (UDSP_FEAT_SLIC_DUMP). The plug-in reads the part on the slic thread, so the
+ * hook samples and the fault poll of every line stall for the dump time:
+ * milliseconds for the registers, seconds for the whole RAM. The dump writes
+ * nothing that the part keeps, so a call on the line goes on.
+ *
+ * Refusals, in this order. UDSP_UNSUPPORTED for a NULL handle, a NULL job, a
+ * line outside the capability, a kind above UDSP_DUMP_RAM and a plug-in
+ * without the op. Then the guard of the SYNC-SLIC class: UDSP_FATAL for a dead
+ * line or a fatal handle, UDSP_TRANSIENT before udsp_start and while another
+ * SLOW job is queued or runs. Then UDSP_TRANSIENT while a delayed loop stands
+ * on the line. A call, a ring session or a caller identity burst on the line
+ * refuses nothing. A start and a line test answer UDSP_TRANSIENT while a dump
+ * is queued or runs.
+ *
+ * The completion carries:
+ * - UDSP_OK when the record stands;
+ * - UDSP_TRANSIENT when the job step found a loop on the line or a stopped
+ *   handle, when a stop superseded the queued dump, and when the plug-in
+ *   reached its deadline;
+ * - UDSP_UNSUPPORTED when the plug-in refused the kind or the channel;
+ * - UDSP_FATAL for a bus error, and for a record whose counts pass its arrays
+ *   or whose kind differs from the request.
+ *
+ * One result slot serves the handle. A dump that reaches the job step clears
+ * the slot first, and only a dump that completes with UDSP_OK stores a new
+ * record. A dump that the submission refuses or that a stop supersedes leaves
+ * the earlier record readable, as a line test does. The caller therefore must
+ * read the result of a dump before it submits the next one.
+ */
+enum udsp_status udsp_slic_dump(udsp_t *s, unsigned line,
+				enum udsp_dump_kind kind, struct udsp_job *job);
+/* fastpath: copies the record of the last dump that completed with UDSP_OK.
+ * UDSP_UNSUPPORTED for a NULL handle or output, a line outside the
+ * capability, before any dump completed, while a dump runs and when the record
+ * belongs to another line; *out is then untouched. */
+enum udsp_status udsp_slic_dump_result(udsp_t *s, unsigned line,
+				       struct udsp_dump *out);
 enum udsp_status udsp_region_load(udsp_t *s, const char *iso3, struct udsp_job *job);
 /*
  * Control thread: tells whether the region file of iso3 exists. It takes no

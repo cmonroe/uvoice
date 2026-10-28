@@ -78,6 +78,29 @@ struct udsp_line_test_slot {
 };
 
 /*
+ * The last completed SLIC dump, the record udsp_slic_dump_result copies out.
+ * One slot serves the handle, because a dump is an exclusive job. The line
+ * travels inside the published record, so a reader checks the line of the
+ * record it copied and never a field that moves beside the double buffer.
+ *
+ * gen follows the rule of struct udsp_line_test_slot. It is zero while no
+ * completed record exists. The slic thread clears it before a dump starts and
+ * publishes it after it stores the record, and the reader loads it on both
+ * sides of the copy.
+ */
+struct udsp_dump_rec {
+	struct udsp_slic_dump_result r;
+	uint8_t line;
+};
+
+UDSP_SNAP_DECLARE(dump_snap, struct udsp_dump_rec);
+
+struct udsp_dump_slot {
+	_Atomic uint_least32_t gen;
+	struct dump_snap snap;
+};
+
+/*
  * The newest line-monitor reading of one line, the record udsp_line_monitor
  * copies out and decodes. The slic thread is its single writer, through the
  * same double buffer the canceller record travels. stamp_ms is
@@ -117,6 +140,11 @@ UDSP_SNAP_DECLARE(engine_diag_snap, struct engine_stats);
  * SLIC_ACK_WAIT_MS on an engine that is already gone. udsp_close waits this
  * long for a recovery to return before the ordinary budget applies. */
 #define UDSP_STOP_RECOVER_MS	10000u
+/* A SLIC dump holds the slic thread for as long as the plug-in reads, and it
+ * carries no cancel. The plug-in ends a dump at a deadline of 10 seconds, so
+ * this figure covers the call with a margin. udsp_close waits this long for a
+ * dump to return before the ordinary budget applies. */
+#define UDSP_STOP_DUMP_MS	15000u
 #define UDSP_SLIC_STACK_BYTES	(256 * 1024)
 /* The probe's --settle default after slic_reset is released. */
 #define UDSP_RESET_SETTLE_MS	100u
@@ -232,6 +260,8 @@ struct udsp {
 	atomic_uint line_test_jobs;
 	/* The recoveries in flight on the slic thread, for the same reason. */
 	atomic_uint recover_jobs;
+	/* The SLIC dumps queued or running, for the same reason. */
+	atomic_uint dump_jobs;
 	/* The passes since the last periodic monitor sample in the per-tick
 	 * modes, and the IDLE deadline of the next one. Slic thread only. */
 	unsigned slic_monitor_pass;
@@ -267,6 +297,14 @@ struct udsp {
 	/* The generation the next stored line test record takes; it never
 	 * reaches zero, which is the value that means "no record". */
 	uint32_t line_test_gen;		/* slic thread only */
+	/* dump_gen is the generation that the next stored SLIC dump record
+	 * takes, on the rule of line_test_gen above. dump_scratch is the
+	 * record that the op fills before the publish copies it into the
+	 * slot. The record is about 12 KiB, so it lives here and not on the
+	 * slic thread's stack, of which the thread prefaults 64 KiB
+	 * (core/rt.c). */
+	uint32_t dump_gen;		/* slic thread only */
+	struct udsp_dump_rec dump_scratch;	/* slic thread only */
 	unsigned attach_channels;
 	char part_name[16];		/* captured during attach */
 
@@ -314,6 +352,7 @@ struct udsp {
 	struct udsp_emitter emitter;
 	struct udsp_chan chan[UDSP_LINE_MAX];
 	struct udsp_line_test_slot line_test[UDSP_LINE_MAX];
+	struct udsp_dump_slot dump;
 
 	/* cap.lines * UDSP_STREAM_MAX slots, allocated once at open so the
 	 * engine and the net thread never allocate. */
@@ -334,12 +373,12 @@ struct udsp {
 	 * both directions.
 	 *
 	 * loop_armed is the record of the lines that carry a loop, which is
-	 * what makes udsp_line_test and udsp_stream_config refuse one. The
-	 * engine tick is its one writer: it sets the line on the arm
-	 * (core/stream.c stream_cmd_run) and clears it wherever it disarms a
-	 * loop, including the stop that chan_lines_safe runs. The control
-	 * thread only reads it, and it reads the arm at once, because the post
-	 * of the command waits for the tick's ack.
+	 * what makes udsp_line_test, udsp_slic_dump and udsp_stream_config
+	 * refuse one. The engine tick is its one writer: it sets the line on
+	 * the arm (core/stream.c stream_cmd_run) and clears it wherever it
+	 * disarms a loop, including the stop that chan_lines_safe runs. The
+	 * control thread only reads it, and it reads the arm at once, because
+	 * the post of the command waits for the tick's ack.
 	 */
 	int16_t *loop_ring[UDSP_LINE_MAX];
 	uint64_t loop_tick;

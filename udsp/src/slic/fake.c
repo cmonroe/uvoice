@@ -68,6 +68,27 @@
 #define FAKE_MLT_HEAD_STATUS	2
 #define FAKE_MLT_RESULT_LEN	(FAKE_MLT_HEAD_LEN + 4)
 
+/* The dump pattern of fake.h. The ranges and the skip lists have the shape of
+ * a dump of a real part, so a consumer lays the record out as it lays out one
+ * from a part. The values are a pattern, never the state of a part. */
+#define FAKE_DUMP_REG_LAST	127u
+#define FAKE_DUMP_RAM_LAST	1644u
+#define FAKE_DUMP_REG_WIDTH	8u
+#define FAKE_DUMP_RAM_WIDTH	29u
+#define FAKE_DUMP_RAM_MASK	0x1fffffffu
+#define FAKE_ARRAY_LEN(a)	(sizeof(a) / sizeof((a)[0]))
+
+static const uint16_t fake_dump_reg_skip[] = { 18, 19, 20, 21 };
+static const uint16_t fake_dump_ram_skip[] = { 1359 };
+static const uint16_t fake_dump_brief[] = {
+	3, 367, 770, 1006, 1007, 1458, 1459, 1476, 1477, 1538, 1551,
+};
+
+_Static_assert(FAKE_ARRAY_LEN(fake_dump_reg_skip) <= UDSP_SLIC_DUMP_SKIP_MAX,
+	       "the fake register skip list outgrew UDSP_SLIC_DUMP_SKIP_MAX");
+_Static_assert(FAKE_DUMP_RAM_LAST < UDSP_SLIC_DUMP_WORDS,
+	       "the fake RAM range outgrew UDSP_SLIC_DUMP_WORDS");
+
 _Static_assert(UDSP_SLIC_FAKE_CHAN_MAX * FAKE_SAFE_STRIDE <= UDSP_SLIC_SAFE_MAX,
 	       "the fake safe transfer outgrew UDSP_SLIC_SAFE_MAX");
 
@@ -114,6 +135,10 @@ static bool fake_wideband = true;
 /* The length mlt_run reports, negative for the true one (fake.h). A test
  * writes it from its control thread while the slic thread runs the op. */
 static _Atomic int_least32_t fake_mlt_len = -1;
+
+/* The count dump reports, negative for the true one (fake.h). It follows the
+ * thread rule of fake_mlt_len. */
+static _Atomic int_least32_t fake_dump_count = -1;
 
 /* One shadow bus behind udsp_slic_fake_host_get(), shared by every instance as
  * one spidev is. It keeps the last transfer's tx bytes and a canned rx byte,
@@ -703,6 +728,85 @@ static int fake_mlt_run(struct udsp_slic *s, unsigned chan, uint8_t test_id,
 	return 0;
 }
 
+static void fake_dump_put(struct udsp_slic_dump_result *out, unsigned chan,
+			  unsigned addr)
+{
+	uint32_t value = ((addr << 13) | chan) & FAKE_DUMP_RAM_MASK;
+
+	if (out->kind == UDSP_SLIC_DUMP_REG)
+		value = (uint8_t)(addr ^ (chan << 4));
+	out->addr[out->count] = (uint16_t)addr;
+	out->value[out->count] = value;
+	out->count++;
+}
+
+/* Every address from 0 to last, less the ascending skip list. */
+static void fake_dump_range(struct udsp_slic_dump_result *out, unsigned chan,
+			    unsigned last, const uint16_t *skip,
+			    unsigned skipped)
+{
+	unsigned next = 0;
+
+	memcpy(out->skip, skip, skipped * sizeof(*skip));
+	out->skipped = (uint16_t)skipped;
+	for (unsigned addr = 0; addr <= last; addr++) {
+		if (next < skipped && addr == skip[next]) {
+			next++;
+			continue;
+		}
+		fake_dump_put(out, chan, addr);
+	}
+}
+
+static void fake_dump_fill(struct udsp_slic_dump_result *out, unsigned chan,
+			   uint8_t kind)
+{
+	memset(out, 0, sizeof(*out));
+	out->kind = kind;
+	out->width = kind == UDSP_SLIC_DUMP_REG ? FAKE_DUMP_REG_WIDTH :
+						  FAKE_DUMP_RAM_WIDTH;
+	if (kind == UDSP_SLIC_DUMP_REG) {
+		fake_dump_range(out, chan, FAKE_DUMP_REG_LAST,
+				fake_dump_reg_skip,
+				FAKE_ARRAY_LEN(fake_dump_reg_skip));
+		return;
+	}
+	if (kind == UDSP_SLIC_DUMP_RAM) {
+		fake_dump_range(out, chan, FAKE_DUMP_RAM_LAST,
+				fake_dump_ram_skip,
+				FAKE_ARRAY_LEN(fake_dump_ram_skip));
+		return;
+	}
+	for (unsigned i = 0; i < FAKE_ARRAY_LEN(fake_dump_brief); i++)
+		fake_dump_put(out, chan, fake_dump_brief[i]);
+}
+
+static int fake_dump(struct udsp_slic *s, unsigned chan, uint8_t kind,
+		     struct udsp_slic_dump_result *out)
+{
+	struct udsp_slic_fake_chan_state *c;
+	int32_t force;
+	int err;
+
+	if (!out || kind > UDSP_SLIC_DUMP_RAM)
+		return -EINVAL;
+	err = chan_begin(s, chan, UDSP_SLIC_FAKE_DUMP, &c);
+	if (err)
+		return err;
+
+	fake_dump_fill(out, chan, kind);
+	force = (int32_t)atomic_load_explicit(&fake_dump_count,
+					      memory_order_acquire);
+	if (force >= 0)
+		out->count = (uint16_t)force;
+	c->dump_kind = kind;
+	c->dump_count++;
+	journal_push(s, UDSP_SLIC_FAKE_DUMP, chan, kind, out->count);
+	chan_end(s);
+
+	return 0;
+}
+
 /* A whole-part property with no journal row: the record is what the part can
  * do, not a call the engine made, and udsp_open reads it once per open
  * (slic.h caps_get). */
@@ -849,6 +953,7 @@ static struct udsp_slic_ops fake_ops = {
 	.monitor_read = fake_monitor_read,
 	.converter_read = fake_converter_read,
 	.hook_read_moved = fake_hook_read_moved,
+	.dump = fake_dump,
 };
 
 const struct udsp_slic_descriptor udsp_slic_fake_descriptor = {
@@ -877,6 +982,7 @@ void udsp_slic_fake_optional_set(uint32_t opt_mask)
 		fake_converter_read : NULL;
 	fake_ops.hook_read_moved = (m & UDSP_SLIC_FAKE_OPT_HOOK_MOVED) ?
 		fake_hook_read_moved : NULL;
+	fake_ops.dump = (m & UDSP_SLIC_FAKE_OPT_DUMP) ? fake_dump : NULL;
 }
 
 void udsp_slic_fake_channels_set(unsigned channels)
@@ -894,12 +1000,18 @@ void udsp_slic_fake_mlt_len_set(int len)
 	atomic_store_explicit(&fake_mlt_len, len, memory_order_release);
 }
 
+void udsp_slic_fake_dump_count_set(int count)
+{
+	atomic_store_explicit(&fake_dump_count, count, memory_order_release);
+}
+
 void udsp_slic_fake_reset(void)
 {
 	memset(&fake_bus, 0, sizeof(fake_bus));
 	udsp_slic_fake_channels_set(2);
 	udsp_slic_fake_wideband_set(true);
 	udsp_slic_fake_mlt_len_set(-1);
+	udsp_slic_fake_dump_count_set(-1);
 	udsp_slic_fake_optional_set(UDSP_SLIC_FAKE_OPT_ALL);
 	for (unsigned i = 0; i < UDSP_SLIC_FAKE_INST_MAX; i++) {
 		for (unsigned op = 0; op < UDSP_SLIC_FAKE_CALL_MAX; op++)

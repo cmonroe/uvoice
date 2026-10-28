@@ -558,6 +558,179 @@ static void abi8_cases_run(void)
 	CHECK(ops->hook_read_moved(s, 0, &offhook, &moved) == -EINVAL);
 }
 
+/* The value rule of the dump pattern, restated from fake.h so that the check
+ * does not read the code it checks. */
+static uint32_t dump_value_want(uint8_t kind, unsigned chan, unsigned addr)
+{
+	if (kind == UDSP_SLIC_DUMP_REG)
+		return (uint8_t)(addr ^ (chan << 4));
+
+	return ((addr << 13) | chan) & 0x1fffffffu;
+}
+
+/* The entries of a dump that leave ascending order or the value rule. */
+static unsigned dump_bad(const struct udsp_slic_dump_result *rec, unsigned chan)
+{
+	unsigned bad = 0;
+
+	for (unsigned i = 0; i < rec->count && i < UDSP_SLIC_DUMP_WORDS; i++) {
+		uint32_t want = dump_value_want(rec->kind, chan, rec->addr[i]);
+
+		if (i && rec->addr[i] <= rec->addr[i - 1])
+			bad++;
+		if (rec->value[i] != want)
+			bad++;
+	}
+
+	return bad;
+}
+
+/* True when the dump holds every address from 0 to last, less the ascending
+ * skip list, and nothing else. */
+static bool dump_range_exact(const struct udsp_slic_dump_result *rec,
+			     unsigned last, const uint16_t *skip,
+			     unsigned skipped)
+{
+	unsigned at = 0;
+	unsigned next = 0;
+
+	for (unsigned addr = 0; addr <= last; addr++) {
+		if (next < skipped && addr == skip[next]) {
+			next++;
+			continue;
+		}
+		if (at >= rec->count || rec->addr[at] != addr)
+			return false;
+		at++;
+	}
+
+	return at == rec->count;
+}
+
+/* dump, the read-out of the SLIC registers and RAM words. The fake fills a
+ * fixed pattern (fake.h), so each case checks every entry against a
+ * restatement of that pattern. An argument the op refuses spends no armed
+ * error. */
+static void abi9_cases_run(void)
+{
+	static const uint16_t reg_skip[] = { 18, 19, 20, 21 };
+	static const uint16_t ram_skip[] = { 1359 };
+	static const uint16_t brief[] = {
+		3, 367, 770, 1006, 1007, 1458, 1459, 1476, 1477, 1538, 1551,
+	};
+	static struct udsp_slic_dump_result rec;
+	const struct udsp_slic_ops *ops = ops_get();
+	struct udsp_slic_fake_chan_state st;
+	struct udsp_slic_fake_entry e[2];
+	unsigned n = 0;
+	struct udsp_slic *s = attach_fresh(2, &n);
+
+	CASE("a register dump covers 0 to 127 less four interrupt registers");
+	udsp_slic_fake_journal_clear(s);
+	memset(&rec, 0xa5, sizeof(rec));
+	CHECK(ops->dump(s, 1, UDSP_SLIC_DUMP_REG, &rec) == 0);
+	CHECK_UINT(rec.kind, UDSP_SLIC_DUMP_REG);
+	CHECK_UINT(rec.width, 8);
+	CHECK_UINT(rec.count, 124);
+	CHECK_UINT(rec.skipped, 4);
+	CHECK(memcmp(rec.skip, reg_skip, sizeof(reg_skip)) == 0);
+	CHECK(dump_range_exact(&rec, 127, reg_skip, 4));
+	CHECK_UINT(dump_bad(&rec, 1), 0);
+	CHECK_UINT(rec.addr[18], 22);
+	CHECK_UINT(rec.value[18], 22u ^ 0x10u);
+	CHECK_UINT(udsp_slic_fake_journal_get(s, e, 2, NULL), 1);
+	CHECK_UINT(e[0].call, UDSP_SLIC_FAKE_DUMP);
+	CHECK_UINT(e[0].chan, 1);
+	CHECK_UINT(e[0].arg0, UDSP_SLIC_DUMP_REG);
+	CHECK_UINT(e[0].arg1, 124);
+	CHECK(udsp_slic_fake_chan_state_get(s, 1, &st));
+	CHECK_UINT(st.dump_count, 1);
+	CHECK_UINT(st.dump_kind, UDSP_SLIC_DUMP_REG);
+
+	CASE("a RAM dump covers 0 to 1644 less the patch data port");
+	CHECK(ops->dump(s, 0, UDSP_SLIC_DUMP_RAM, &rec) == 0);
+	CHECK_UINT(rec.kind, UDSP_SLIC_DUMP_RAM);
+	CHECK_UINT(rec.width, 29);
+	CHECK_UINT(rec.count, 1644);
+	CHECK_UINT(rec.skipped, 1);
+	CHECK_UINT(rec.skip[0], 1359);
+	CHECK(dump_range_exact(&rec, 1644, ram_skip, 1));
+	CHECK_UINT(dump_bad(&rec, 0), 0);
+	CHECK_UINT(rec.addr[1359], 1360);
+	/* The entries past count read zero. */
+	CHECK_UINT(rec.addr[1644], 0);
+	CHECK_UINT(rec.value[1644], 0);
+
+	CASE("a brief dump lists eleven named words in ascending order");
+	CHECK(ops->dump(s, 1, UDSP_SLIC_DUMP_RAM_BRIEF, &rec) == 0);
+	CHECK_UINT(rec.kind, UDSP_SLIC_DUMP_RAM_BRIEF);
+	CHECK_UINT(rec.width, 29);
+	CHECK_UINT(rec.count, 11);
+	CHECK_UINT(rec.skipped, 0);
+	CHECK(memcmp(rec.addr, brief, sizeof(brief)) == 0);
+	CHECK_UINT(dump_bad(&rec, 1), 0);
+	CHECK(udsp_slic_fake_chan_state_get(s, 1, &st));
+	CHECK_UINT(st.dump_count, 2);
+	CHECK_UINT(st.dump_kind, UDSP_SLIC_DUMP_RAM_BRIEF);
+
+	CASE("dump rejects NULL, a kind above RAM, a bad channel "
+	     "and a detached instance, and spends no armed error");
+	udsp_slic_fake_error_set(s, UDSP_SLIC_FAKE_DUMP, -EIO);
+	CHECK(ops->dump(NULL, 0, UDSP_SLIC_DUMP_REG, &rec) == -EINVAL);
+	CHECK(ops->dump(s, 0, UDSP_SLIC_DUMP_REG, NULL) == -EINVAL);
+	CHECK(ops->dump(s, 0, UDSP_SLIC_DUMP_RAM + 1, &rec) == -EINVAL);
+	CHECK(ops->dump(s, 2, UDSP_SLIC_DUMP_REG, &rec) == -EINVAL);
+	CHECK(ops->dump(s, 0, UDSP_SLIC_DUMP_REG, &rec) == -EIO);
+	CHECK(ops->dump(s, 0, UDSP_SLIC_DUMP_REG, &rec) == 0);
+	ops->detach(s);
+	CHECK(ops->dump(s, 0, UDSP_SLIC_DUMP_REG, &rec) == -EINVAL);
+	s = attach_fresh(2, &n);
+
+	CASE("an armed dump error reaches the caller and journals nothing");
+	udsp_slic_fake_journal_clear(s);
+	udsp_slic_fake_error_set(s, UDSP_SLIC_FAKE_DUMP, -ETIMEDOUT);
+	CHECK(ops->dump(s, 1, UDSP_SLIC_DUMP_RAM, &rec) == -ETIMEDOUT);
+	CHECK_UINT(udsp_slic_fake_journal_get(s, NULL, 0, NULL), 0);
+	CHECK(udsp_slic_fake_chan_state_get(s, 1, &st));
+	CHECK_UINT(st.dump_count, 0);
+	CHECK(ops->dump(s, 1, UDSP_SLIC_DUMP_RAM, &rec) == 0);
+	CHECK_UINT(udsp_slic_fake_journal_get(s, NULL, 0, NULL), 1);
+	CHECK(udsp_slic_fake_chan_state_get(s, 1, &st));
+	CHECK_UINT(st.dump_count, 1);
+	CHECK_UINT(st.dump_kind, UDSP_SLIC_DUMP_RAM);
+
+	CASE("a forced count reaches the caller, and a reset clears it");
+	udsp_slic_fake_journal_clear(s);
+	udsp_slic_fake_dump_count_set(UDSP_SLIC_DUMP_WORDS + 1);
+	CHECK(ops->dump(s, 0, UDSP_SLIC_DUMP_REG, &rec) == 0);
+	CHECK_UINT(rec.count, UDSP_SLIC_DUMP_WORDS + 1);
+	CHECK_UINT(udsp_slic_fake_journal_get(s, e, 2, NULL), 1);
+	CHECK_UINT(e[0].arg1, UDSP_SLIC_DUMP_WORDS + 1);
+	ops->detach(s);
+	s = attach_fresh(2, &n);
+	CHECK(ops->dump(s, 0, UDSP_SLIC_DUMP_REG, &rec) == 0);
+	CHECK_UINT(rec.count, 124);
+	ops->detach(s);
+
+	CASE("a cleared dump bit removes that op alone");
+	udsp_slic_fake_optional_set(UDSP_SLIC_FAKE_OPT_ALL &
+				    ~(uint32_t)UDSP_SLIC_FAKE_OPT_DUMP);
+	CHECK(ops->dump == NULL);
+	CHECK(ops->mlt_run != NULL);
+	CHECK(ops->monitor_read != NULL);
+	CHECK(ops->hook_read_moved != NULL);
+	for (unsigned i = 0; i < 12; i++) {
+		uint32_t mask = UDSP_SLIC_FAKE_OPT_ALL & ~(1u << i);
+
+		udsp_slic_fake_optional_set(mask);
+		CHECK(ops->dump != NULL);
+	}
+	udsp_slic_fake_optional_set(0);
+	CHECK(ops->dump == NULL);
+	udsp_slic_fake_reset();
+	CHECK(ops->dump != NULL);
+}
+
 int main(void)
 {
 	const struct udsp_slic_ops *ops = ops_get();
@@ -1337,6 +1510,7 @@ int main(void)
 	monitor_error_cases_run();
 	abi7_cases_run();
 	abi8_cases_run();
+	abi9_cases_run();
 
 	return tu_summary("slic_fake");
 }
