@@ -15,8 +15,10 @@
  *
  * 1. Speed classes
  *
- * Every op is FAST or SLOW. The two classes live in separate blocks of struct
- * hal_ops and every op carries a "fast:" or "slow:" doc line.
+ * Every op is FAST or SLOW, and every op carries a "fast:" or "slow:" doc
+ * line. The two classes live in separate blocks of struct hal_ops, apart from
+ * the tail of the table, which carries appended ops of both classes (see the
+ * diagnostic getters).
  *
  *   FAST  Runs on the uloop thread. Must not block longer than a single
  *         round trip to the backend's driver or engine.
@@ -26,15 +28,18 @@
  *         job->cb on the uloop thread.
  *
  * A slow op is the only op that takes a struct hal_job pointer, so the class
- * is visible in the signature as well as in the block and the doc line.
+ * is visible in the signature as well as in the doc line and, outside the
+ * tail, in the block.
  *
  * An op is SLOW when a backend can need seconds or a bulk copy for it: the
  * GR-909 sweep fills a large result buffer over several seconds, and the DSP
  * bring-up loads firmware or starts an engine. Every other op is FAST.
  *
  * A bulk diagnostic read from the device joins the SLOW block with its own
- * completion payload. It does not go into a fast op. A read from state that
- * the backend already caches is FAST (see the diagnostic getters).
+ * completion payload. It does not go into a fast op. The SLIC dump of
+ * line_dump_start is one: a dump of the whole RAM reads some thousands of
+ * words over the SLIC bus. A read from state that the backend already caches
+ * is FAST (see the diagnostic getters).
  *
  * stream_stats_start is SLOW as well. The CDR path reads it at call teardown,
  * where a deferred ubus reply costs nothing, so the class costs a fast backend
@@ -139,7 +144,7 @@
 #define HAL_IFNAME_MAX		16
 /* Backstop for a slow op whose completion never arrives, see section 2. The
  * default covers firmware load, DSP stop, region apply, and media queries.
- * Line tests use LINE_TEST_JOB_MS. */
+ * Line tests use LINE_TEST_JOB_MS, and SLIC dumps LINE_DUMP_JOB_MS. */
 #define HAL_JOB_TIMEOUT_MS	30000
 /* HAL_TRANSIENT retry delay, see section 3. */
 #define HAL_RETRY_MS		50
@@ -306,6 +311,14 @@ enum hal_feature {
 						 * leaves line_loop_set NULL,
 						 * and the core then runs no
 						 * loop test on it. */
+	HAL_FEAT_SLIC_DUMP	= (1 << 19),	/* the backend reads the
+						 * registers and the RAM words
+						 * of a line's SLIC on demand
+						 * (line_dump_start). A clear
+						 * bit means the core runs no
+						 * dump, and a backend that
+						 * never sets it can leave both
+						 * dump ops NULL. */
 };
 
 enum hal_codec {
@@ -1549,6 +1562,49 @@ enum hal_line_test {
 	HAL_LINE_TEST_LOOP,
 };
 
+/*
+ * The kinds of SLIC dump (line_dump_start). REG reads the direct registers,
+ * RAM_BRIEF the named RAM words that the SLIC driver of the backend chooses,
+ * and RAM the whole RAM. The values are the ones libudsp defines (enum
+ * udsp_dump_kind), and hal/udsp/udsp.c asserts the two vocabularies equal by
+ * name, so that backend casts the kind.
+ */
+enum hal_dump_kind {
+	HAL_DUMP_REG = 0,
+	HAL_DUMP_RAM_BRIEF,
+	HAL_DUMP_RAM,
+};
+
+/* The pairs one dump carries at most, and the skipped addresses it lists at
+ * most: the libudsp bounds UDSP_DUMP_WORDS and UDSP_DUMP_SKIP_MAX. */
+#define HAL_SLIC_DUMP_WORDS	2048
+#define HAL_SLIC_DUMP_SKIP_MAX	8
+
+/*
+ * One SLIC dump of one line, the record line_dump_result_get copies out. The
+ * field set, the names and the order are those of libudsp's struct udsp_dump,
+ * copied one by one for the reason struct hal_lec_stats gives.
+ *
+ * count (addr, value) pairs come in ascending address order, and count is at
+ * most HAL_SLIC_DUMP_WORDS. skip lists the addresses inside the range of the
+ * kind that the backend did not read, because a read changes the part: a
+ * read-to-clear interrupt register, or a RAM port whose read moves an address.
+ * skipped is at most HAL_SLIC_DUMP_SKIP_MAX. width is the bits of a value: 8
+ * for a register and 29 for a RAM word. kind is enum hal_dump_kind, and line
+ * is the line the dump read. The entries past count and past skipped are
+ * undefined. No layer of the core decodes a value.
+ */
+struct hal_slic_dump {
+	uint8_t kind;
+	uint8_t line;
+	uint8_t width;
+	uint16_t count;
+	uint16_t skipped;
+	uint16_t skip[HAL_SLIC_DUMP_SKIP_MAX];
+	uint16_t addr[HAL_SLIC_DUMP_WORDS];
+	uint32_t value[HAL_SLIC_DUMP_WORDS];
+};
+
 enum hal_event_type {
 	HAL_EVENT_NONE = 0,
 	HAL_EVENT_HOOK,			/* seize, release, flash, pulse */
@@ -2103,6 +2159,64 @@ struct hal_ops {
 	 */
 	enum hal_status (*line_loop_set)(struct hal *h, unsigned int line,
 					 const struct hal_loop *loop);
+	/*
+	 * slow: one dump of the SLIC registers or RAM words of a line, the bulk
+	 * diagnostic read of section 1. HAL_FEAT_SLIC_DUMP gates it. Fetch the
+	 * record with line_dump_result_get after the completion.
+	 *
+	 * The udsp backend reads the part on the thread that samples the hook,
+	 * so the hook samples of every line stall for the dump time:
+	 * milliseconds for the registers, seconds for the whole RAM. The dump
+	 * writes nothing that the part keeps, so a call on the line goes on.
+	 *
+	 * For the dump time the udsp backend answers HAL_TRANSIENT to every
+	 * SLIC write of the board, on every line: line_state_set,
+	 * line_polarity_set, line_hook_timing_set, line_ring_start,
+	 * line_ring_stop and line_mwi_set. The core holds a ring start, a ring
+	 * stop and the forward restore of line_polarity_set that a dump
+	 * refuses. It issues them when the dump ends, by completion, budget or
+	 * drop.
+	 *
+	 * The core checks the line and the kind before the call. Refusals:
+	 * HAL_UNSUPPORTED for a backend without the dump; HAL_FATAL for a dead
+	 * line; HAL_TRANSIENT while another slow job holds the part (a line
+	 * test, a bring-up, a region load or another dump) and while a loop
+	 * stands on the line. While a dump is pending, line_test_start answers
+	 * HAL_TRANSIENT, so the two exclude each other in both directions.
+	 *
+	 * The completion carries:
+	 * - HAL_OK when the record stands;
+	 * - HAL_TRANSIENT when a loop stood on the line or the backend stopped
+	 *   before the read, when a stop took the queued dump, and when the
+	 *   read passed the deadline of the backend;
+	 * - HAL_UNSUPPORTED when the SLIC driver refused the kind or the line;
+	 * - HAL_FATAL for a bus error, and for a record whose counts exceed its
+	 *   arrays or whose kind differs from the request.
+	 * Only HAL_OK leaves a record.
+	 *
+	 * One record serves the backend, and the next dump replaces it. A
+	 * caller therefore reads the record of a dump before it submits the
+	 * next one.
+	 *
+	 * Nullable, like line_loop_set: NULL on a backend with no dump. Its
+	 * place at the end of the table is no layout rule (see the diagnostic
+	 * getters).
+	 */
+	enum hal_status (*line_dump_start)(struct hal *h, unsigned int line,
+					   enum hal_dump_kind kind,
+					   struct hal_job *job);
+	/*
+	 * fast: copies the record of the last dump that completed HAL_OK on the
+	 * line. HAL_UNSUPPORTED before a completion, from the start of the read
+	 * of a later dump at the latest, and when the record belongs to another
+	 * line; *out is then untouched. The udsp backend clears the record at
+	 * the start of the read, so between the accept of a later dump and its
+	 * read the record of the dump before stays readable. Nullable together
+	 * with line_dump_start.
+	 */
+	enum hal_status (*line_dump_result_get)(struct hal *h,
+						unsigned int line,
+						struct hal_slic_dump *out);
 };
 
 /*

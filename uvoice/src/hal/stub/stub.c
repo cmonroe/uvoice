@@ -99,6 +99,9 @@ struct stub_line {
 struct stub_job {
 	struct uloop_timeout timeout;
 	struct hal *h;
+	/* Nullable. It runs before the completion leaves, so the core reads the
+	 * state the job left when the completion arrives. */
+	void (*done)(struct hal *h);
 	uint32_t token;
 	int32_t status;
 };
@@ -111,6 +114,15 @@ struct hal {
 	struct hal_counters counters;
 	struct stub_line line[HAL_LINE_MAX];
 	char region[8];
+	/* The line test jobs that have not completed. A count, because two
+	 * lines can each hold one. */
+	unsigned int tests_pending;
+	/* The one dump record of the board. A dump is pending from its start to
+	 * its completion, and the record is valid only after that completion
+	 * (hal.h line_dump_result_get). */
+	bool dump_pending;
+	bool dump_valid;
+	struct hal_slic_dump dump;
 };
 
 static struct hal *stub_dev;
@@ -191,6 +203,9 @@ static void job_complete(struct uloop_timeout *t)
 	struct stub_job *job = container_of(t, struct stub_job, timeout);
 	struct hal_event ev = { .type = HAL_EVENT_JOB_DONE };
 
+	if (job->done)
+		job->done(job->h);
+
 	ev.u.job.token = job->token;
 	ev.u.job.status = job->status;
 	event_push_completion(job->h, &ev);
@@ -198,7 +213,9 @@ static void job_complete(struct uloop_timeout *t)
 }
 
 static enum hal_status job_schedule_after(struct hal *h, struct hal_job *out,
-					  enum hal_status status, unsigned int delay_ms)
+					  enum hal_status status,
+					  unsigned int delay_ms,
+					  void (*done)(struct hal *h))
 {
 	struct stub_job *job = calloc(1, sizeof(*job));
 
@@ -206,6 +223,7 @@ static enum hal_status job_schedule_after(struct hal *h, struct hal_job *out,
 		return HAL_FATAL;
 
 	job->h = h;
+	job->done = done;
 	job->token = ++h->token_next;
 	job->status = (int32_t)status;
 	job->timeout.cb = job_complete;
@@ -218,7 +236,7 @@ static enum hal_status job_schedule_after(struct hal *h, struct hal_job *out,
 static enum hal_status job_schedule(struct hal *h, struct hal_job *out,
 				    enum hal_status status)
 {
-	return job_schedule_after(h, out, status, STUB_JOB_DELAY_MS);
+	return job_schedule_after(h, out, status, STUB_JOB_DELAY_MS, NULL);
 }
 
 static struct hal *stub_open(int event_fd)
@@ -248,12 +266,14 @@ static struct hal *stub_open(int event_fd)
 	 * annexb=no. HAL_FEAT_IPV6_MEDIA and HAL_FEAT_RTCP_ADDR take the same
 	 * precedent, so CI reaches an IPv6 stream and a separate RTCP
 	 * address. HAL_FEAT_LOOP takes it as well, so CI reaches the loop test
-	 * arm; the udsp backend maps that bit from the library. */
+	 * arm; the udsp backend maps that bit from the library. So does
+	 * HAL_FEAT_SLIC_DUMP, so CI reaches the dump and its renderers. */
 	h->cap.features = HAL_FEAT_G729 | HAL_FEAT_G729B | HAL_FEAT_G726 |
 			  HAL_FEAT_LINE_TEST | HAL_FEAT_POLARITY |
 			  HAL_FEAT_MWI_LAMP | HAL_FEAT_CONF | HAL_FEAT_T38 |
 			  HAL_FEAT_SRTP | HAL_FEAT_IPV6_MEDIA |
-			  HAL_FEAT_RTCP_ADDR | HAL_FEAT_LOOP;
+			  HAL_FEAT_RTCP_ADDR | HAL_FEAT_LOOP |
+			  HAL_FEAT_SLIC_DUMP;
 	/*
 	 * The G.726-32 and T.38 codec bits travel with their feature bits.
 	 * This backend accepts both configs. It must describe a consistent DSP.
@@ -1224,7 +1244,7 @@ static enum hal_status stub_dsp_start(struct hal *h, struct hal_job *job)
 	dsp_start_calls++;
 	TRACE(TRACE_HAL, "stub: dsp start %s in %u ms", hal_status_name(st), delay_ms);
 
-	return job_schedule_after(h, job, st, delay_ms);
+	return job_schedule_after(h, job, st, delay_ms, NULL);
 }
 
 static enum hal_status stub_dsp_stop(struct hal *h, struct hal_job *job)
@@ -1237,7 +1257,12 @@ static enum hal_status stub_dsp_stop(struct hal *h, struct hal_job *job)
 
 	TRACE(TRACE_HAL, "stub: dsp stop");
 
-	return job_schedule_after(h, job, HAL_OK, delay_ms);
+	return job_schedule_after(h, job, HAL_OK, delay_ms, NULL);
+}
+
+static void test_job_done(struct hal *h)
+{
+	h->tests_pending--;
 }
 
 static enum hal_status stub_line_test_start(struct hal *h, unsigned int line,
@@ -1245,6 +1270,7 @@ static enum hal_status stub_line_test_start(struct hal *h, unsigned int line,
 					    struct hal_job *job)
 {
 	struct stub_line *l = line_get(h, line);
+	enum hal_status st;
 
 	if (!l)
 		return HAL_FATAL;
@@ -1257,10 +1283,183 @@ static enum hal_status stub_line_test_start(struct hal *h, unsigned int line,
 		return HAL_TRANSIENT;
 	}
 
+	/* the other direction of the dump exclusion (hal.h line_dump_start) */
+	if (h->dump_pending) {
+		TRACE(TRACE_HAL, "stub: line %u line test refused: a dump "
+		      "holds the part", line);
+		return HAL_TRANSIENT;
+	}
+
 	snprintf(l->test_result, sizeof(l->test_result), "test=%u result=pass", test);
 	TRACE(TRACE_HAL, "stub: line %u line test %u", line, test);
 
-	return job_schedule(h, job, HAL_OK);
+	st = job_schedule_after(h, job, HAL_OK, STUB_JOB_DELAY_MS,
+				test_job_done);
+	if (st == HAL_OK)
+		h->tests_pending++;
+
+	return st;
+}
+
+/*
+ * The test-only fault injection of the dump, in the shape of
+ * UVOICE_STUB_RING_START. UVOICE_STUB_SLIC_DUMP=transient_once answers the
+ * first dump start HAL_TRANSIENT and every later one HAL_OK, the answer of a
+ * backend whose part is busy. fatal answers every start HAL_FATAL, the answer
+ * for a dead line. Every other value, the absent variable included, answers
+ * ok.
+ */
+static enum hal_status dump_start_status_take(void)
+{
+	static unsigned int dump_starts;
+	const char *mode = getenv("UVOICE_STUB_SLIC_DUMP");
+
+	if (!mode)
+		return HAL_OK;
+
+	if (!strcmp(mode, "fatal"))
+		return HAL_FATAL;
+
+	dump_starts++;
+	if (dump_starts > 1)
+		return HAL_OK;
+
+	if (!strcmp(mode, "transient_once"))
+		return HAL_TRANSIENT;
+
+	return HAL_OK;
+}
+
+/* The addresses the stub reads for a dump. The pattern matches the fake SLIC
+ * of libudsp (udsp/src/slic/fake.h), so a suite on either backend checks the
+ * same record. */
+#define STUB_DUMP_REG_LAST	127u
+#define STUB_DUMP_RAM_LAST	1644u
+
+static const uint16_t stub_dump_reg_skip[] = { 18, 19, 20, 21 };
+static const uint16_t stub_dump_ram_skip[] = { 1359 };
+static const uint16_t stub_dump_brief[] = {
+	3, 367, 770, 1006, 1007, 1458, 1459, 1476, 1477, 1538, 1551,
+};
+
+static void dump_word_add(struct hal_slic_dump *d, uint16_t addr)
+{
+	uint32_t value = (((uint32_t)addr << 13) | d->line) & 0x1fffffffu;
+
+	if (d->kind == HAL_DUMP_REG)
+		value = (addr ^ ((uint32_t)d->line << 4)) & 0xffu;
+
+	d->addr[d->count] = addr;
+	d->value[d->count] = value;
+	d->count++;
+}
+
+static bool dump_addr_skipped(const struct hal_slic_dump *d, uint16_t addr)
+{
+	unsigned int i;
+
+	for (i = 0; i < d->skipped; i++) {
+		if (d->skip[i] == addr)
+			return true;
+	}
+
+	return false;
+}
+
+static void dump_fill(struct hal_slic_dump *d, unsigned int line,
+		      enum hal_dump_kind kind)
+{
+	const uint16_t *skip = stub_dump_ram_skip;
+	unsigned int nskip = ARRAY_SIZE(stub_dump_ram_skip);
+	unsigned int last = STUB_DUMP_RAM_LAST;
+	unsigned int addr, i;
+
+	memset(d, 0, sizeof(*d));
+	d->kind = (uint8_t)kind;
+	d->line = (uint8_t)line;
+	d->width = kind == HAL_DUMP_REG ? 8 : 29;
+
+	if (kind == HAL_DUMP_RAM_BRIEF) {
+		for (i = 0; i < ARRAY_SIZE(stub_dump_brief); i++)
+			dump_word_add(d, stub_dump_brief[i]);
+		return;
+	}
+
+	if (kind == HAL_DUMP_REG) {
+		skip = stub_dump_reg_skip;
+		nskip = ARRAY_SIZE(stub_dump_reg_skip);
+		last = STUB_DUMP_REG_LAST;
+	}
+
+	memcpy(d->skip, skip, nskip * sizeof(skip[0]));
+	d->skipped = (uint16_t)nskip;
+
+	for (addr = 0; addr <= last; addr++) {
+		if (dump_addr_skipped(d, (uint16_t)addr))
+			continue;
+		dump_word_add(d, (uint16_t)addr);
+	}
+}
+
+static void dump_job_done(struct hal *h)
+{
+	h->dump_pending = false;
+	h->dump_valid = true;
+}
+
+/*
+ * The SLIC dump. This backend has no part to read, so it fills the pattern
+ * above at the start and publishes it at the completion, through the hook of
+ * its job. The refusals are the ones hal.h states.
+ */
+static enum hal_status stub_line_dump_start(struct hal *h, unsigned int line,
+					    enum hal_dump_kind kind,
+					    struct hal_job *job)
+{
+	struct stub_line *l = line_get(h, line);
+	enum hal_status st;
+
+	if (!l || kind > HAL_DUMP_RAM)
+		return HAL_FATAL;
+
+	st = dump_start_status_take();
+	if (st != HAL_OK) {
+		TRACE(TRACE_HAL, "stub: line %u dump refused: %s", line,
+		      hal_status_name(st));
+		return st;
+	}
+
+	if (l->loop_mode != HAL_LOOP_OFF || h->dump_pending ||
+	    h->tests_pending) {
+		TRACE(TRACE_HAL, "stub: line %u dump refused: the part is held",
+		      line);
+		return HAL_TRANSIENT;
+	}
+
+	h->dump_valid = false;
+	dump_fill(&h->dump, line, kind);
+	st = job_schedule_after(h, job, HAL_OK, STUB_JOB_DELAY_MS,
+				dump_job_done);
+	if (st != HAL_OK)
+		return st;
+
+	h->dump_pending = true;
+	TRACE(TRACE_HAL, "stub: line %u dump kind %u, %u words", line, kind,
+	      h->dump.count);
+
+	return HAL_OK;
+}
+
+static enum hal_status stub_line_dump_result_get(struct hal *h,
+						 unsigned int line,
+						 struct hal_slic_dump *out)
+{
+	if (!out || !h->dump_valid || h->dump.line != line)
+		return HAL_UNSUPPORTED;
+
+	*out = h->dump;
+
+	return HAL_OK;
 }
 
 static enum hal_status stub_stream_stats_start(struct hal *h, unsigned int line,
@@ -1421,6 +1620,8 @@ const struct hal_ops hal_backend_ops = {
 	.line_test_start = stub_line_test_start,
 	.stream_stats_start = stub_stream_stats_start,
 	.region_apply = stub_region_apply,
+	.line_dump_start = stub_line_dump_start,
+	.line_dump_result_get = stub_line_dump_result_get,
 };
 
 enum {

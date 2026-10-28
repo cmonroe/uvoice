@@ -44,6 +44,7 @@ static const struct {
 	{ HAL_FEAT_DTMF_RELAY, "dtmf_relay" },
 	{ HAL_FEAT_DTMF_PLAYOUT, "dtmf_playout" },
 	{ HAL_FEAT_LOOP, "loop" },
+	{ HAL_FEAT_SLIC_DUMP, "slic_dump" },
 };
 
 static const char * const codec_names[] = {

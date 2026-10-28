@@ -157,7 +157,8 @@ static line_test_cb query_cb;
 static void *query_priv;
 static unsigned int query_calls;
 static unsigned int drop_calls;
-static uint8_t reply_data[4096];
+/* a dump of the whole RAM renders about 40 KiB */
+static uint8_t reply_data[65536];
 static struct blob_attr *reply;
 static int complete_status;
 static unsigned int complete_calls;
@@ -176,6 +177,34 @@ enum line_test_query_status line_test_query(unsigned int line,
 void line_test_drop(unsigned int line)
 {
 	drop_calls++;
+}
+
+/* The SLIC dump in its place: what the handler passed down, and the answer
+ * the case asked for. */
+static enum line_dump_query_status dump_query_status;
+static line_dump_cb dump_query_cb;
+static void *dump_query_priv;
+static unsigned int dump_query_calls;
+static unsigned int dump_query_line;
+static enum hal_dump_kind dump_query_kind;
+static unsigned int dump_drop_calls;
+
+enum line_dump_query_status line_dump_query(unsigned int line,
+					    enum hal_dump_kind kind,
+					    line_dump_cb cb, void *priv)
+{
+	dump_query_calls++;
+	dump_query_line = line;
+	dump_query_kind = kind;
+	dump_query_cb = cb;
+	dump_query_priv = priv;
+
+	return dump_query_status;
+}
+
+void line_dump_drop(unsigned int line)
+{
+	dump_drop_calls++;
 }
 
 /*
@@ -625,11 +654,21 @@ static void state_reset(void)
 	for (line = 0; line < ARRAY_SIZE(line_test_reqs); line++)
 		uloop_timeout_cancel(&line_test_reqs[line].reply.timeout);
 	memset(line_test_reqs, 0, sizeof(line_test_reqs));
+	for (line = 0; line < ARRAY_SIZE(slic_dump_reqs); line++)
+		uloop_timeout_cancel(&slic_dump_reqs[line].reply.timeout);
+	memset(slic_dump_reqs, 0, sizeof(slic_dump_reqs));
 	query_status = LINE_TEST_QUERY_OK;
 	query_cb = NULL;
 	query_priv = NULL;
 	query_calls = 0;
 	drop_calls = 0;
+	dump_query_status = LINE_DUMP_QUERY_OK;
+	dump_query_cb = NULL;
+	dump_query_priv = NULL;
+	dump_query_calls = 0;
+	dump_query_line = ~0u;
+	dump_query_kind = HAL_DUMP_REG;
+	dump_drop_calls = 0;
 	reply = NULL;
 	complete_status = -1;
 	complete_calls = 0;
@@ -995,17 +1034,23 @@ static int method_call(const char *name, struct ubus_request_data *request,
  */
 static void test_method_table(void)
 {
-	int live, reg, unreg, seize;
+	int live, reg, unreg, seize, dump;
 
 	voice_methods_compose();
 	live = method_index("stats_live");
 	reg = method_index("register");
 	unreg = method_index("unregister");
 	seize = method_index("seize");
+	dump = method_index("slic_dump");
 
 	CASE("method table: the protocol adds register and unregister");
 	CHECK(reg >= 0);
 	CHECK(unreg >= 0);
+
+	/* a core row, so it sits in front of the rows the protocol adds */
+	CASE("method table: slic_dump sits before stats_live");
+	CHECK(dump >= 0 && live == dump + 1);
+	CHECK(method_index("loop_test") == dump - 1);
 
 	CASE("method table: the protocol rows sit between stats_live "
 	     "and seize");
@@ -1408,7 +1453,7 @@ static void test_hal_feature_names(void)
 	field = nested_field_get(field_get(reply, "hal", BLOBMSG_TYPE_TABLE),
 				 "features", BLOBMSG_TYPE_ARRAY);
 	CHECK(field != NULL);
-	CHECK_UINT(array_len(field), 19);
+	CHECK_UINT(array_len(field), 20);
 	CHECK(array_has_string(field, "g729"));
 	CHECK(array_has_string(field, "g726"));
 	CHECK(array_has_string(field, "t38"));
@@ -1451,6 +1496,11 @@ static void test_hal_feature_names(void)
 	 * sees that in front of the refusal */
 	CASE("voice status names the loop capability");
 	CHECK(array_has_string(field, "loop"));
+
+	/* the bit the dump query reads before it submits, and the word an
+	 * operator reads in front of a refused dump */
+	CASE("voice status names the SLIC dump capability");
+	CHECK(array_has_string(field, "slic_dump"));
 
 	/* it is a bit of its own: a board with Annex A alone names g729 and
 	 * not g729b, which is what makes the word worth reading */
@@ -3089,12 +3139,304 @@ static void test_calltrace_verbs(void)
 	calltrace_reset();
 }
 
+/*
+ * One SLIC dump call, built the way a ubus client builds it. with_line false
+ * leaves the line key out, and a NULL kind leaves the kind key out.
+ */
+static int dump_run(bool with_line, uint32_t line, const char *kind,
+		    struct ubus_request_data *request)
+{
+	struct blob_buf args = {};
+	int status;
+
+	blob_buf_init(&args, 0);
+	if (with_line)
+		blobmsg_add_u32(&args, "line", line);
+	if (kind)
+		blobmsg_add_string(&args, "kind", kind);
+	status = voice_slic_dump(&request_context, NULL, request, "slic_dump",
+				 args.head);
+	blob_buf_free(&args);
+
+	return status;
+}
+
+/* The word at entry i of an array, or all ones where the array has none, so
+ * a short array fails its check instead of the case. */
+static uint32_t u32_at(struct blob_attr *array, unsigned int i)
+{
+	struct blob_attr *cur = attr_at(array, i);
+
+	return cur ? blobmsg_get_u32(cur) : ~0u;
+}
+
+static bool dump_skip_has(const uint16_t *skip, unsigned int n,
+			  unsigned int addr)
+{
+	unsigned int i;
+
+	for (i = 0; i < n; i++) {
+		if (skip[i] == addr)
+			return true;
+	}
+
+	return false;
+}
+
+/* The record the cases render: the pattern of the libudsp fake SLIC
+ * (udsp/src/slic/fake.h) over addresses 0 to last, less the skip list. */
+static void dump_record_build(struct hal_slic_dump *rec, unsigned int line,
+			      enum hal_dump_kind kind, unsigned int last,
+			      const uint16_t *skip, unsigned int nskip)
+{
+	unsigned int addr;
+	uint32_t value;
+
+	memset(rec, 0, sizeof(*rec));
+	rec->kind = (uint8_t)kind;
+	rec->line = (uint8_t)line;
+	rec->width = kind == HAL_DUMP_REG ? 8 : 29;
+	memcpy(rec->skip, skip, nskip * sizeof(skip[0]));
+	rec->skipped = (uint16_t)nskip;
+
+	for (addr = 0; addr <= last; addr++) {
+		if (dump_skip_has(skip, nskip, addr))
+			continue;
+
+		value = ((addr << 13) | line) & 0x1fffffffu;
+		if (kind == HAL_DUMP_REG)
+			value = (addr ^ (line << 4)) & 0xffu;
+		rec->addr[rec->count] = (uint16_t)addr;
+		rec->value[rec->count] = value;
+		rec->count++;
+	}
+}
+
+/*
+ * The refusals of voice slic_dump. The handler refuses a bad argument itself
+ * and maps every refusal of line_dump_query() onto a ubus status. No refusal
+ * sends a body.
+ */
+static void test_slic_dump_refusals(void)
+{
+	static const struct {
+		enum line_dump_query_status st;
+		int code;
+	} map[] = {
+		{ LINE_DUMP_QUERY_BAD_ARGUMENT, UBUS_STATUS_INVALID_ARGUMENT },
+		{ LINE_DUMP_QUERY_NO_LINE, UBUS_STATUS_NOT_FOUND },
+		{ LINE_DUMP_QUERY_NOT_UP, UBUS_STATUS_NO_DATA },
+		{ LINE_DUMP_QUERY_PENDING, UBUS_STATUS_NO_DATA },
+		{ LINE_DUMP_QUERY_HELD, UBUS_STATUS_NO_DATA },
+		{ LINE_DUMP_QUERY_BUSY, UBUS_STATUS_NO_DATA },
+		{ LINE_DUMP_QUERY_UNSUPPORTED, UBUS_STATUS_NO_DATA },
+		{ LINE_DUMP_QUERY_REFUSED, UBUS_STATUS_UNKNOWN_ERROR },
+	};
+	static const struct {
+		const char *word;
+		enum hal_dump_kind kind;
+	} kinds[] = {
+		{ "reg", HAL_DUMP_REG },
+		{ "ram_brief", HAL_DUMP_RAM_BRIEF },
+		{ "ram", HAL_DUMP_RAM },
+	};
+	struct ubus_request_data first = {};
+	struct ubus_request_data second = {};
+	unsigned int i;
+
+	voice_methods_compose();
+	CASE("the voice object registers the slic dump method");
+	CHECK(method_index("slic_dump") >= 0);
+
+	state_reset();
+	CASE("an unknown kind word is an invalid argument, with no query");
+	CHECK_UINT(dump_run(true, 0, "rom", &first),
+		   UBUS_STATUS_INVALID_ARGUMENT);
+	CHECK_UINT(dump_query_calls, 0);
+
+	CASE("a missing line or a missing kind is an invalid argument");
+	CHECK_UINT(dump_run(false, 0, "reg", &first),
+		   UBUS_STATUS_INVALID_ARGUMENT);
+	CHECK_UINT(dump_run(true, 0, NULL, &first),
+		   UBUS_STATUS_INVALID_ARGUMENT);
+	CHECK_UINT(dump_query_calls, 0);
+
+	CASE("a line past the channel array is an invalid argument");
+	CHECK_UINT(dump_run(true, CFG_CHANNEL_MAX, "reg", &first),
+		   UBUS_STATUS_INVALID_ARGUMENT);
+	CHECK_UINT(dump_query_calls, 0);
+
+	CASE("each kind word reaches the query as its kind, on the line asked");
+	for (i = 0; i < ARRAY_SIZE(kinds); i++) {
+		state_reset();
+		CHECK_UINT(dump_run(true, 1, kinds[i].word, &first), 0);
+		CHECK_UINT(dump_query_line, 1);
+		CHECK_UINT(dump_query_kind, kinds[i].kind);
+	}
+
+	CASE("each refusal of the query maps onto its status, with no body");
+	for (i = 0; i < ARRAY_SIZE(map); i++) {
+		state_reset();
+		dump_query_status = map[i].st;
+		CHECK_UINT(dump_run(true, 0, "reg", &first), map[i].code);
+		CHECK(reply == NULL);
+		CHECK(!slic_dump_reqs[0].reply.pending);
+	}
+
+	state_reset();
+	CASE("an accepted dump defers its request");
+	memset(&first, 0, sizeof(first));
+	CHECK_UINT(dump_run(true, 1, "ram", &first), 0);
+	CHECK(first.deferred);
+	CHECK(dump_query_cb != NULL);
+
+	CASE("a second request while the first is pending has no data");
+	CHECK_UINT(dump_run(true, 1, "reg", &second), UBUS_STATUS_NO_DATA);
+	CHECK_UINT(dump_query_calls, 1);
+	dump_query_cb(dump_query_priv, LINE_DUMP_RESULT_BUSY, NULL);
+
+	state_reset();
+}
+
+/*
+ * The deferred answers of voice slic_dump. A complete record renders its line,
+ * kind, width and count, and three parallel arrays. Every other completion
+ * closes the request with its status and no body.
+ */
+static void test_slic_dump_replies(void)
+{
+	static const uint16_t reg_skip[] = { 18, 19, 20, 21 };
+	static const uint16_t ram_skip[] = { 1359 };
+	static const enum line_dump_result_status no_data[] = {
+		LINE_DUMP_RESULT_BUSY, LINE_DUMP_RESULT_UNSUPPORTED,
+	};
+	static const enum line_dump_result_status failed[] = {
+		LINE_DUMP_RESULT_FATAL, LINE_DUMP_RESULT_UNREADABLE,
+	};
+	static struct hal_slic_dump rec;
+	struct ubus_request_data request = {};
+	struct blob_attr *field;
+	unsigned int i;
+	char *json;
+
+	state_reset();
+	dump_record_build(&rec, 1, HAL_DUMP_REG, 127, reg_skip,
+			  ARRAY_SIZE(reg_skip));
+	CASE("a register record renders every key and three arrays");
+	CHECK_UINT(dump_run(true, 1, "reg", &request), 0);
+	dump_query_cb(dump_query_priv, LINE_DUMP_RESULT_COMPLETE, &rec);
+	CHECK_UINT(complete_calls, 1);
+	CHECK_UINT(complete_status, 0);
+	CHECK_UINT(reply_u32("line"), 1);
+	CHECK(!strcmp(reply_string("kind"), "reg"));
+	CHECK_UINT(reply_u32("width"), 8);
+	CHECK_UINT(reply_u32("count"), 124);
+	field = field_get(reply, "skipped", BLOBMSG_TYPE_ARRAY);
+	CHECK_UINT(array_len(field), 4);
+	CHECK_UINT(u32_at(field, 0), 18);
+	CHECK_UINT(u32_at(field, 3), 21);
+	field = field_get(reply, "addr", BLOBMSG_TYPE_ARRAY);
+	CHECK_UINT(array_len(field), 124);
+	CHECK_UINT(u32_at(field, 17), 17);
+	CHECK_UINT(u32_at(field, 18), 22);
+	CHECK_UINT(u32_at(field, 123), 127);
+	field = field_get(reply, "value", BLOBMSG_TYPE_ARRAY);
+	CHECK_UINT(array_len(field), 124);
+	CHECK_UINT(u32_at(field, 18), 22 ^ (1 << 4));
+
+	CASE("and the wire carries the keys in the order a client reads them");
+	json = blobmsg_format_json(reply, true);
+	CHECK(json && strstr(json, "{\"line\":1,\"kind\":\"reg\",\"width\":8,"
+			     "\"count\":124,\"skipped\":[18,19,20,21],"
+			     "\"addr\":[0,1,2,"));
+	free(json);
+
+	state_reset();
+	dump_record_build(&rec, 1, HAL_DUMP_RAM, 1647, ram_skip,
+			  ARRAY_SIZE(ram_skip));
+	CASE("a record of the whole RAM renders all of its words");
+	CHECK_UINT(rec.count, 1647);
+	CHECK_UINT(dump_run(true, 1, "ram", &request), 0);
+	dump_query_cb(dump_query_priv, LINE_DUMP_RESULT_COMPLETE, &rec);
+	CHECK_UINT(complete_status, 0);
+	CHECK(!strcmp(reply_string("kind"), "ram"));
+	CHECK_UINT(reply_u32("width"), 29);
+	CHECK_UINT(reply_u32("count"), 1647);
+	field = field_get(reply, "skipped", BLOBMSG_TYPE_ARRAY);
+	CHECK_UINT(array_len(field), 1);
+	CHECK_UINT(u32_at(field, 0), 1359);
+	field = field_get(reply, "addr", BLOBMSG_TYPE_ARRAY);
+	CHECK_UINT(array_len(field), 1647);
+	CHECK_UINT(u32_at(field, 1359), 1360);
+	CHECK_UINT(u32_at(field, 1646), 1647);
+	field = field_get(reply, "value", BLOBMSG_TYPE_ARRAY);
+	CHECK_UINT(array_len(field), 1647);
+	CHECK_UINT(u32_at(field, 1646), (1647u << 13) | 1u);
+
+	CASE("a busy and an unsupported completion have no data and no body");
+	for (i = 0; i < ARRAY_SIZE(no_data); i++) {
+		state_reset();
+		CHECK_UINT(dump_run(true, 0, "reg", &request), 0);
+		dump_query_cb(dump_query_priv, no_data[i], NULL);
+		CHECK_UINT(complete_status, UBUS_STATUS_NO_DATA);
+		CHECK(reply == NULL);
+	}
+
+	CASE("a fatal and an unreadable completion report an unknown error");
+	for (i = 0; i < ARRAY_SIZE(failed); i++) {
+		state_reset();
+		CHECK_UINT(dump_run(true, 0, "reg", &request), 0);
+		dump_query_cb(dump_query_priv, failed[i], NULL);
+		CHECK_UINT(complete_status, UBUS_STATUS_UNKNOWN_ERROR);
+		CHECK(reply == NULL);
+	}
+
+	state_reset();
+	CASE("the dump job timeout returns a timeout and drops nothing");
+	CHECK_UINT(dump_run(true, 0, "ram", &request), 0);
+	dump_query_cb(dump_query_priv, LINE_DUMP_RESULT_TIMEOUT, NULL);
+	CHECK_UINT(dump_drop_calls, 0);
+	CHECK_UINT(complete_calls, 1);
+	CHECK_UINT(complete_status, UBUS_STATUS_TIMEOUT);
+
+	state_reset();
+	CASE("the request safety timer drops the query and returns a timeout");
+	CHECK_UINT(dump_run(true, 0, "ram", &request), 0);
+	slic_dump_request_expire(&slic_dump_reqs[0].reply.timeout);
+	CHECK_UINT(dump_drop_calls, 1);
+	CHECK_UINT(complete_calls, 1);
+	CHECK_UINT(complete_status, UBUS_STATUS_TIMEOUT);
+
+	CASE("and a record that arrives behind it sends nothing");
+	dump_query_cb(dump_query_priv, LINE_DUMP_RESULT_COMPLETE, &rec);
+	CHECK_UINT(complete_calls, 1);
+	CHECK(reply == NULL);
+
+	CASE("the request safety timer follows the dump budget");
+	CHECK_UINT(LINE_DUMP_TIMEOUT_MS, LINE_DUMP_JOB_MS + 1000);
+
+	CASE("the dump budget stays inside the default job backstop");
+	CHECK(LINE_DUMP_JOB_MS <= HAL_JOB_TIMEOUT_MS);
+
+	state_reset();
+	CASE("a daemon stop closes a pending dump reply");
+	CHECK_UINT(dump_run(true, 0, "reg", &request), 0);
+	slic_dump_shutdown();
+	CHECK_UINT(dump_drop_calls, 1);
+	CHECK_UINT(complete_calls, 1);
+	CHECK_UINT(complete_status, UBUS_STATUS_NO_DATA);
+
+	state_reset();
+}
+
 int main(void)
 {
 	uloop_init();
 	test_method_and_refusals();
 	test_deferred_replies();
 	test_loop_test_verb();
+	test_slic_dump_refusals();
+	test_slic_dump_replies();
 	test_method_table();
 	test_reload_verb();
 	test_stats_live_stream();

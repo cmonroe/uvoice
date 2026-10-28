@@ -1365,7 +1365,7 @@ static void test_cap_fill(void)
 		       UDSP_FEAT_LINE_TEST | UDSP_FEAT_POLARITY |
 		       UDSP_FEAT_MWI_LAMP | UDSP_FEAT_CONF | UDSP_FEAT_SRTP |
 		       UDSP_FEAT_WIDEBAND | UDSP_FEAT_DTMF_RELAY |
-		       UDSP_FEAT_DTMF_PLAYOUT;
+		       UDSP_FEAT_DTMF_PLAYOUT | UDSP_FEAT_SLIC_DUMP;
 	src.codecs = (1u << UDSP_SEL_PCMU) | (1u << UDSP_SEL_PCMA) |
 		     (1u << UDSP_SEL_G729) | (1u << UDSP_SEL_G726_16) |
 		     (1u << UDSP_SEL_G726_24) | (1u << UDSP_SEL_G726_32) |
@@ -1392,7 +1392,7 @@ static void test_cap_fill(void)
 		   HAL_FEAT_WIDEBAND | HAL_FEAT_IPV6_MEDIA |
 		   HAL_FEAT_RTCP_ADDR |
 		   HAL_FEAT_REGION_HOOK | HAL_FEAT_DTMF_RELAY |
-		   HAL_FEAT_DTMF_PLAYOUT);
+		   HAL_FEAT_DTMF_PLAYOUT | HAL_FEAT_SLIC_DUMP);
 
 	CASE("the line test bit follows the library because both ops forward");
 	CHECK((dst.features & HAL_FEAT_LINE_TEST) != 0);
@@ -1435,6 +1435,16 @@ static void test_cap_fill(void)
 	hal_udsp_cap_fill(&dst, &src);
 	CHECK((dst.features & HAL_FEAT_LOOP) != 0);
 	src.features &= ~(uint32_t)UDSP_FEAT_LOOP;
+	hal_udsp_cap_fill(&dst, &src);
+
+	/* The dump query reads the bit before it submits, so a plug-in without
+	 * the dump op must leave it clear. */
+	CASE("a SLIC dump bit travels with its library bit");
+	CHECK((dst.features & HAL_FEAT_SLIC_DUMP) != 0);
+	src.features &= ~(uint32_t)UDSP_FEAT_SLIC_DUMP;
+	hal_udsp_cap_fill(&dst, &src);
+	CHECK(!(dst.features & HAL_FEAT_SLIC_DUMP));
+	src.features |= UDSP_FEAT_SLIC_DUMP;
 	hal_udsp_cap_fill(&dst, &src);
 
 	CASE("HAL_FEAT_KERNEL_RTP stays clear: the packet loop is in user space");
@@ -1519,7 +1529,7 @@ static void test_cap_fill(void)
 		   HAL_FEAT_SRTP | HAL_FEAT_CONF | HAL_FEAT_WIDEBAND |
 		   HAL_FEAT_IPV6_MEDIA | HAL_FEAT_RTCP_ADDR |
 		   HAL_FEAT_REGION_HOOK | HAL_FEAT_DTMF_RELAY |
-		   HAL_FEAT_DTMF_PLAYOUT);
+		   HAL_FEAT_DTMF_PLAYOUT | HAL_FEAT_SLIC_DUMP);
 
 	CASE("a library built without srtp clears the srtp feature");
 	src.features &= ~(uint32_t)UDSP_FEAT_SRTP;
@@ -1529,7 +1539,7 @@ static void test_cap_fill(void)
 		   HAL_FEAT_CONF | HAL_FEAT_WIDEBAND | HAL_FEAT_IPV6_MEDIA |
 		   HAL_FEAT_RTCP_ADDR |
 		   HAL_FEAT_REGION_HOOK | HAL_FEAT_DTMF_RELAY |
-		   HAL_FEAT_DTMF_PLAYOUT);
+		   HAL_FEAT_DTMF_PLAYOUT | HAL_FEAT_SLIC_DUMP);
 	src.features |= UDSP_FEAT_SRTP | UDSP_FEAT_MWI_LAMP;
 
 	CASE("a line count above the hal maximum is clamped");
@@ -2019,7 +2029,8 @@ static void test_attach(void)
 	 * the region hook bit are this file's own and travel whatever the
 	 * library reports. The loop bit is always set in the library, as the
 	 * conference bit is: the loop runs inside the engine and asks the
-	 * plug-in for nothing.
+	 * plug-in for nothing. The dump bit is the fake plug-in's answer, like
+	 * the lamp bit.
 	 */
 	CASE("the attached capability advertises what the shipped library carries");
 	CHECK_UINT(cap->features, HAL_FEAT_POLARITY | HAL_FEAT_MWI_LAMP |
@@ -2027,7 +2038,8 @@ static void test_attach(void)
 		   HAL_FEAT_LINE_TEST | HAL_FEAT_SRTP | HAL_FEAT_CONF |
 		   HAL_FEAT_IPV6_MEDIA | HAL_FEAT_RTCP_ADDR |
 		   HAL_FEAT_REGION_HOOK | HAL_FEAT_DTMF_RELAY |
-		   HAL_FEAT_DTMF_PLAYOUT | HAL_FEAT_LOOP);
+		   HAL_FEAT_DTMF_PLAYOUT | HAL_FEAT_LOOP |
+		   HAL_FEAT_SLIC_DUMP);
 	CHECK_UINT(cap->codecs, (1u << HAL_CODEC_PCMU) | (1u << HAL_CODEC_PCMA) |
 		   (1u << HAL_CODEC_G726_32) | (1u << HAL_CODEC_G729));
 	CHECK_UINT(ts_be.geom.rate, 8000);
@@ -8331,6 +8343,165 @@ static void test_line_test(void)
 	probe_down(&p);
 }
 
+/* One dump that the library completes, and the status of its completion. */
+static bool dump_done_wait(struct probe *p, unsigned int line,
+			   enum hal_dump_kind kind, int32_t *status)
+{
+	struct hal_job job = { 0 };
+
+	*status = -1;
+	if (hal_backend_ops.line_dump_start(p->h, line, kind, &job) != HAL_OK)
+		return false;
+
+	return job_wait(p, job.token, 5000, status, NULL);
+}
+
+/*
+ * The SLIC dump, translated. libudsp owns its refusal order, and its own
+ * suite checks each job and its slot. This case checks what the backend adds.
+ * It copies a record of the fake SLIC, and it maps each completion status and
+ * the capability bit. A metallic test and a dump refuse each other. A delay on
+ * the fake keeps one job running while the case asks for its peer.
+ */
+static void test_slic_dump(void)
+{
+	static struct hal_slic_dump rec;
+	struct hal_job test_job = { 0 };
+	struct hal_job job = { 0 };
+	struct hal_media media;
+	unsigned int lines;
+	struct probe p;
+	struct wire wire;
+	int32_t status = -1;
+
+	if (!probe_up(&p)) {
+		CASE("the dump case needs a started backend");
+		CHECK(false);
+		probe_down(&p);
+		return;
+	}
+
+	CASE("the backend reports the dump feature and carries both ops");
+	CHECK((hal_backend_ops.cap_get(p.h)->features &
+	       HAL_FEAT_SLIC_DUMP) != 0);
+	CHECK(hal_backend_ops.line_dump_start != NULL);
+	CHECK(hal_backend_ops.line_dump_result_get != NULL);
+
+	CASE("a result read before a dump answers unsupported");
+	memset(&rec, 0xa5, sizeof(rec));
+	CHECK(hal_backend_ops.line_dump_result_get(p.h, 0, &rec) ==
+	      HAL_UNSUPPORTED);
+	CHECK_UINT(rec.count, 0xa5a5);
+
+	CASE("both dump ops answer unsupported for a line past the capability");
+	lines = hal_backend_ops.cap_get(p.h)->lines;
+	CHECK(hal_backend_ops.line_dump_start(p.h, lines, HAL_DUMP_REG, &job) ==
+	      HAL_UNSUPPORTED);
+	CHECK_UINT(job.token, 0);
+	CHECK(hal_backend_ops.line_dump_result_get(p.h, lines, &rec) ==
+	      HAL_UNSUPPORTED);
+	CHECK_UINT(rec.count, 0xa5a5);
+
+	CASE("a register dump completes ok and the getter copies the record");
+	CHECK(hal_backend_ops.line_dump_start(p.h, 0, HAL_DUMP_REG, &job) ==
+	      HAL_OK);
+	CHECK(job.token != 0);
+	CHECK(job_wait(&p, job.token, 5000, &status, NULL));
+	CHECK_UINT(status, HAL_OK);
+	CHECK(hal_backend_ops.line_dump_result_get(p.h, 0, &rec) == HAL_OK);
+	CHECK_UINT(rec.kind, HAL_DUMP_REG);
+	CHECK_UINT(rec.line, 0);
+	CHECK_UINT(rec.width, 8);
+	CHECK_UINT(rec.count, 124);
+	CHECK_UINT(rec.skipped, 4);
+	CHECK_UINT(rec.skip[0], 18);
+	CHECK_UINT(rec.skip[3], 21);
+	CHECK_UINT(rec.addr[18], 22);
+	CHECK_UINT(rec.addr[123], 127);
+	CHECK_UINT(rec.value[18], 22);
+
+	CASE("the record of one line is not the record of the other");
+	CHECK(hal_backend_ops.line_dump_result_get(p.h, 1, &rec) ==
+	      HAL_UNSUPPORTED);
+
+	CASE("a brief dump on line 1 carries the pattern of that line");
+	CHECK(dump_done_wait(&p, 1, HAL_DUMP_RAM_BRIEF, &status));
+	CHECK_UINT(status, HAL_OK);
+	CHECK(hal_backend_ops.line_dump_result_get(p.h, 1, &rec) == HAL_OK);
+	CHECK_UINT(rec.kind, HAL_DUMP_RAM_BRIEF);
+	CHECK_UINT(rec.line, 1);
+	CHECK_UINT(rec.width, 29);
+	CHECK_UINT(rec.count, 11);
+	CHECK_UINT(rec.skipped, 0);
+	CHECK_UINT(rec.addr[0], 3);
+	CHECK_UINT(rec.value[0], (3u << 13) | 1u);
+
+	if (!wire_open(&wire)) {
+		CASE("the dump during a stream needs a wire");
+		CHECK(false);
+		probe_down(&p);
+		return;
+	}
+	media_build(&media, &wire, HAL_CODEC_PCMU, 0, 20);
+	CASE("a dump during a running stream completes ok");
+	CHECK(media_up(&p, &wire, &media));
+	CHECK(dump_done_wait(&p, 0, HAL_DUMP_REG, &status));
+	CHECK_UINT(status, HAL_OK);
+	CHECK(hal_backend_ops.stream_stop(p.h, 0, 0) == HAL_OK);
+	wire_close(&wire);
+
+	CASE("a line test while a dump runs answers transient");
+	udsp_slic_fake_delay_set(p.h->s->slic, UDSP_SLIC_FAKE_DUMP, 300);
+	memset(&job, 0, sizeof(job));
+	CHECK(hal_backend_ops.line_dump_start(p.h, 0, HAL_DUMP_RAM, &job) ==
+	      HAL_OK);
+	CHECK(hal_backend_ops.line_test_start(p.h, 1, HAL_LINE_TEST_ROH,
+					      &test_job) == HAL_TRANSIENT);
+	CHECK_UINT(test_job.token, 0);
+	CHECK(job_wait(&p, job.token, 5000, &status, NULL));
+	CHECK_UINT(status, HAL_OK);
+	udsp_slic_fake_delay_set(p.h->s->slic, UDSP_SLIC_FAKE_DUMP, 0);
+
+	CASE("and a dump while a line test runs answers transient");
+	udsp_slic_fake_delay_set(p.h->s->slic, UDSP_SLIC_FAKE_MLT_RUN, 300);
+	CHECK(hal_backend_ops.line_test_start(p.h, 0, HAL_LINE_TEST_ROH,
+					      &test_job) == HAL_OK);
+	memset(&job, 0, sizeof(job));
+	CHECK(hal_backend_ops.line_dump_start(p.h, 1, HAL_DUMP_REG, &job) ==
+	      HAL_TRANSIENT);
+	CHECK_UINT(job.token, 0);
+	CHECK(job_wait(&p, test_job.token, 5000, NULL, NULL));
+	udsp_slic_fake_delay_set(p.h->s->slic, UDSP_SLIC_FAKE_MLT_RUN, 0);
+
+	CASE("an injected bus error completes the dump fatal with no record");
+	udsp_slic_fake_error_set(p.h->s->slic, UDSP_SLIC_FAKE_DUMP, -EIO);
+	CHECK(dump_done_wait(&p, 0, HAL_DUMP_REG, &status));
+	CHECK_UINT(status, HAL_FATAL);
+	CHECK(hal_backend_ops.line_dump_result_get(p.h, 0, &rec) ==
+	      HAL_UNSUPPORTED);
+
+	probe_down(&p);
+
+	if (!probe_open_opts(&p, UDSP_SLIC_FAKE_OPT_ALL &
+			     ~(uint32_t)UDSP_SLIC_FAKE_OPT_DUMP, 2) ||
+	    !probe_start(&p) || !probe_region(&p, "USA")) {
+		CASE("the case without the dump op needs a started backend");
+		CHECK(false);
+		probe_down(&p);
+		return;
+	}
+
+	CASE("a plug-in without the dump op clears the bit and refuses a dump");
+	CHECK((hal_backend_ops.cap_get(p.h)->features &
+	       HAL_FEAT_SLIC_DUMP) == 0);
+	memset(&job, 0, sizeof(job));
+	CHECK(hal_backend_ops.line_dump_start(p.h, 0, HAL_DUMP_REG, &job) ==
+	      HAL_UNSUPPORTED);
+	CHECK_UINT(job.token, 0);
+
+	probe_down(&p);
+}
+
 /*
  * The delayed loop, translated. libudsp owns the refusal order, and its own
  * suite checks the audio that the loop carries. This case holds the backend
@@ -8378,6 +8549,11 @@ static void test_line_loop(void)
 	CASE("an armed line refuses a metallic test");
 	CHECK(hal_backend_ops.line_test_start(p.h, 0, HAL_LINE_TEST_ROH,
 					      &job) == HAL_TRANSIENT);
+	CHECK_UINT(job.token, 0);
+
+	CASE("an armed line refuses a dump");
+	CHECK(hal_backend_ops.line_dump_start(p.h, 0, HAL_DUMP_REG, &job) ==
+	      HAL_TRANSIENT);
 	CHECK_UINT(job.token, 0);
 
 	CASE("off disarms the line and the test is taken again");
@@ -8863,6 +9039,7 @@ int main(void)
 	test_t38_profile();
 	test_media_population_gate();
 	test_line_test();
+	test_slic_dump();
 	test_line_loop();
 	test_fault_relay();
 	test_dead_stream_fault();

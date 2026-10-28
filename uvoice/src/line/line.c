@@ -85,11 +85,13 @@
 
 /*
  * How long a ring the backend still refuses waits before it asks again. This
- * cadence belongs to a line test alone, so it is far slower than HAL_RETRY_MS.
- * The caller hears ringback while it runs. A measurement that outlasts the
- * core's job budget must not cost that caller the bell, so the attempt repeats
- * until it lands. The ring stop of the protocol ends it (proto/proto.h
- * ring_stop), so the call itself bounds the loop.
+ * cadence belongs to a line test or a dump alone, so it is far slower than
+ * HAL_RETRY_MS. The caller hears ringback while it runs. A measurement that
+ * outlasts the core's job budget must not cost that caller the bell, so the
+ * attempt repeats until it lands. The ring stop of the protocol ends it
+ * (proto/proto.h ring_stop), so the call itself bounds the loop. A held stop
+ * or restore repeats at the same cadence until the backend accepts it
+ * (held_writes_issue()).
  */
 #define LINE_RING_HOLD_RETRY_MS	500
 
@@ -105,7 +107,7 @@
  * restarts the pass at once. The reading in front of that wait is older than
  * the loss. Under a storm of gaps the pass repeats every confirm interval and
  * heals nothing until the loss stops. The same value postpones a pass a
- * metallic line test holds.
+ * metallic line test or a SLIC dump holds.
  *
  * The second value is how long the release arm waits for its second reading.
  * The third is the pad the floor of that wait adds to the flash window of the
@@ -252,9 +254,11 @@ struct line {
 	/* the re-attempt of a restore the backend refused */
 	struct uloop_timeout fwd_disc_retry;
 	/* the repeat of a ring the backend refused: once behind HAL_RETRY_MS
-	 * with no line test running, and every LINE_RING_HOLD_RETRY_MS for as
-	 * long as a re-issue keeps answering transient */
+	 * with no line test or dump running, and every LINE_RING_HOLD_RETRY_MS
+	 * for as long as a re-issue keeps answering transient */
 	struct uloop_timeout ring_retry;
+	/* the repeat of a held stop or restore the backend still refuses */
+	struct uloop_timeout hold_retry;
 	/* the timer that paces the digits the far end sent out of band */
 	struct uloop_timeout digit_play;
 	struct line_digit_q digit_q[LINE_DIGIT_Q_MAX];
@@ -328,7 +332,13 @@ struct line {
 	bool fault;
 	bool down;
 	bool ringing;
-	bool ring_held;			/* a line test refused this ring */
+	bool ring_held;			/* a line test or a dump refused
+					 * this ring */
+	/* a line test or a dump refused the stop of this bell or the forward
+	 * restore of a reversal, and the write stays pending until the backend
+	 * accepts it */
+	bool ring_stop_held;
+	bool polarity_held;
 	/*
 	 * The backend refused this ring for good and the caller is owed a 480.
 	 * It is applied one uloop pass later. The bell op runs in front of the
@@ -565,6 +575,9 @@ static uint32_t fwd_disc_ms(const struct line *l)
 	return ms > LINE_FWD_DISC_MAX_MS ? LINE_FWD_DISC_MAX_MS : ms;
 }
 
+static bool part_write_held(const struct line *l, bool held,
+			    enum hal_status st, const char *write);
+
 static void fwd_disc_polarity(struct line *l, enum hal_polarity pol)
 {
 	enum hal_status st;
@@ -573,8 +586,19 @@ static void fwd_disc_polarity(struct line *l, enum hal_polarity pol)
 		return;
 
 	st = hal_backend_ops.line_polarity_set(uv.hal, l->index, pol);
-	if (st == HAL_OK)
+	if (st == HAL_OK) {
+		l->polarity_held = false;
 		return;
+	}
+
+	/* a reversal is a signal, and a late one would report what stopped
+	 * being true (fwd_disc_blocked()), so only the restore is held */
+	if (pol == HAL_POL_FORWARD) {
+		l->polarity_held = part_write_held(l, l->polarity_held, st,
+						   "polarity restore");
+		if (l->polarity_held)
+			return;
+	}
 
 	ULOG_WARN("line %u polarity not applied: %s\n", l->index,
 		  hal_status_name(st));
@@ -1602,30 +1626,78 @@ void line_stats_live_drop(unsigned int line, unsigned int stream)
 	s->live_priv = NULL;
 }
 
-struct line_test_slot {
+/* One accepted line test or SLIC dump. The tests and the dumps keep a table
+ * each, and a slot uses the union members of its own table. */
+struct line_job_slot {
 	struct hal_job job;
-	line_test_cb cb;
+	union {
+		line_test_cb test;
+		line_dump_cb dump;
+	} cb;
 	void *priv;
 	uint8_t line;
-	uint8_t test;
+	union {
+		uint8_t test;		/* enum hal_line_test */
+		uint8_t kind;		/* enum hal_dump_kind */
+	} req;
 	bool busy;
 };
 
-static struct line_test_slot line_test_slots[CFG_CHANNEL_MAX];
+static struct line_job_slot line_test_slots[CFG_CHANNEL_MAX];
+static struct line_job_slot line_dump_slots[CFG_CHANNEL_MAX];
 
-static bool line_test_running(unsigned int *tested)
+/* The record a consumer reads. One serves the board, as one serves the
+ * backend, and it is static because it is 12 KiB. */
+static struct hal_slic_dump dump_record;
+
+static bool line_slots_busy(const struct line_job_slot *slots,
+			    unsigned int *line)
 {
-	unsigned int line;
+	unsigned int i;
 
-	for (line = 0; line < CFG_CHANNEL_MAX; line++) {
-		if (!line_test_slots[line].busy)
+	for (i = 0; i < CFG_CHANNEL_MAX; i++) {
+		if (!slots[i].busy)
 			continue;
 
-		*tested = line;
+		*line = i;
 		return true;
 	}
 
 	return false;
+}
+
+/*
+ * The part is held for a metallic line test or a SLIC dump. libudsp refuses
+ * every SYNC-SLIC op of the board while either job runs, because both hold the
+ * slic thread.
+ */
+static bool line_part_held(unsigned int *line)
+{
+	return line_slots_busy(line_test_slots, line) ||
+	       line_slots_busy(line_dump_slots, line);
+}
+
+/*
+ * Whether a ring stop or a polarity restore of the line stays pending after
+ * this answer. A refusal under a line test or a dump holds the write. A hold
+ * that stands outlives every later transient answer, so a job that outlasts
+ * its budget cannot drop it (part_hold_replay()).
+ */
+static bool part_write_held(const struct line *l, bool held,
+			    enum hal_status st, const char *write)
+{
+	unsigned int holder;
+
+	if (st != HAL_TRANSIENT)
+		return false;
+	if (held)
+		return true;
+	if (!line_part_held(&holder))
+		return false;
+
+	TRACE(TRACE_FSM, "line %u %s held by the line test or the dump on "
+	      "line %u", l->index, write, holder);
+	return true;
 }
 
 /* The protocol's flags of one line (proto/proto.h enum proto_line_flag). */
@@ -1679,11 +1751,17 @@ static bool line_test_call_active(void)
  */
 static bool line_test_policy_refused(unsigned int line)
 {
+	unsigned int dumped;
+
 	/* The loop test holds every port and its own audio path, and a
 	 * metallic test would take the part away from it. The line reads out
 	 * of service while the mode stands, which the predicate above admits,
 	 * so the mode is refused by name. */
 	if (loop_test_armed)
+		return true;
+
+	/* a dump holds the part, which the test needs whole */
+	if (line_slots_busy(line_dump_slots, &dumped))
 		return true;
 
 	if (!line_test_state_safe(&lines[line]))
@@ -1692,29 +1770,104 @@ static bool line_test_policy_refused(unsigned int line)
 	return line_test_call_active();
 }
 
-static void ring_hold_replay(void);
+static void part_hold_replay(void);
 
-static void line_test_finish(struct line_test_slot *slot,
+/* The part is free from the moment the slot is, so a write the job held
+ * reaches the line before the consumer reads the result. */
+static void line_slot_release(struct line_job_slot *slot)
+{
+	slot->busy = false;
+	memset(&slot->cb, 0, sizeof(slot->cb));
+	slot->priv = NULL;
+	part_hold_replay();
+}
+
+/* An abandoned job frees the part exactly as a completed one does. */
+static void line_slot_drop(struct line_job_slot *slots, unsigned int line,
+			   const char *job)
+{
+	struct line_job_slot *slot;
+
+	if (line >= CFG_CHANNEL_MAX)
+		return;
+
+	slot = &slots[line];
+	if (!slot->busy)
+		return;
+
+	if (job_take(slot->job.token))
+		TRACE(TRACE_HAL, "line %u %s token %u abandoned", line, job,
+		      slot->job.token);
+	line_slot_release(slot);
+}
+
+static void line_slots_drop(struct line_job_slot *slots, const char *job)
+{
+	unsigned int line;
+
+	for (line = 0; line < CFG_CHANNEL_MAX; line++)
+		line_slot_drop(slots, line, job);
+}
+
+enum line_job_admission {
+	LINE_JOB_ADMITTED,
+	LINE_JOB_BAD_ARGUMENT,
+	LINE_JOB_NO_LINE,
+	LINE_JOB_NOT_UP,
+};
+
+/* The first checks of line_test_query() and line_dump_query(). Each query maps
+ * the answer onto its own status. */
+static enum line_job_admission line_job_admit(unsigned int line,
+					      bool req_valid, const char *job,
+					      unsigned int req)
+{
+	if (line >= CFG_CHANNEL_MAX || !req_valid) {
+		TRACE(TRACE_HAL, "line %u %s %u refused: bad argument", line,
+		      job, req);
+		return LINE_JOB_BAD_ARGUMENT;
+	}
+	if (!uv.cfg || line >= uv.cfg->channels ||
+	    !uv.cfg->channel[line].present) {
+		TRACE(TRACE_HAL, "line %u %s %u refused: no configured line",
+		      line, job, req);
+		return LINE_JOB_NO_LINE;
+	}
+	if (!lines_up) {
+		TRACE(TRACE_HAL, "line %u %s %u refused: lines are not up",
+		      line, job, req);
+		return LINE_JOB_NOT_UP;
+	}
+	if (!line_exists(line)) {
+		TRACE(TRACE_HAL, "line %u %s %u refused: no board port", line,
+		      job, req);
+		return LINE_JOB_BAD_ARGUMENT;
+	}
+	if (!line_get(line) || !uv.hal || uv.hal_state != UVOICE_HAL_READY) {
+		TRACE(TRACE_HAL, "line %u %s %u refused: the line is not up",
+		      line, job, req);
+		return LINE_JOB_NOT_UP;
+	}
+
+	return LINE_JOB_ADMITTED;
+}
+
+static void line_test_finish(struct line_job_slot *slot,
 			     enum line_test_result_status status,
 			     const void *record, size_t len)
 {
-	line_test_cb cb = slot->cb;
+	line_test_cb cb = slot->cb.test;
 	void *priv = slot->priv;
 
-	slot->busy = false;
-	slot->cb = NULL;
-	slot->priv = NULL;
-	/* the part is free from the moment the slot is, so a ring this test
-	 * held reaches the line before the consumer reads the result */
-	ring_hold_replay();
+	line_slot_release(slot);
 	cb(priv, status, record, len);
 }
 
 static void line_test_done(struct hal_job *job, enum hal_status status,
 			   const struct hal_event *ev)
 {
-	struct line_test_slot *slot = container_of(job, struct line_test_slot,
-						   job);
+	struct line_job_slot *slot = container_of(job, struct line_job_slot,
+						  job);
 	uint8_t record[LINE_TEST_RECORD_MAX];
 	enum hal_status read_status;
 	size_t len = 0;
@@ -1742,7 +1895,7 @@ static void line_test_done(struct hal_job *job, enum hal_status status,
 	}
 	if (read_status != HAL_OK) {
 		TRACE(TRACE_HAL, "line %u test %u result unreadable: %s",
-		      slot->line, slot->test, hal_status_name(read_status));
+		      slot->line, slot->req.test, hal_status_name(read_status));
 		line_test_finish(slot, LINE_TEST_RESULT_UNREADABLE, NULL, 0);
 		return;
 	}
@@ -1756,39 +1909,18 @@ enum line_test_query_status line_test_query(unsigned int line,
 					    enum hal_line_test test,
 					    line_test_cb cb, void *priv)
 {
-	struct line_test_slot *slot;
-	struct line *shell;
+	struct line_job_slot *slot;
+	enum line_job_admission admit;
 	enum hal_status status;
 
-	if (line >= CFG_CHANNEL_MAX || test > HAL_LINE_TEST_LOOP || !cb) {
-		TRACE(TRACE_HAL, "line %u test %u refused: bad argument", line,
-		      test);
+	admit = line_job_admit(line, test <= HAL_LINE_TEST_LOOP && cb != NULL,
+			       "test", test);
+	if (admit == LINE_JOB_BAD_ARGUMENT)
 		return LINE_TEST_QUERY_BAD_ARGUMENT;
-	}
-	if (!uv.cfg || line >= uv.cfg->channels ||
-	    !uv.cfg->channel[line].present) {
-		TRACE(TRACE_HAL,
-		      "line %u test %u refused: no configured line",
-		      line, test);
+	if (admit == LINE_JOB_NO_LINE)
 		return LINE_TEST_QUERY_NO_LINE;
-	}
-	if (!lines_up) {
-		TRACE(TRACE_HAL, "line %u test %u refused: lines are not up",
-		      line, test);
+	if (admit == LINE_JOB_NOT_UP)
 		return LINE_TEST_QUERY_NOT_UP;
-	}
-	if (!line_exists(line)) {
-		TRACE(TRACE_HAL,
-		      "line %u test %u refused: no board port", line, test);
-		return LINE_TEST_QUERY_BAD_ARGUMENT;
-	}
-
-	shell = line_get(line);
-	if (!shell || !uv.hal || uv.hal_state != UVOICE_HAL_READY) {
-		TRACE(TRACE_HAL, "line %u test %u refused: the line is not up",
-		      line, test);
-		return LINE_TEST_QUERY_NOT_UP;
-	}
 
 	slot = &line_test_slots[line];
 	if (slot->busy) {
@@ -1798,15 +1930,15 @@ enum line_test_query_status line_test_query(unsigned int line,
 	}
 
 	if (line_test_policy_refused(line)) {
-		TRACE(TRACE_HAL, "line %u test %u refused: a call is active",
-		      line, test);
+		TRACE(TRACE_HAL, "line %u test %u refused: a call, the loop "
+		      "test or a dump holds the board", line, test);
 		return LINE_TEST_QUERY_CALL_ACTIVE;
 	}
 
-	slot->cb = cb;
+	slot->cb.test = cb;
 	slot->priv = priv;
 	slot->line = (uint8_t)line;
-	slot->test = (uint8_t)test;
+	slot->req.test = (uint8_t)test;
 	slot->job.cb = line_test_done;
 
 	status = hal_backend_ops.line_test_start(uv.hal, line, test,
@@ -1814,7 +1946,7 @@ enum line_test_query_status line_test_query(unsigned int line,
 	if (status != HAL_OK) {
 		TRACE(TRACE_HAL, "line %u test %u refused by backend: %s",
 		      line, test, hal_status_name(status));
-		slot->cb = NULL;
+		slot->cb.test = NULL;
 		slot->priv = NULL;
 		if (status == HAL_UNSUPPORTED)
 			return LINE_TEST_QUERY_UNSUPPORTED;
@@ -1833,31 +1965,172 @@ enum line_test_query_status line_test_query(unsigned int line,
 
 void line_test_drop(unsigned int line)
 {
-	struct line_test_slot *slot;
-
-	if (line >= CFG_CHANNEL_MAX)
-		return;
-
-	slot = &line_test_slots[line];
-	if (!slot->busy)
-		return;
-
-	if (job_take(slot->job.token))
-		TRACE(TRACE_HAL, "line %u test token %u abandoned", line,
-		      slot->job.token);
-	slot->busy = false;
-	slot->cb = NULL;
-	slot->priv = NULL;
-	/* an abandoned test frees the part exactly as a completed one does */
-	ring_hold_replay();
+	line_slot_drop(line_test_slots, line, "test");
 }
 
-static void line_tests_drop(void)
+static bool line_dump_backend_has(void)
 {
-	unsigned int line;
+	if (!hal_backend_ops.line_dump_start ||
+	    !hal_backend_ops.line_dump_result_get)
+		return false;
 
-	for (line = 0; line < CFG_CHANNEL_MAX; line++)
-		line_test_drop(line);
+	return (lines_hal_cap()->features & HAL_FEAT_SLIC_DUMP) != 0;
+}
+
+static void line_dump_finish(struct line_job_slot *slot,
+			     enum line_dump_result_status status,
+			     const struct hal_slic_dump *rec)
+{
+	line_dump_cb cb = slot->cb.dump;
+	void *priv = slot->priv;
+
+	line_slot_release(slot);
+	cb(priv, status, rec);
+}
+
+/*
+ * The record of the completion. The renderer walks count pairs and skipped
+ * addresses and names the kind of the request, so a record whose counts
+ * exceed its arrays or whose kind differs is unreadable.
+ */
+static bool line_dump_record_take(const struct line_job_slot *slot)
+{
+	enum hal_status st;
+
+	st = hal_backend_ops.line_dump_result_get(uv.hal, slot->line,
+						  &dump_record);
+	if (st != HAL_OK) {
+		TRACE(TRACE_HAL, "line %u dump result unreadable: %s",
+		      slot->line, hal_status_name(st));
+		return false;
+	}
+
+	if (dump_record.count > HAL_SLIC_DUMP_WORDS ||
+	    dump_record.skipped > HAL_SLIC_DUMP_SKIP_MAX) {
+		TRACE(TRACE_HAL, "line %u dump result unreadable: %u words, %u "
+		      "skipped", slot->line, dump_record.count,
+		      dump_record.skipped);
+		return false;
+	}
+
+	if (dump_record.kind != slot->req.kind) {
+		TRACE(TRACE_HAL, "line %u dump result unreadable: kind %u for "
+		      "kind %u", slot->line, dump_record.kind, slot->req.kind);
+		return false;
+	}
+
+	return true;
+}
+
+static void line_dump_done(struct hal_job *job, enum hal_status status,
+			   const struct hal_event *ev)
+{
+	struct line_job_slot *slot = container_of(job, struct line_job_slot,
+						  job);
+
+	if (!slot->busy)
+		return;
+	if (!ev) {
+		line_dump_finish(slot, LINE_DUMP_RESULT_TIMEOUT, NULL);
+		return;
+	}
+	if (status == HAL_FATAL || !uv.hal) {
+		line_dump_finish(slot, LINE_DUMP_RESULT_FATAL, NULL);
+		return;
+	}
+	if (status == HAL_UNSUPPORTED) {
+		line_dump_finish(slot, LINE_DUMP_RESULT_UNSUPPORTED, NULL);
+		return;
+	}
+	if (status == HAL_TRANSIENT) {
+		line_dump_finish(slot, LINE_DUMP_RESULT_BUSY, NULL);
+		return;
+	}
+	if (!line_dump_record_take(slot)) {
+		line_dump_finish(slot, LINE_DUMP_RESULT_UNREADABLE, NULL);
+		return;
+	}
+
+	line_dump_finish(slot, LINE_DUMP_RESULT_COMPLETE, &dump_record);
+}
+
+/*
+ * The checks of line_test_query() without the call predicate, because a dump
+ * writes nothing that the part keeps. Two holds refuse it instead:
+ *
+ * - a dump on any line that has not completed, because the backend keeps one
+ *   record for the board and the next dump replaces it (hal.h
+ *   line_dump_start). The slot stays busy until the shell copies the
+ *   record, and the consumer reads that copy in the callback after the
+ *   release;
+ * - a metallic line test or the loop test, each of which owns the part.
+ */
+enum line_dump_query_status line_dump_query(unsigned int line,
+					    enum hal_dump_kind kind,
+					    line_dump_cb cb, void *priv)
+{
+	struct line_job_slot *slot;
+	enum line_job_admission admit;
+	enum hal_status status;
+	unsigned int held;
+
+	admit = line_job_admit(line, kind <= HAL_DUMP_RAM && cb != NULL,
+			       "dump", kind);
+	if (admit == LINE_JOB_BAD_ARGUMENT)
+		return LINE_DUMP_QUERY_BAD_ARGUMENT;
+	if (admit == LINE_JOB_NO_LINE)
+		return LINE_DUMP_QUERY_NO_LINE;
+	if (admit == LINE_JOB_NOT_UP)
+		return LINE_DUMP_QUERY_NOT_UP;
+
+	if (line_slots_busy(line_dump_slots, &held)) {
+		TRACE(TRACE_HAL, "line %u dump refused: the dump on line %u is "
+		      "pending", line, held);
+		return LINE_DUMP_QUERY_PENDING;
+	}
+	if (loop_test_armed || line_slots_busy(line_test_slots, &held)) {
+		TRACE(TRACE_HAL, "line %u dump refused: a line test or the "
+		      "loop test holds the board", line);
+		return LINE_DUMP_QUERY_HELD;
+	}
+	if (!line_dump_backend_has()) {
+		TRACE(TRACE_HAL, "line %u dump refused: the backend has no "
+		      "dump", line);
+		return LINE_DUMP_QUERY_UNSUPPORTED;
+	}
+
+	slot = &line_dump_slots[line];
+	slot->cb.dump = cb;
+	slot->priv = priv;
+	slot->line = (uint8_t)line;
+	slot->req.kind = (uint8_t)kind;
+	slot->job.cb = line_dump_done;
+
+	status = hal_backend_ops.line_dump_start(uv.hal, line, kind,
+						 &slot->job);
+	if (status != HAL_OK) {
+		TRACE(TRACE_HAL, "line %u dump refused by backend: %s", line,
+		      hal_status_name(status));
+		slot->cb.dump = NULL;
+		slot->priv = NULL;
+		if (status == HAL_UNSUPPORTED)
+			return LINE_DUMP_QUERY_UNSUPPORTED;
+		if (status == HAL_TRANSIENT)
+			return LINE_DUMP_QUERY_BUSY;
+		return LINE_DUMP_QUERY_REFUSED;
+	}
+
+	slot->busy = true;
+	job_add_budget(&slot->job, LINE_DUMP_JOB_MS);
+	TRACE(TRACE_HAL, "line %u dump %u submitted, token %u", line, kind,
+	      slot->job.token);
+
+	return LINE_DUMP_QUERY_OK;
+}
+
+void line_dump_drop(unsigned int line)
+{
+	line_slot_drop(line_dump_slots, line, "dump");
 }
 
 /* a completion after the lines are gone would report on a dead shell */
@@ -3064,11 +3337,64 @@ static void ring_give_up(struct line *l)
 	ring_retry_arm(l, 0);
 }
 
+/* A stop that a line test or a dump refused stays pending, because the bell
+ * rings on until the backend accepts a stop (part_write_held()). */
+static void ring_stop_issue(struct line *l)
+{
+	bool held = l->ring_stop_held;
+	enum hal_status st;
+
+	if (!uv.hal)
+		return;
+
+	st = hal_backend_ops.line_ring_stop(uv.hal, l->index);
+	l->ring_stop_held = part_write_held(l, held, st, "ring stop");
+	if (held && st != HAL_OK && !l->ring_stop_held)
+		ULOG_WARN("line %u held ring stop not applied: %s\n", l->index,
+			  hal_status_name(st));
+}
+
+static void hold_retry_expire(struct uloop_timeout *t);
+
+/*
+ * The stop and the restore a line test or a dump held, once the part is free.
+ * While a job holds it, the end of that job issues them (part_hold_replay()).
+ * A re-issue the backend still refuses keeps its hold and asks again every
+ * LINE_RING_HOLD_RETRY_MS, for the reason a held ring does. A fatal or
+ * unsupported answer ends the hold.
+ */
+static void held_writes_issue(struct line *l)
+{
+	unsigned int holder;
+
+	if (!l->ring_stop_held && !l->polarity_held)
+		return;
+	if (!uv.hal || line_part_held(&holder))
+		return;
+
+	if (l->ring_stop_held)
+		ring_stop_issue(l);
+	if (l->polarity_held)
+		fwd_disc_polarity(l, HAL_POL_FORWARD);
+	if (!l->ring_stop_held && !l->polarity_held)
+		return;
+
+	l->hold_retry.cb = hold_retry_expire;
+	uloop_timeout_set(&l->hold_retry, LINE_RING_HOLD_RETRY_MS);
+	TRACE(TRACE_FSM, "line %u held stop or restore refused, asking again "
+	      "in %u ms", l->index, LINE_RING_HOLD_RETRY_MS);
+}
+
+static void hold_retry_expire(struct uloop_timeout *t)
+{
+	held_writes_issue(container_of(t, struct line, hold_retry));
+}
+
 /*
  * Which attempt at the bell this is, because the three answer a refusal
  * differently. RING_TRY_FIRST is the attempt the machine asked for.
  * RING_TRY_RETRY is the single repeat of a transient refusal. RING_TRY_HELD is
- * the re-issue of a ring a line test held.
+ * the re-issue of a ring a line test or a dump held.
  */
 enum ring_try {
 	RING_TRY_FIRST = 0,
@@ -3080,10 +3406,11 @@ enum ring_try {
  * One attempt at the bell, and what the backend's answer means.
  *
  * libudsp answers HAL_TRANSIENT to a ring on any line while a metallic line
- * test runs. The thread that executes a ring is inside the measurement. This
- * shell holds the ring instead. The line still reads as ringing and the caller
- * hears ringback. The end of the test issues the ring again, and a GR-909 set
- * delays the bell by about 10 s.
+ * test or a SLIC dump runs. The thread that executes a ring is inside the
+ * measurement or the read. This shell holds the ring instead. The line still
+ * reads as ringing and the caller hears ringback. The end of the job issues
+ * the ring again. A GR-909 set delays the bell by about 10 s, and a dump of
+ * the whole RAM by seconds.
  *
  * A re-issue the backend still refuses keeps the hold and asks again every
  * LINE_RING_HOLD_RETRY_MS. The core gives the test job a budget, and a plug-in
@@ -3091,13 +3418,13 @@ enum ring_try {
  * does not prove the part is free. The line rings or the call ends; nothing
  * else stops the attempts.
  *
- * A transient answer with no test in flight is the ordinary busy answer of
- * hal.h section 3. The shell waits HAL_RETRY_MS and asks once more, and a
- * second refusal there gives the bell up. A fatal or unsupported answer gives
- * it up from the first attempt. Either way the subscriber loses the call, so
- * the give-up is logged and not traced. The log names the outcome of the
- * profile it belongs to: a caller gets 480, and a recall stays silent, because
- * it has no caller to refuse.
+ * A transient answer with no test or dump in flight is the ordinary busy
+ * answer of hal.h section 3. The shell waits HAL_RETRY_MS and asks once more,
+ * and a second refusal there gives the bell up. A fatal or unsupported answer
+ * gives it up from the first attempt. Either way the subscriber loses the
+ * call, so the give-up is logged and not traced. The log names the outcome of
+ * the profile it belongs to: a caller gets 480, and a recall stays silent,
+ * because it has no caller to refuse.
  */
 static void ring_issue(struct line *l, enum ring_try try)
 {
@@ -3106,7 +3433,7 @@ static void ring_issue(struct line *l, enum ring_try try)
 	const struct proto_ops *ops = proto_ops_get();
 	struct hal_ring ring;
 	enum hal_status st;
-	unsigned int tested;
+	unsigned int holder;
 
 	ring_build(l, &ring);
 
@@ -3119,8 +3446,14 @@ static void ring_issue(struct line *l, enum ring_try try)
 	if (!uv.hal)
 		return;
 
+	/* a stop or a restore a job held goes out first, so that neither
+	 * falls inside this cadence */
+	held_writes_issue(l);
 	st = hal_backend_ops.line_ring_start(uv.hal, l->index, &ring);
 	if (st == HAL_OK) {
+		/* this bell belongs to the current request, so a stop held from
+		 * an earlier call must not end it */
+		l->ring_stop_held = false;
 		/* the no-answer window measures a phone the subscriber can
 		 * hear, so a bell the hold delayed restarts it (fsm.h) */
 		if (held && ops->ring_started)
@@ -3147,15 +3480,15 @@ static void ring_issue(struct line *l, enum ring_try try)
 		return;
 	}
 
-	if (line_test_running(&tested)) {
+	if (line_part_held(&holder)) {
 		l->ring_held = true;
 		/* the no-answer window must not run over a silent telephone,
 		 * and a hold longer than that window would forward the call
 		 * before the bell ever sounded (fsm.h) */
 		if (ops->ring_held)
 			ops->ring_held(l->index);
-		TRACE(TRACE_FSM, "line %u ring held by the line test on line "
-		      "%u", l->index, tested);
+		TRACE(TRACE_FSM, "line %u ring held by the line test or the "
+		      "dump on line %u", l->index, holder);
 		return;
 	}
 
@@ -3205,31 +3538,38 @@ static void ring_retry_expire(struct uloop_timeout *t)
 }
 
 /*
- * The bells a line test held. The last test to finish rings them.
+ * The writes a line test or a dump held: the bells, the stops and the
+ * polarity restores. The last job to finish issues them, every path that
+ * frees its slot included.
  *
- * This builds the profile again from the request the ring belongs to. The
- * cadence starts from its beginning and the profile carries the full
+ * A held ring builds the profile again from the request the ring belongs to.
+ * The cadence starts from its beginning and the profile carries the full
  * duration, so the subscriber hears a whole ring and not the tail of one.
+ * ring_issue() sends the held stop and restore of its line first.
  *
  * A line whose call ended in the meantime rings nothing: line_ringer_stop()
- * cleared the hold, so a caller who gave up does not ring the phone late.
+ * cleared the hold, so a caller who gave up does not ring the phone late. The
+ * stop of that call is held instead, so this replay ends a bell that still
+ * rings.
  */
-static void ring_hold_replay(void)
+static void part_hold_replay(void)
 {
-	unsigned int i, tested;
+	unsigned int i, holder;
 
-	/* a second test still owns the part, so the hold outlives this one */
-	if (line_test_running(&tested))
+	/* a second job still owns the part, so the hold outlives this one */
+	if (line_part_held(&holder))
 		return;
 
 	for (i = 0; i < CFG_CHANNEL_MAX; i++) {
 		struct line *l = &lines[i];
 
-		if (!l->ring_held || !l->ringing)
+		if (!l->ring_held || !l->ringing) {
+			held_writes_issue(l);
 			continue;
+		}
 
-		TRACE(TRACE_FSM, "line %u ring re-issued after the line test",
-		      i);
+		TRACE(TRACE_FSM, "line %u ring re-issued after the line test "
+		      "or the dump", i);
 		ring_issue(l, RING_TRY_HELD);
 	}
 }
@@ -3279,9 +3619,7 @@ void line_ringer_stop(unsigned int line)
 	l->ring_held = false;
 	l->ring_failed = false;
 	uloop_timeout_cancel(&l->ring_retry);
-
-	if (uv.hal)
-		hal_backend_ops.line_ring_stop(uv.hal, l->index);
+	ring_stop_issue(l);
 }
 
 /*
@@ -3746,7 +4084,7 @@ static bool loop_test_audio_want(const struct line *l);
  *
  * The timer is the ring retry of the protocol's ring, which is free while the
  * mode holds the line: ring_issue() is reached from line_ringer_start(),
- * ring_retry_expire() and ring_hold_replay(), all of which need a ring the
+ * ring_retry_expire() and part_hold_replay(), all of which need a ring the
  * out of service machine never asks for, and the force that took the line
  * out reached line_ringer_stop(), which cancelled it. Every arm below writes
  * its own callback first, and line_timers_cancel() cancels it at the end of
@@ -3764,8 +4102,12 @@ static void loop_test_ring_issue(struct line *l, bool retry)
 	ring_cadence_take(l, 0, &ring);
 	ring.duration_ms = loop_test_ring_ms;
 
+	/* as in ring_issue(): a held stop or restore goes out first, and an
+	 * accepted bell outranks a held stop */
+	held_writes_issue(l);
 	st = hal_backend_ops.line_ring_start(uv.hal, l->index, &ring);
 	if (st == HAL_OK) {
+		l->ring_stop_held = false;
 		l->loop_test_ringing = true;
 		TRACE(TRACE_FSM, "line %u loop test ring for %u ms", l->index,
 		      ring.duration_ms);
@@ -4124,7 +4466,7 @@ enum line_loop_test_status line_loop_test_set(bool enable, bool want_self,
 					      struct line_loop_test_view *out)
 {
 	unsigned int count = loop_test_line_count();
-	unsigned int tested;
+	unsigned int holder;
 
 	/* every answer carries the standing view, so a refusal reports what
 	 * the board is doing now */
@@ -4142,7 +4484,9 @@ enum line_loop_test_status line_loop_test_set(bool enable, bool want_self,
 	if (line_test_call_active())
 		return LINE_LOOP_TEST_CALL_ACTIVE;
 
-	if (line_test_running(&tested))
+	/* only an arm needs the part: no mode stands beside a line test or a
+	 * dump, so a disarm then changes nothing */
+	if (enable && line_part_held(&holder))
 		return LINE_LOOP_TEST_TEST_RUNNING;
 
 	if (ring_s < 1 || ring_s > LINE_LOOP_TEST_RING_S_MAX ||
@@ -5040,6 +5384,7 @@ static void line_timers_cancel(struct line *l)
 	digit_queue_flush(l);
 	uloop_timeout_cancel(&l->dial_tone);
 	uloop_timeout_cancel(&l->ring_retry);
+	uloop_timeout_cancel(&l->hold_retry);
 	uloop_timeout_cancel(&l->service_sync);
 	/* the abort carries the other two forward disconnect timers, and it is
 	 * also where a battery this line removed is put back: a re-init or a
@@ -5047,6 +5392,12 @@ static void line_timers_cancel(struct line *l)
 	 * retry of a refused restore stops, in front of the memset that would
 	 * corrupt the list an armed timer is linked into */
 	fwd_disc_abort(l, true);
+	/* a held stop or restore ends with the line, so the replay of a job
+	 * that ends later arms no retry behind this cancel. lines_init() clears
+	 * the line, and after lines_done() hal_close() stops every bell and
+	 * takes every feed down */
+	l->ring_stop_held = false;
+	l->polarity_held = false;
 }
 
 /*
@@ -5403,20 +5754,21 @@ static void hook_resync_confirm(void)
 
 static void hook_resync_expire(struct uloop_timeout *t)
 {
-	unsigned int tested;
+	unsigned int holder;
 
 	if (!uv.hal)
 		return;
 
 	/*
-	 * A metallic line test blocks the hook sample of every port for the
-	 * length of its measurement. Both phases therefore wait for it rather
-	 * than read a part the test owns. The per line state is kept, so a
-	 * wait this postpone carries forward still ends in one second reading.
+	 * A metallic line test or a SLIC dump blocks the hook sample of every
+	 * port for the length of its job. Both phases therefore wait for it
+	 * rather than read a part the job owns. The per line state is kept, so
+	 * a wait this postpone carries forward still ends in one second
+	 * reading.
 	 */
-	if (line_test_running(&tested)) {
-		TRACE(TRACE_HOOK, "hook resync held by the line test on "
-		      "line %u", tested);
+	if (line_part_held(&holder)) {
+		TRACE(TRACE_HOOK, "hook resync held by the line test or the "
+		      "dump on line %u", holder);
 		hook_resync_arm(hook_resync_phase, LINE_HOOK_RESYNC_MIN_MS);
 		return;
 	}
@@ -5660,7 +6012,8 @@ void lines_init(const struct cfg *cfg)
 	const struct proto_ops *ops = proto_ops_get();
 	unsigned int i;
 
-	line_tests_drop();
+	line_slots_drop(line_test_slots, "test");
+	line_slots_drop(line_dump_slots, "dump");
 	stats_drop();
 
 	/*
@@ -5943,7 +6296,8 @@ void lines_done(void)
 
 	region_drop();
 	region_hal_drop();
-	line_tests_drop();
+	line_slots_drop(line_test_slots, "test");
+	line_slots_drop(line_dump_slots, "dump");
 	/* after the legs are torn down, because their teardown is what submits
 	 * the last media snapshots */
 	stats_drop();
@@ -6055,9 +6409,9 @@ void lines_status_dump(struct blob_buf *b)
 		if (l->fault || l->down)
 			blobmsg_add_u8(b, "fault", 1);
 		blobmsg_add_u8(b, "ringing", l->ringing);
-		/* present only while a line test holds the bell back, which is
-		 * the one state where a line reads as ringing and the phone is
-		 * quiet */
+		/* present only while a line test or a dump holds the bell back,
+		 * which is the one state where a line reads as ringing and the
+		 * phone is quiet */
 		if (l->ring_held)
 			blobmsg_add_u8(b, "ring_held", 1);
 		/* what the switch said, not what either presentation gate did

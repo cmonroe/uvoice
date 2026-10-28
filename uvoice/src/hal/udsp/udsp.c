@@ -134,6 +134,11 @@ _Static_assert((int)HAL_LINE_TEST_CAPACITANCE ==
 _Static_assert((int)HAL_LINE_TEST_LOOP == (int)UDSP_TEST_LOOP,
 	       "line test LOOP moved");
 
+_Static_assert((int)HAL_DUMP_REG == (int)UDSP_DUMP_REG, "dump kind REG moved");
+_Static_assert((int)HAL_DUMP_RAM_BRIEF == (int)UDSP_DUMP_RAM_BRIEF,
+	       "dump kind RAM_BRIEF moved");
+_Static_assert((int)HAL_DUMP_RAM == (int)UDSP_DUMP_RAM, "dump kind RAM moved");
+
 _Static_assert((int)HAL_CID_BELLCORE_FSK == (int)UDSP_CIDF_BELLCORE_FSK,
 	       "cid format BELLCORE_FSK moved");
 _Static_assert((int)HAL_CID_ETSI_FSK == (int)UDSP_CIDF_ETSI_FSK,
@@ -177,6 +182,19 @@ _Static_assert(HAL_CID_STR_MAX == UDSP_CID_STR_MAX, "the cid string widths diffe
 _Static_assert(sizeof(((struct hal_engine_diag *)0)->interval) ==
 	       sizeof(((struct udsp_engine_diag *)0)->interval),
 	       "the engine diag interval histograms differ");
+/* The dump copy below moves the three arrays whole, so both records must
+ * carry the same bounds and the same element types. */
+_Static_assert(HAL_SLIC_DUMP_WORDS == UDSP_DUMP_WORDS,
+	       "the dump word counts differ");
+_Static_assert(HAL_SLIC_DUMP_SKIP_MAX == UDSP_DUMP_SKIP_MAX,
+	       "the dump skip lists differ");
+_Static_assert(sizeof(((struct hal_slic_dump *)0)->skip) ==
+	       sizeof(((struct udsp_dump *)0)->skip) &&
+	       sizeof(((struct hal_slic_dump *)0)->addr) ==
+	       sizeof(((struct udsp_dump *)0)->addr) &&
+	       sizeof(((struct hal_slic_dump *)0)->value) ==
+	       sizeof(((struct udsp_dump *)0)->value),
+	       "the dump arrays differ");
 
 /* --- capability ---------------------------------------------------------- */
 
@@ -289,6 +307,8 @@ void hal_udsp_cap_fill(struct hal_cap *dst, const struct udsp_cap *src)
 		dst->features |= HAL_FEAT_DTMF_PLAYOUT;
 	if (src->features & UDSP_FEAT_LOOP)
 		dst->features |= HAL_FEAT_LOOP;
+	if (src->features & UDSP_FEAT_SLIC_DUMP)
+		dst->features |= HAL_FEAT_SLIC_DUMP;
 
 	/*
 	 * Neither of these is a library bit. libudsp takes connected
@@ -2209,6 +2229,21 @@ static void hal_udsp_monitor_fill(struct hal_monitor *dst,
 	dst->fault_held = src->fault_held;
 }
 
+/* One SLIC dump, copied one field at a time for the reason the fills above
+ * are; the three arrays move whole, under the asserts at the top. */
+static void hal_udsp_dump_fill(struct hal_slic_dump *dst,
+			       const struct udsp_dump *src)
+{
+	dst->kind = src->kind;
+	dst->line = src->line;
+	dst->width = src->width;
+	dst->count = src->count;
+	dst->skipped = src->skipped;
+	memcpy(dst->skip, src->skip, sizeof(dst->skip));
+	memcpy(dst->addr, src->addr, sizeof(dst->addr));
+	memcpy(dst->value, src->value, sizeof(dst->value));
+}
+
 /*
  * The transport and encryption counters of one stream, copied one field at a
  * time for the reason the fills above are: the two records stay separate types
@@ -3288,6 +3323,25 @@ static enum hal_status udsp_line_test_start(struct hal *h, unsigned int line,
 }
 
 /*
+ * The SLIC dump, forwarded the way the line test is. The library owns the
+ * refusal order and both exclusions, so this op adds the line bound alone, for
+ * the reason udsp_line_loop_set gives.
+ */
+static enum hal_status udsp_line_dump_start(struct hal *h, unsigned int line,
+					    enum hal_dump_kind kind,
+					    struct hal_job *job)
+{
+	struct udsp_job j = { 0 };
+
+	if (line >= h->cap.lines)
+		return HAL_UNSUPPORTED;
+
+	return job_submit(job,
+		udsp_slic_dump(h->s, line, (enum udsp_dump_kind)kind, &j), &j,
+		"slic_dump");
+}
+
+/*
  * The one SLOW op with no SLOW library call behind it.
  *
  * hal.h classifies stream_stats_start SLOW to leave room for a backend that
@@ -3470,6 +3524,32 @@ static enum hal_status udsp_line_monitor_get(struct hal *h, unsigned int line,
 		return st;
 
 	hal_udsp_monitor_fill(out, &snap);
+
+	return HAL_OK;
+}
+
+/*
+ * The dump getter, the shape of the monitor getter above. The core reads it
+ * once per completion and never polls it, so a refusal is traced. The record
+ * is 12 KiB, and udsp_slic_dump_result() keeps one copy on its own frame. The
+ * library writes into the scratch record of the backend, so this frame adds
+ * no second copy.
+ */
+static enum hal_status udsp_line_dump_result_get(struct hal *h,
+						 unsigned int line,
+						 struct hal_slic_dump *out)
+{
+	enum hal_status st;
+
+	if (line >= h->cap.lines || !out)
+		return HAL_UNSUPPORTED;
+
+	st = call_check(udsp_slic_dump_result(h->s, line, &h->dump_rec),
+			"slic_dump_result");
+	if (st != HAL_OK)
+		return st;
+
+	hal_udsp_dump_fill(out, &h->dump_rec);
 
 	return HAL_OK;
 }
@@ -3686,4 +3766,6 @@ const struct hal_ops hal_backend_ops = {
 	.stream_stats_start = udsp_stream_stats_start,
 	.region_apply = udsp_region_apply,
 	.line_loop_set = udsp_line_loop_set,
+	.line_dump_start = udsp_line_dump_start,
+	.line_dump_result_get = udsp_line_dump_result_get,
 };

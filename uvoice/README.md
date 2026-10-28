@@ -191,8 +191,8 @@ wall time. Main variables:
 - `UVOICE_UCODE_MODDIR`: ucode module directory that the CLI formatter
   needs.
 - `UVOICED`, `UVOICE_PREFIX`, `WORK`: daemon and paths of the CLI suite.
-- `UVOICE_STUB_DSP_START`, `UVOICE_STUB_RING_START`: behavior hooks of the
-  stub backend.
+- `UVOICE_STUB_DSP_START`, `UVOICE_STUB_RING_START`,
+  `UVOICE_STUB_SLIC_DUMP`: behavior hooks of the stub backend.
 - `UVOICE_STUB_RING_CAP_MS`: caps the stub ring timer, so that a suite can
   watch a long ring end inside a pumped window.
 - `UVOICE_EVENT_POST`: event script that the daemon runs in place of

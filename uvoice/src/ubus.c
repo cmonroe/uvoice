@@ -30,6 +30,8 @@
 /* The line test budget owns the normal timeout. This later timer closes the
  * ubus request if the HAL callback path fails to deliver its answer. */
 #define LINE_TEST_TIMEOUT_MS	(LINE_TEST_JOB_MS + 1000)
+/* The line test rule above, for the SLIC dump budget. */
+#define LINE_DUMP_TIMEOUT_MS	(LINE_DUMP_JOB_MS + 1000)
 
 enum {
 	MLT_VERSION = 1,
@@ -522,8 +524,8 @@ static const char * const line_test_names[] = {
 	[HAL_LINE_TEST_LOOP] = "loop",
 };
 
-/* A reply that waits for a HAL answer: the part that the line test and the
- * live stats requests share. */
+/* A reply that waits for a HAL answer: the part that the line test, the SLIC
+ * dump and the live stats requests share. */
 struct deferred_reply {
 	struct ubus_request_data req;
 	struct uloop_timeout timeout;
@@ -537,6 +539,35 @@ static void deferred_reply_finish(struct deferred_reply *reply, int status)
 	reply->pending = false;
 	uloop_timeout_cancel(&reply->timeout);
 	ubus_complete_deferred_request(reply->ctx, &reply->req, status);
+}
+
+/*
+ * The two closes of a line test or dump reply that no completion answered:
+ * the safety timer and the daemon stop. The drop frees the slot of
+ * line/line.c first, so a completion that arrives later reaches no consumer.
+ */
+static void line_job_reply_expire(struct deferred_reply *reply,
+				  const char *job, const char *name,
+				  unsigned int timeout_ms,
+				  void (*drop)(unsigned int line))
+{
+	ULOG_WARN("line %u %s %s produced no answer in %u ms\n", reply->line,
+		  job, name, timeout_ms);
+	drop(reply->line);
+	deferred_reply_finish(reply, UBUS_STATUS_TIMEOUT);
+}
+
+static void line_job_reply_shutdown(struct deferred_reply *reply,
+				    const char *job, const char *name,
+				    void (*drop)(unsigned int line))
+{
+	if (!reply->pending)
+		return;
+
+	ULOG_WARN("line %u %s %s reply closed by the daemon stop\n",
+		  reply->line, job, name);
+	drop(reply->line);
+	deferred_reply_finish(reply, UBUS_STATUS_NO_DATA);
 }
 
 struct line_test_request {
@@ -603,11 +634,9 @@ static void line_test_request_expire(struct uloop_timeout *timeout)
 	struct line_test_request *request = container_of(
 		timeout, struct line_test_request, reply.timeout);
 
-	ULOG_WARN("line %u test %s produced no answer in %u ms\n",
-		  request->reply.line, line_test_names[request->test],
-		  LINE_TEST_TIMEOUT_MS);
-	line_test_drop(request->reply.line);
-	deferred_reply_finish(&request->reply, UBUS_STATUS_TIMEOUT);
+	line_job_reply_expire(&request->reply, "test",
+			      line_test_names[request->test],
+			      LINE_TEST_TIMEOUT_MS, line_test_drop);
 }
 
 enum {
@@ -621,18 +650,32 @@ static const struct blobmsg_policy line_test_policy[__LINE_TEST_MAX] = {
 	[LINE_TEST_NAME] = { "test", BLOBMSG_TYPE_STRING },
 };
 
-static bool line_test_name_get(const char *name, enum hal_line_test *test)
+static bool word_index_get(const char * const *words, size_t n,
+			   const char *name, unsigned int *index)
 {
 	unsigned int i;
 
-	for (i = 0; i < ARRAY_SIZE(line_test_names); i++) {
-		if (strcmp(name, line_test_names[i]))
+	for (i = 0; i < n; i++) {
+		if (strcmp(name, words[i]))
 			continue;
-		*test = (enum hal_line_test)i;
+		*index = i;
 		return true;
 	}
 
 	return false;
+}
+
+static bool line_test_name_get(const char *name, enum hal_line_test *test)
+{
+	unsigned int i;
+
+	if (!word_index_get(line_test_names, ARRAY_SIZE(line_test_names), name,
+			    &i))
+		return false;
+
+	*test = (enum hal_line_test)i;
+
+	return true;
 }
 
 static int voice_line_test(struct ubus_context *ctx, struct ubus_object *obj,
@@ -684,8 +727,8 @@ static int voice_line_test(struct ubus_context *ctx, struct ubus_object *obj,
 		      "line %u test refused: a query is pending", line);
 		return UBUS_STATUS_NO_DATA;
 	case LINE_TEST_QUERY_CALL_ACTIVE:
-		TRACE(TRACE_HAL,
-		      "line %u test refused: a call is active", line);
+		TRACE(TRACE_HAL, "line %u test refused: a call, the loop test "
+		      "or a dump holds the board", line);
 		return UBUS_STATUS_NO_DATA;
 	case LINE_TEST_QUERY_BUSY:
 		TRACE(TRACE_HAL,
@@ -821,7 +864,8 @@ static int voice_loop_test(struct ubus_context *ctx, struct ubus_object *obj,
 		TRACE(TRACE_HAL, "loop test refused: a call is active");
 		return UBUS_STATUS_NO_DATA;
 	case LINE_LOOP_TEST_TEST_RUNNING:
-		TRACE(TRACE_HAL, "loop test refused: a line test is running");
+		TRACE(TRACE_HAL,
+		      "loop test refused: a line test or a dump is running");
 		return UBUS_STATUS_NO_DATA;
 	case LINE_LOOP_TEST_REFUSED:
 		TRACE(TRACE_HAL, "loop test refused: the backend failed");
@@ -846,12 +890,221 @@ static void line_test_shutdown(void)
 	for (line = 0; line < CFG_CHANNEL_MAX; line++) {
 		struct line_test_request *request = &line_test_reqs[line];
 
-		if (!request->reply.pending)
-			continue;
-		ULOG_WARN("line %u test %s reply closed by the daemon stop\n",
-			  line, line_test_names[request->test]);
-		line_test_drop(line);
-		deferred_reply_finish(&request->reply, UBUS_STATUS_NO_DATA);
+		line_job_reply_shutdown(&request->reply, "test",
+					line_test_names[request->test],
+					line_test_drop);
+	}
+}
+
+static const char * const dump_kind_names[] = {
+	[HAL_DUMP_REG] = "reg",
+	[HAL_DUMP_RAM_BRIEF] = "ram_brief",
+	[HAL_DUMP_RAM] = "ram",
+};
+
+static bool dump_kind_get(const char *name, enum hal_dump_kind *kind)
+{
+	unsigned int i;
+
+	if (!word_index_get(dump_kind_names, ARRAY_SIZE(dump_kind_names), name,
+			    &i))
+		return false;
+
+	*kind = (enum hal_dump_kind)i;
+
+	return true;
+}
+
+/*
+ * The SLIC dump (line/line.h line_dump_query). Like line_test, it defers: the
+ * backend reads the part on a SLOW job (hal.h line_dump_start), and the
+ * completion below renders the record. One request per line, because
+ * line/line.c holds one slot per line. The records are static, because a
+ * deferred handle must outlive the frame that took it.
+ */
+struct slic_dump_request {
+	struct deferred_reply reply;
+	enum hal_dump_kind kind;
+};
+
+static struct slic_dump_request slic_dump_reqs[CFG_CHANNEL_MAX];
+
+static void dump_u16_array_add(const char *key, const uint16_t *v,
+			       unsigned int n)
+{
+	void *array = blobmsg_open_array(&b, key);
+	unsigned int i;
+
+	for (i = 0; i < n; i++)
+		blobmsg_add_u32(&b, NULL, v[i]);
+	blobmsg_close_array(&b, array);
+}
+
+/*
+ * The record as three parallel arrays of count entries: entry i of value is
+ * the word at entry i of addr. skipped lists the addresses the backend did not
+ * read. The daemon decodes no value, because the meaning of a word is the SLIC
+ * driver's.
+ */
+static void slic_dump_render(const struct slic_dump_request *request,
+			     const struct hal_slic_dump *rec)
+{
+	void *array;
+	unsigned int i;
+
+	blob_buf_init(&b, 0);
+	blobmsg_add_u32(&b, "line", request->reply.line);
+	blobmsg_add_string(&b, "kind", dump_kind_names[request->kind]);
+	blobmsg_add_u32(&b, "width", rec->width);
+	blobmsg_add_u32(&b, "count", rec->count);
+	dump_u16_array_add("skipped", rec->skip, rec->skipped);
+	dump_u16_array_add("addr", rec->addr, rec->count);
+
+	array = blobmsg_open_array(&b, "value");
+	for (i = 0; i < rec->count; i++)
+		blobmsg_add_u32(&b, NULL, rec->value[i]);
+	blobmsg_close_array(&b, array);
+}
+
+static void slic_dump_request_done(void *priv,
+				   enum line_dump_result_status status,
+				   const struct hal_slic_dump *rec)
+{
+	struct slic_dump_request *request = priv;
+	struct deferred_reply *reply = &request->reply;
+
+	if (!reply->pending) {
+		TRACE(TRACE_HAL,
+		      "line %u dump %s result arrived after its reply closed",
+		      reply->line, dump_kind_names[request->kind]);
+		return;
+	}
+	if (status == LINE_DUMP_RESULT_TIMEOUT) {
+		deferred_reply_finish(reply, UBUS_STATUS_TIMEOUT);
+		return;
+	}
+	if (status == LINE_DUMP_RESULT_FATAL ||
+	    status == LINE_DUMP_RESULT_UNREADABLE) {
+		deferred_reply_finish(reply, UBUS_STATUS_UNKNOWN_ERROR);
+		return;
+	}
+	if (status != LINE_DUMP_RESULT_COMPLETE || !rec) {
+		TRACE(TRACE_HAL,
+		      "line %u dump %s completed without a record: %s",
+		      reply->line, dump_kind_names[request->kind],
+		      status == LINE_DUMP_RESULT_UNSUPPORTED ? "unsupported" :
+		      "the part was busy");
+		deferred_reply_finish(reply, UBUS_STATUS_NO_DATA);
+		return;
+	}
+
+	slic_dump_render(request, rec);
+	ubus_send_reply(reply->ctx, &reply->req, b.head);
+	deferred_reply_finish(reply, 0);
+}
+
+static void slic_dump_request_expire(struct uloop_timeout *timeout)
+{
+	struct slic_dump_request *request = container_of(
+		timeout, struct slic_dump_request, reply.timeout);
+
+	line_job_reply_expire(&request->reply, "dump",
+			      dump_kind_names[request->kind],
+			      LINE_DUMP_TIMEOUT_MS, line_dump_drop);
+}
+
+/*
+ * The refusal classes of line_dump_query(), which traces the reason of each.
+ * Every hold and every busy answer shares No data, the line_test precedent:
+ * ubus carries no busy code.
+ */
+static int slic_dump_status(enum line_dump_query_status st)
+{
+	switch (st) {
+	case LINE_DUMP_QUERY_OK:
+		return 0;
+	case LINE_DUMP_QUERY_BAD_ARGUMENT:
+		return UBUS_STATUS_INVALID_ARGUMENT;
+	case LINE_DUMP_QUERY_NO_LINE:
+		return UBUS_STATUS_NOT_FOUND;
+	case LINE_DUMP_QUERY_NOT_UP:
+	case LINE_DUMP_QUERY_PENDING:
+	case LINE_DUMP_QUERY_HELD:
+	case LINE_DUMP_QUERY_BUSY:
+	case LINE_DUMP_QUERY_UNSUPPORTED:
+		return UBUS_STATUS_NO_DATA;
+	case LINE_DUMP_QUERY_REFUSED:
+		return UBUS_STATUS_UNKNOWN_ERROR;
+	}
+
+	return UBUS_STATUS_UNKNOWN_ERROR;
+}
+
+enum {
+	SLIC_DUMP_LINE,
+	SLIC_DUMP_KIND,
+	__SLIC_DUMP_MAX,
+};
+
+static const struct blobmsg_policy slic_dump_policy[__SLIC_DUMP_MAX] = {
+	[SLIC_DUMP_LINE] = { "line", BLOBMSG_TYPE_INT32 },
+	[SLIC_DUMP_KIND] = { "kind", BLOBMSG_TYPE_STRING },
+};
+
+static int voice_slic_dump(struct ubus_context *ctx, struct ubus_object *obj,
+			   struct ubus_request_data *req, const char *method,
+			   struct blob_attr *msg)
+{
+	struct blob_attr *tb[__SLIC_DUMP_MAX] = {};
+	struct slic_dump_request *request;
+	enum line_dump_query_status status;
+	enum hal_dump_kind kind;
+	uint32_t line;
+
+	if (msg)
+		blobmsg_parse(slic_dump_policy, __SLIC_DUMP_MAX, tb,
+			      blob_data(msg), blob_len(msg));
+	if (!tb[SLIC_DUMP_LINE] || !tb[SLIC_DUMP_KIND] ||
+	    !dump_kind_get(blobmsg_get_string(tb[SLIC_DUMP_KIND]), &kind))
+		return UBUS_STATUS_INVALID_ARGUMENT;
+
+	line = blobmsg_get_u32(tb[SLIC_DUMP_LINE]);
+	if (line >= CFG_CHANNEL_MAX)
+		return UBUS_STATUS_INVALID_ARGUMENT;
+
+	request = &slic_dump_reqs[line];
+	if (request->reply.pending) {
+		TRACE(TRACE_HAL,
+		      "line %u dump refused: a reply is already deferred",
+		      line);
+		return UBUS_STATUS_NO_DATA;
+	}
+
+	request->reply.ctx = ctx;
+	request->reply.line = line;
+	request->kind = kind;
+	status = line_dump_query(line, kind, slic_dump_request_done, request);
+	if (status != LINE_DUMP_QUERY_OK)
+		return slic_dump_status(status);
+
+	ubus_defer_request(ctx, req, &request->reply.req);
+	request->reply.pending = true;
+	request->reply.timeout.cb = slic_dump_request_expire;
+	uloop_timeout_set(&request->reply.timeout, LINE_DUMP_TIMEOUT_MS);
+
+	return 0;
+}
+
+static void slic_dump_shutdown(void)
+{
+	unsigned int line;
+
+	for (line = 0; line < CFG_CHANNEL_MAX; line++) {
+		struct slic_dump_request *request = &slic_dump_reqs[line];
+
+		line_job_reply_shutdown(&request->reply, "dump",
+					dump_kind_names[request->kind],
+					line_dump_drop);
 	}
 }
 
@@ -1078,6 +1331,7 @@ static const struct ubus_method voice_methods_head[] = {
 	UBUS_METHOD_NOARG("stats_reset", voice_stats_reset),
 	UBUS_METHOD("line_test", voice_line_test, line_test_policy),
 	UBUS_METHOD("loop_test", voice_loop_test, loop_test_policy),
+	UBUS_METHOD("slic_dump", voice_slic_dump, slic_dump_policy),
 	UBUS_METHOD("stats_live", voice_stats_live, stats_live_policy),
 };
 
@@ -1407,6 +1661,7 @@ int uvoice_ubus_init(const char *socket_path)
 void uvoice_ubus_done(void)
 {
 	line_test_shutdown();
+	slic_dump_shutdown();
 	stats_live_shutdown();
 	ubus_connected = false;
 	ubus_auto_shutdown(&conn);

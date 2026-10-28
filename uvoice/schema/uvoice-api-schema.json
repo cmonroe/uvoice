@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "uvoice-api-schema.json",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "title": "uvoice ubus API",
   "description": "Every ubus method the uvoiced daemon answers, on the voice, voice.trace, voice.calltrace and voice.stub objects (voice.stub exists on the UVOICE_HAL_STUB build only). The daemon emits no ubus events; method replies are the whole surface. The root validates one capture envelope {object, method, args, reply}; args may be absent for a NOARG method, reply may be absent for a call answered with a bare status code. Owning functions are cited per property.",
   "type": "object",
@@ -16,6 +16,7 @@
     { "$ref": "#/$defs/VoiceStatsLiveCall" },
     { "$ref": "#/$defs/VoiceLineTestCall" },
     { "$ref": "#/$defs/VoiceLoopTestCall" },
+    { "$ref": "#/$defs/VoiceSlicDumpCall" },
     { "$ref": "#/$defs/VoiceRegisterCall" },
     { "$ref": "#/$defs/VoiceUnregisterCall" },
     { "$ref": "#/$defs/VoiceSeizeCall" },
@@ -229,7 +230,8 @@
     "MediaStateWord": { "enum": ["absent", "pending", "present", "failed"], "description": "cdr.c media_state_names[]." },
     "LineTestWord": { "enum": ["gr909", "roh", "capacitance", "loop"], "description": "ubus.c line_test_names[]." },
     "LoopTestModeWord": { "enum": ["self", "cross"], "description": "ubus.c loop_test_mode_get(): the two words the loop test surface takes. The reply carries a third, off, for a board that runs no mode." },
-    "HalFeatureWord": { "enum": ["g729", "g726", "t38", "vbd", "line_test", "polarity", "mwi_lamp", "metering", "kernel_rtp", "conf", "srtp", "wideband", "g729b", "ipv6_media", "rtcp_addr", "region_hook", "dtmf_relay", "dtmf_playout", "loop"], "description": "status.c feature_names[], bit-gated. g729b is narrower than g729 and never implies it: it says the backend's G.729 carries Annex B, which is what lets a leg advertise annexb=yes and arm the transmit DTX. ipv6_media says the backend carries a media stream whose addresses are IPv6, and stream_config_set refuses every IPv6 address without it. rtcp_addr says the backend connects the RTCP socket to the address the peer named in an RFC 3605 a=rtcp attribute. region_hook says the backend programs each line's hook windows from its own region data, so the core never pushes a window to it (libudsp); the stub takes the push. dtmf_relay says the backend relays a digit it detects on the phone as an RFC 4733 event itself, so the core sends none for a measured digit; dtmf_playout says the backend renders a telephone-event it receives toward the phone itself, so the core plays none for a wire digit (hal.h HAL_FEAT_DTMF_RELAY, HAL_FEAT_DTMF_PLAYOUT). loop says the backend plays a line the capture of a line, its own or another, a fixed delay later (hal.h line_loop_set), which is the audio path of the manufacturing loop test; the core reads the bit before it arms." },
+    "SlicDumpKindWord": { "enum": ["reg", "ram_brief", "ram"], "description": "ubus.c dump_kind_names[]: reg is the direct registers, ram_brief the named RAM words that the SLIC driver chooses, and ram the whole RAM (hal.h enum hal_dump_kind)." },
+    "HalFeatureWord": { "enum": ["g729", "g726", "t38", "vbd", "line_test", "polarity", "mwi_lamp", "metering", "kernel_rtp", "conf", "srtp", "wideband", "g729b", "ipv6_media", "rtcp_addr", "region_hook", "dtmf_relay", "dtmf_playout", "loop", "slic_dump"], "description": "status.c feature_names[], bit-gated. g729b is narrower than g729 and never implies it: it says the backend's G.729 carries Annex B, which is what lets a leg advertise annexb=yes and arm the transmit DTX. ipv6_media says the backend carries a media stream whose addresses are IPv6, and stream_config_set refuses every IPv6 address without it. rtcp_addr says the backend connects the RTCP socket to the address the peer named in an RFC 3605 a=rtcp attribute. region_hook says the backend programs each line's hook windows from its own region data, so the core never pushes a window to it (libudsp); the stub takes the push. dtmf_relay says the backend relays a digit it detects on the phone as an RFC 4733 event itself, so the core sends none for a measured digit; dtmf_playout says the backend renders a telephone-event it receives toward the phone itself, so the core plays none for a wire digit (hal.h HAL_FEAT_DTMF_RELAY, HAL_FEAT_DTMF_PLAYOUT). loop says the backend plays a line the capture of a line, its own or another, a fixed delay later (hal.h line_loop_set), which is the audio path of the manufacturing loop test; the core reads the bit before it arms. slic_dump says the backend reads the registers and the RAM words of a line's SLIC on demand (hal.h line_dump_start), which is what voice slic_dump needs." },
     "HalCidFormatWord": { "enum": ["bellcore-fsk", "etsi-fsk", "etsi-rpas", "etsi-dtas", "dtmf", "ntt", "etsi-lr-dtas", "dtmf-dtas", "unknown"], "description": "hal.h hal_cid_format_name(): the eight enum hal_cid_format transports in the words the libudsp region grammar uses ([cid] format); unknown is the fallback." },
     "FlashServiceWord": { "enum": ["off", "split", "drop", "unknown"], "description": "hal.h hal_flash_service_name(): the region's hook flash policy ([hook] flash_service in the region file); unknown is the fallback." },
     "HalCodecWord": { "enum": ["pcmu", "pcma", "g729", "g726_32", "t38", "vbd_pcmu", "vbd_pcma", "g722", "opus"], "description": "status.c codec_names[], lower snake; a different spelling of the same codecs than sdp_codec_name()." },
@@ -774,7 +776,7 @@
         "oos": { "type": "boolean" },
         "fault": { "const": true, "description": "Present only while a SLIC fault holds the line out of service (line/line.c lines_status_dump()), so it rides beside oos true and nowhere else. A reload derives the config reasons again, and this one is not among them. Only the backend's clear record removes it, a fault code of 0." },
         "ringing": { "type": "boolean" },
-        "ring_held": { "const": true, "description": "Present only while a line test holds the bell back (line/line.c lines_status_dump(), fsm_ring_held()): the one state where the line reads as ringing and the phone is quiet." },
+        "ring_held": { "const": true, "description": "Present only while a line test or a SLIC dump holds the bell back (line/line.c lines_status_dump(), fsm_ring_held()): the one state where the line reads as ringing and the phone is quiet." },
         "call_waiting": { "type": "boolean", "description": "Effective value (proto/sip/features.c feature_cw_effective())." },
         "dnd": { "type": "boolean" },
         "cf_uncond": { "type": "string", "description": "Present iff armed; may be empty for a config that arms without a target (proto/sip/line.c cf_dump())." },
@@ -1203,6 +1205,33 @@
         "delay_ms": { "$ref": "#/$defs/U32" }
       },
       "required": ["enabled", "mode", "lines", "ring_s", "delay_ms"],
+      "additionalProperties": false
+    },
+
+    "SlicDumpArgs": {
+      "type": "object",
+      "description": "voice slic_dump (ubus.c voice_slic_dump()). Both keys are required; an unknown kind word and a line at or past CFG_CHANNEL_MAX answer Invalid argument.",
+      "properties": {
+        "line": { "$ref": "#/$defs/U32", "description": "0-based line index." },
+        "kind": { "$ref": "#/$defs/SlicDumpKindWord" }
+      },
+      "required": ["line", "kind"],
+      "additionalProperties": false
+    },
+
+    "SlicDumpReply": {
+      "type": "object",
+      "description": "The deferred body of voice slic_dump (ubus.c slic_dump_request_done(), slic_dump_render()). addr and value are parallel arrays of count entries in ascending address order: entry i of value is the word at entry i of addr. skipped lists the addresses inside the range of the kind that the backend did not read, because a read changes the part. The daemon decodes no value.",
+      "properties": {
+        "line": { "$ref": "#/$defs/U32" },
+        "kind": { "$ref": "#/$defs/SlicDumpKindWord" },
+        "width": { "$ref": "#/$defs/U32", "description": "The bits of a value: 8 for a register, 29 for a RAM word." },
+        "count": { "$ref": "#/$defs/U32", "description": "The entries of addr and of value, at most 2048 (hal.h HAL_SLIC_DUMP_WORDS)." },
+        "skipped": { "type": "array", "items": { "$ref": "#/$defs/U32" }, "maxItems": 8, "description": "The addresses the backend skipped, at most 8 (hal.h HAL_SLIC_DUMP_SKIP_MAX)." },
+        "addr": { "type": "array", "items": { "$ref": "#/$defs/U32" }, "maxItems": 2048 },
+        "value": { "type": "array", "items": { "$ref": "#/$defs/U32" }, "maxItems": 2048 }
+      },
+      "required": ["line", "kind", "width", "count", "skipped", "addr", "value"],
       "additionalProperties": false
     },
 
@@ -2113,6 +2142,17 @@
         "method": { "const": "loop_test" },
         "args": { "$ref": "#/$defs/LoopTestArgs" },
         "reply": { "$ref": "#/$defs/LoopTestReply" }
+      },
+      "required": ["object", "method"],
+      "additionalProperties": false
+    },
+    "VoiceSlicDumpCall": {
+      "type": "object",
+      "properties": {
+        "object": { "const": "voice" },
+        "method": { "const": "slic_dump" },
+        "args": { "$ref": "#/$defs/SlicDumpArgs" },
+        "reply": { "$ref": "#/$defs/SlicDumpReply" }
       },
       "required": ["object", "method"],
       "additionalProperties": false

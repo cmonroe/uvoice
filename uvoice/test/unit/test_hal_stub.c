@@ -957,6 +957,175 @@ static void test_loop_exclusion(void)
 	probe_close(&p);
 }
 
+/* One dump that completes: the start, the completion on the loop, and the
+ * record read back. */
+static enum hal_status dump_complete(struct probe *p, unsigned int line,
+				     enum hal_dump_kind kind,
+				     struct hal_slic_dump *rec)
+{
+	struct hal_job job = { 0 };
+	enum hal_status st;
+
+	st = hal_backend_ops.line_dump_start(p->h, line, kind, &job);
+	if (st != HAL_OK)
+		return st;
+
+	uloop_pump(STUB_JOB_WAIT_MS);
+	if (!ev_drain_has(p, HAL_EVENT_JOB_DONE))
+		return HAL_TRANSIENT;
+
+	return hal_backend_ops.line_dump_result_get(p->h, line, rec);
+}
+
+/*
+ * The SLIC dump of the stub. It fills the pattern of the libudsp fake SLIC at
+ * a start and publishes it at its completion, so its getter answers nothing
+ * in between. A newer dump replaces a record of the other line. The refusals
+ * are those of hal.h: a loop, a line test or another dump holds the part.
+ * UVOICE_STUB_SLIC_DUMP injects two refusals: a busy part and a dead line.
+ */
+static void test_slic_dump(void)
+{
+	const enum hal_dump_kind bad_kind =
+		(enum hal_dump_kind)(HAL_DUMP_RAM + 1);
+	static struct hal_slic_dump rec;
+	const struct hal_cap *cap;
+	struct hal_job test_job = { 0 };
+	struct hal_job other = { 0 };
+	struct hal_job job = { 0 };
+	struct hal_loop loop;
+	unsigned int i;
+	struct probe p;
+
+	if (!probe_open(&p)) {
+		CASE("the dump case needs an open backend");
+		CHECK(false);
+		return;
+	}
+
+	cap = hal_backend_ops.cap_get(p.h);
+	unsetenv("UVOICE_STUB_SLIC_DUMP");
+
+	CASE("the backend carries the dump feature and both ops");
+	CHECK((cap->features & HAL_FEAT_SLIC_DUMP) != 0);
+	CHECK(hal_backend_ops.line_dump_start != NULL);
+	CHECK(hal_backend_ops.line_dump_result_get != NULL);
+
+	CASE("a result read before any dump answers unsupported");
+	memset(&rec, 0xa5, sizeof(rec));
+	CHECK(hal_backend_ops.line_dump_result_get(p.h, 1, &rec) ==
+	      HAL_UNSUPPORTED);
+	CHECK_UINT(rec.count, 0xa5a5);
+
+	CASE("a register dump answers nothing until its completion");
+	CHECK(hal_backend_ops.line_dump_start(p.h, 1, HAL_DUMP_REG, &job) ==
+	      HAL_OK);
+	CHECK(job.token != 0);
+	CHECK(hal_backend_ops.line_dump_result_get(p.h, 1, &rec) ==
+	      HAL_UNSUPPORTED);
+
+	CASE("a second dump while one is pending answers transient");
+	CHECK(hal_backend_ops.line_dump_start(p.h, 0, HAL_DUMP_RAM, &other) ==
+	      HAL_TRANSIENT);
+	CHECK_UINT(other.token, 0);
+
+	CASE("a line test while a dump is pending answers transient");
+	CHECK(hal_backend_ops.line_test_start(p.h, 0, HAL_LINE_TEST_GR909,
+					      &test_job) == HAL_TRANSIENT);
+
+	CASE("the completed register dump carries the pattern of its line");
+	uloop_pump(STUB_JOB_WAIT_MS);
+	CHECK(ev_drain_has(&p, HAL_EVENT_JOB_DONE));
+	CHECK(hal_backend_ops.line_dump_result_get(p.h, 1, &rec) == HAL_OK);
+	CHECK_UINT(rec.kind, HAL_DUMP_REG);
+	CHECK_UINT(rec.line, 1);
+	CHECK_UINT(rec.width, 8);
+	CHECK_UINT(rec.count, 124);
+	CHECK_UINT(rec.skipped, 4);
+	CHECK_UINT(rec.skip[0], 18);
+	CHECK_UINT(rec.skip[3], 21);
+	CHECK_UINT(rec.addr[17], 17);
+	CHECK_UINT(rec.addr[18], 22);
+	CHECK_UINT(rec.addr[123], 127);
+	CHECK_UINT(rec.value[18], 22 ^ (1 << 4));
+
+	CASE("the record belongs to its line alone");
+	CHECK(hal_backend_ops.line_dump_result_get(p.h, 0, &rec) ==
+	      HAL_UNSUPPORTED);
+
+	CASE("a RAM dump reads 0 to 1644 less the patch data port");
+	CHECK(dump_complete(&p, 0, HAL_DUMP_RAM, &rec) == HAL_OK);
+	CHECK_UINT(rec.kind, HAL_DUMP_RAM);
+	CHECK_UINT(rec.width, 29);
+	CHECK_UINT(rec.count, 1644);
+	CHECK_UINT(rec.skipped, 1);
+	CHECK_UINT(rec.skip[0], 1359);
+	CHECK_UINT(rec.addr[1358], 1358);
+	CHECK_UINT(rec.addr[1359], 1360);
+	CHECK_UINT(rec.addr[1643], 1644);
+	CHECK_UINT(rec.value[1643], 1644u << 13);
+
+	CASE("and the register record of the other line is gone");
+	CHECK(hal_backend_ops.line_dump_result_get(p.h, 1, &rec) ==
+	      HAL_UNSUPPORTED);
+
+	CASE("a brief RAM dump lists the eleven named words and skips none");
+	CHECK(dump_complete(&p, 1, HAL_DUMP_RAM_BRIEF, &rec) == HAL_OK);
+	CHECK_UINT(rec.kind, HAL_DUMP_RAM_BRIEF);
+	CHECK_UINT(rec.width, 29);
+	CHECK_UINT(rec.count, 11);
+	CHECK_UINT(rec.skipped, 0);
+	CHECK_UINT(rec.addr[0], 3);
+	CHECK_UINT(rec.addr[9], 1538);
+	CHECK_UINT(rec.addr[10], 1551);
+	CHECK_UINT(rec.value[9], (1538u << 13) | 1u);
+	for (i = 1; i < rec.count; i++)
+		CHECK(rec.addr[i] > rec.addr[i - 1]);
+
+	CASE("a start while a line test job is pending answers transient");
+	memset(&test_job, 0, sizeof(test_job));
+	CHECK(hal_backend_ops.line_test_start(p.h, 0, HAL_LINE_TEST_ROH,
+					      &test_job) == HAL_OK);
+	memset(&job, 0, sizeof(job));
+	CHECK(hal_backend_ops.line_dump_start(p.h, 1, HAL_DUMP_REG, &job) ==
+	      HAL_TRANSIENT);
+	CHECK_UINT(job.token, 0);
+	uloop_pump(STUB_JOB_WAIT_MS);
+	CHECK(dump_complete(&p, 1, HAL_DUMP_REG, &rec) == HAL_OK);
+
+	CASE("an armed loop refuses a dump on its line and not on the other");
+	memset(&loop, 0, sizeof(loop));
+	loop.mode = HAL_LOOP_SELF;
+	CHECK(hal_backend_ops.line_loop_set(p.h, 0, &loop) == HAL_OK);
+	CHECK(hal_backend_ops.line_dump_start(p.h, 0, HAL_DUMP_REG, &job) ==
+	      HAL_TRANSIENT);
+	CHECK(dump_complete(&p, 1, HAL_DUMP_REG, &rec) == HAL_OK);
+	loop.mode = HAL_LOOP_OFF;
+	CHECK(hal_backend_ops.line_loop_set(p.h, 0, &loop) == HAL_OK);
+
+	CASE("a line outside the cap and a kind above RAM are refused");
+	CHECK(hal_backend_ops.line_dump_start(p.h, cap->lines, HAL_DUMP_REG,
+					      &job) == HAL_FATAL);
+	CHECK(hal_backend_ops.line_dump_start(p.h, 0, bad_kind, &job) ==
+	      HAL_FATAL);
+
+	CASE("the fatal shape refuses every start");
+	setenv("UVOICE_STUB_SLIC_DUMP", "fatal", 1);
+	CHECK(hal_backend_ops.line_dump_start(p.h, 0, HAL_DUMP_REG, &job) ==
+	      HAL_FATAL);
+	CHECK(hal_backend_ops.line_dump_start(p.h, 0, HAL_DUMP_REG, &job) ==
+	      HAL_FATAL);
+
+	CASE("the transient_once shape refuses the first start alone");
+	setenv("UVOICE_STUB_SLIC_DUMP", "transient_once", 1);
+	CHECK(hal_backend_ops.line_dump_start(p.h, 0, HAL_DUMP_REG, &job) ==
+	      HAL_TRANSIENT);
+	CHECK(dump_complete(&p, 0, HAL_DUMP_REG, &rec) == HAL_OK);
+	unsetenv("UVOICE_STUB_SLIC_DUMP");
+
+	probe_close(&p);
+}
+
 /*
  * The ring cap hook. UVOICE_STUB_RING_CAP_MS shortens only the timer, so a
  * suite can watch a 60 s ring end inside a pumped window. The record that the
@@ -1024,6 +1193,7 @@ int main(void)
 	test_debug_and_diag();
 	test_loop_set();
 	test_loop_exclusion();
+	test_slic_dump();
 	test_ring_cap();
 
 	uloop_done();

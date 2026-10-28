@@ -171,6 +171,7 @@ enum hop_kind {
 	H_CONF,
 	H_DIGIT_PLAY,
 	H_LOOP,
+	H_DUMP,
 };
 
 struct hop {
@@ -362,11 +363,15 @@ static unsigned int ring_ok_count(void)
 	return n;
 }
 
+/* The stop answers a settable status, so a case can refuse it the way libudsp
+ * does while a dump runs. The answer is recorded in val. */
+static enum hal_status ring_stop_status = HAL_OK;
+
 static enum hal_status fake_ring_stop(struct hal *h, unsigned int line)
 {
-	hop_add(H_RING_STOP, line);
+	hop_add(H_RING_STOP, line)->val = ring_stop_status;
 
-	return HAL_OK;
+	return ring_stop_status;
 }
 
 /*
@@ -781,6 +786,44 @@ static enum hal_status fake_line_test_result(struct hal *h,
 	return HAL_OK;
 }
 
+/*
+ * The SLIC dump, a slow op like the line test: the start is recorded with its
+ * kind in val and answers a token, and the record is read back with the fast
+ * result op after the case dispatches the completion. Both answers are
+ * settable, and so is the record, so a case reaches every result of the shell.
+ */
+static enum hal_status dump_start_status = HAL_OK;
+static enum hal_status dump_result_status = HAL_OK;
+static struct hal_slic_dump fake_dump;
+static uint32_t dump_token;
+
+static enum hal_status fake_dump_start(struct hal *h, unsigned int line,
+				       enum hal_dump_kind kind,
+				       struct hal_job *job)
+{
+	hop_add(H_DUMP, line)->val = kind;
+	if (dump_start_status != HAL_OK)
+		return dump_start_status;
+
+	/* a backend records the kind it read; a case that wants another kind
+	 * writes it after the start */
+	fake_dump.kind = (uint8_t)kind;
+	job->token = ++dump_token;
+
+	return HAL_OK;
+}
+
+static enum hal_status fake_dump_result(struct hal *h, unsigned int line,
+					struct hal_slic_dump *out)
+{
+	if (dump_result_status != HAL_OK)
+		return dump_result_status;
+
+	*out = fake_dump;
+
+	return HAL_OK;
+}
+
 /* the country tone table load: what it was asked for and how it answers */
 static char region_seen[8];
 static unsigned int region_calls;
@@ -1012,6 +1055,8 @@ const struct hal_ops hal_backend_ops = {
 	.line_test_result_get = fake_line_test_result,
 	.conf_set = fake_conf_set,
 	.line_loop_set = fake_loop_set,
+	.line_dump_start = fake_dump_start,
+	.line_dump_result_get = fake_dump_result,
 };
 
 /*
@@ -2584,8 +2629,12 @@ static void fixture_start(void)
 	line_test_result_status = HAL_OK;
 	line_test_record_len = 0;
 	memset(line_test_record, 0, sizeof(line_test_record));
+	dump_start_status = HAL_OK;
+	dump_result_status = HAL_OK;
+	memset(&fake_dump, 0, sizeof(fake_dump));
 	ring_start_status = HAL_OK;
 	ring_start_fail_n = 0;
+	ring_stop_status = HAL_OK;
 	loop_set_status = HAL_OK;
 	loop_set_fail_n = 0;
 	hops_reset();
@@ -13541,6 +13590,48 @@ static void t_line_test(void)
 	CHECK_UINT(answer.calls, 0);
 }
 
+/* What the consumer of one dump got. The record is copied, because the one the
+ * shell hands over is valid during the callback alone. */
+struct line_dump_answer {
+	enum line_dump_result_status status;
+	struct hal_slic_dump rec;
+	bool has_rec;
+	void *priv;
+	unsigned int calls;
+};
+
+static struct line_dump_answer dump_answer;
+
+static void line_dump_answer_take(void *priv,
+				  enum line_dump_result_status status,
+				  const struct hal_slic_dump *rec)
+{
+	struct line_dump_answer *answer = priv;
+
+	answer->status = status;
+	answer->priv = priv;
+	answer->calls++;
+	answer->has_rec = rec != NULL;
+	if (rec)
+		answer->rec = *rec;
+}
+
+static enum line_dump_query_status dump_ask(unsigned int line,
+					    enum hal_dump_kind kind)
+{
+	return line_dump_query(line, kind, line_dump_answer_take, &dump_answer);
+}
+
+/* fixture_start() with the dump bit beside the bits every fixture carries. */
+static void dump_fixture_start(void)
+{
+	fake_features_extra = HAL_FEAT_SLIC_DUMP;
+	fixture_start();
+	fake_features_extra = 0;
+	region_ready();
+	memset(&dump_answer, 0, sizeof(dump_answer));
+}
+
 /* ------------------------------------------------------------ the held bell */
 
 /*
@@ -13577,6 +13668,7 @@ static void t_line_test(void)
 static void t_ring_hold(void)
 {
 	struct line_test_answer answer = {};
+	unsigned int stops;
 	struct line_view v;
 	struct hop *r;
 
@@ -13612,6 +13704,186 @@ static void t_ring_hold(void)
 	view_get(1, &v);
 	CHECK(v.ringing);
 	CHECK(!v.ring_held);
+
+	/* libudsp answers a ring transient while a dump holds the slic
+	 * thread, the answer a line test gets */
+	CASE("a ring during a dump is held and replays at the completion");
+	cfg_default();
+	cfg.channel[1].enabled = true;
+	dump_fixture_start();
+	CHECK_UINT(dump_ask(0, HAL_DUMP_RAM), LINE_DUMP_QUERY_OK);
+	hops_reset();
+	ring_start_status = HAL_TRANSIENT;
+	ring_start_fail_n = 1;
+	inject_incoming(1, 0, "5551000", "Alice", 0);
+	CHECK(state_is(1, "RINGING"));
+	CHECK_UINT(ring_ok_count(), 0);
+	view_get(1, &v);
+	CHECK(v.ring_held);
+	uloop_pump(RING_HOLD_PUMP_MS);
+	CHECK_UINT(hop_count(H_RING_START), 1);
+	job_complete(HAL_OK);
+	CHECK_UINT(dump_answer.status, LINE_DUMP_RESULT_COMPLETE);
+	CHECK_UINT(ring_ok_count(), 1);
+	CHECK(strcmp(hop_last(H_RING_START)->ring.cid.number, "5551000") == 0);
+	view_get(1, &v);
+	CHECK(v.ringing);
+	CHECK(!v.ring_held);
+
+	CASE("a ring held by a dump rings when the dump runs out of budget");
+	cfg_default();
+	cfg.channel[1].enabled = true;
+	dump_fixture_start();
+	CHECK_UINT(dump_ask(0, HAL_DUMP_RAM), LINE_DUMP_QUERY_OK);
+	hops_reset();
+	ring_start_status = HAL_TRANSIENT;
+	ring_start_fail_n = 1;
+	inject_incoming(1, 0, "5551000", "Alice", 0);
+	view_get(1, &v);
+	CHECK(v.ring_held);
+	job_timeout();
+	CHECK_UINT(dump_answer.status, LINE_DUMP_RESULT_TIMEOUT);
+	CHECK_UINT(ring_ok_count(), 1);
+	view_get(1, &v);
+	CHECK(!v.ring_held);
+
+	CASE("a ring held by a dump rings when the dump is dropped");
+	cfg_default();
+	cfg.channel[1].enabled = true;
+	dump_fixture_start();
+	CHECK_UINT(dump_ask(0, HAL_DUMP_RAM), LINE_DUMP_QUERY_OK);
+	hops_reset();
+	ring_start_status = HAL_TRANSIENT;
+	ring_start_fail_n = 1;
+	inject_incoming(1, 0, "5551000", "Alice", 0);
+	view_get(1, &v);
+	CHECK(v.ring_held);
+	line_dump_drop(0);
+	CHECK_UINT(dump_answer.calls, 0);
+	CHECK_UINT(ring_ok_count(), 1);
+	view_get(1, &v);
+	CHECK(!v.ring_held);
+
+	/* libudsp answers the stop transient as well, and a bell that is
+	 * already ringing would ring on after the call ended */
+	CASE("a ring stop during a dump is held and issued at the completion");
+	cfg_default();
+	cfg.channel[1].enabled = true;
+	dump_fixture_start();
+	inject_incoming(1, 0, "5551000", "Alice", 0);
+	CHECK_UINT(ring_ok_count(), 1);
+	CHECK_UINT(dump_ask(0, HAL_DUMP_RAM), LINE_DUMP_QUERY_OK);
+	hops_reset();
+	ring_stop_status = HAL_TRANSIENT;
+	rec_cb.remote_cancel(1, 0);
+	CHECK(state_is(1, "IDLE"));
+	CHECK(hop_has(H_RING_STOP));
+	CHECK_UINT(hop_last(H_RING_STOP)->val, HAL_TRANSIENT);
+	ring_stop_status = HAL_OK;
+	stops = hop_count(H_RING_STOP);
+	/* the hold waits for the dump and arms no timer of its own */
+	uloop_pump(RING_HOLD_PUMP_MS);
+	CHECK_UINT(hop_count(H_RING_STOP), stops);
+	job_complete(HAL_OK);
+	CHECK_UINT(hop_count(H_RING_STOP), stops + 1);
+	CHECK_UINT(hop_last(H_RING_STOP)->line, 1);
+	CHECK_UINT(hop_last(H_RING_STOP)->val, HAL_OK);
+	CHECK_UINT(ring_ok_count(), 0);
+
+	CASE("a held stop the backend still refuses is asked again until it "
+	     "lands");
+	cfg_default();
+	cfg.channel[1].enabled = true;
+	dump_fixture_start();
+	inject_incoming(1, 0, "5551000", "Alice", 0);
+	CHECK_UINT(dump_ask(0, HAL_DUMP_RAM), LINE_DUMP_QUERY_OK);
+	hops_reset();
+	ring_stop_status = HAL_TRANSIENT;
+	rec_cb.remote_cancel(1, 0);
+	stops = hop_count(H_RING_STOP);
+	/* the budget ran out while the part still read, so the re-issue of
+	 * the stop is refused too and the hold has to outlive that refusal */
+	job_timeout();
+	CHECK_UINT(hop_count(H_RING_STOP), stops + 1);
+	ring_stop_status = HAL_OK;
+	uloop_pump(RING_HOLD_PUMP_MS);
+	CHECK_UINT(hop_count(H_RING_STOP), stops + 2);
+	CHECK_UINT(hop_last(H_RING_STOP)->val, HAL_OK);
+	uloop_pump(RING_HOLD_PUMP_MS);
+	CHECK_UINT(hop_count(H_RING_STOP), stops + 2);
+
+	CASE("a bell that lands outranks a stop held from the call before");
+	cfg_default();
+	cfg.channel[1].enabled = true;
+	dump_fixture_start();
+	inject_incoming(1, 0, "5551000", "Alice", 0);
+	CHECK_UINT(dump_ask(0, HAL_DUMP_RAM), LINE_DUMP_QUERY_OK);
+	ring_stop_status = HAL_TRANSIENT;
+	rec_cb.remote_cancel(1, 0);
+	job_timeout();
+	hops_reset();
+	inject_incoming(1, 0, "5552000", "Bob", 0);
+	CHECK_UINT(ring_ok_count(), 1);
+	CHECK(hop_has(H_RING_STOP));
+	CHECK(hop_index(H_RING_STOP) < hop_index(H_RING_START));
+	stops = hop_count(H_RING_STOP);
+	ring_stop_status = HAL_OK;
+	uloop_pump(RING_HOLD_PUMP_MS);
+	CHECK_UINT(hop_count(H_RING_STOP), stops);
+	view_get(1, &v);
+	CHECK(v.ringing);
+
+	CASE("a held stop and a held bell on one line go out stop first at "
+	     "one completion");
+	cfg_default();
+	cfg.channel[1].enabled = true;
+	dump_fixture_start();
+	inject_incoming(1, 0, "5551000", "Alice", 0);
+	CHECK_UINT(dump_ask(0, HAL_DUMP_RAM), LINE_DUMP_QUERY_OK);
+	ring_stop_status = HAL_TRANSIENT;
+	rec_cb.remote_cancel(1, 0);
+	ring_start_status = HAL_TRANSIENT;
+	ring_start_fail_n = 1;
+	inject_incoming(1, 0, "5552000", "Bob", 0);
+	view_get(1, &v);
+	CHECK(v.ring_held);
+	ring_stop_status = HAL_OK;
+	hops_reset();
+	job_complete(HAL_OK);
+	CHECK_UINT(hop_count(H_RING_STOP), 1);
+	CHECK_UINT(hop_last(H_RING_STOP)->val, HAL_OK);
+	CHECK_UINT(ring_ok_count(), 1);
+	CHECK(hop_index(H_RING_STOP) < hop_index(H_RING_START));
+	CHECK(strcmp(hop_last(H_RING_START)->ring.cid.number, "5552000") == 0);
+
+	/* the shell runs two line tests on two lines side by side, and the
+	 * fake keeps the second job as its pending one */
+	CASE("a hold that outlives a second job goes out at the release of "
+	     "that job and not before");
+	cfg_default();
+	cfg.channel[1].enabled = true;
+	fixture_start();
+	region_ready();
+	CHECK_UINT(line_test_query(0, HAL_LINE_TEST_GR909,
+				   line_test_answer_take, &answer),
+		   LINE_TEST_QUERY_OK);
+	CHECK_UINT(line_test_query(1, HAL_LINE_TEST_ROH,
+				   line_test_answer_take, &answer),
+		   LINE_TEST_QUERY_OK);
+	ring_start_status = HAL_TRANSIENT;
+	ring_start_fail_n = 1;
+	inject_incoming(1, 0, "5551000", "Alice", 0);
+	ring_stop_status = HAL_TRANSIENT;
+	rec_cb.remote_cancel(1, 0);
+	ring_stop_status = HAL_OK;
+	stops = hop_count(H_RING_STOP);
+	line_test_drop(0);
+	uloop_pump(RING_HOLD_PUMP_MS);
+	CHECK_UINT(hop_count(H_RING_STOP), stops);
+	job_complete(HAL_OK);
+	CHECK_UINT(hop_count(H_RING_STOP), stops + 1);
+	CHECK_UINT(hop_last(H_RING_STOP)->line, 1);
+	CHECK_UINT(hop_last(H_RING_STOP)->val, HAL_OK);
 
 	CASE("a held ring is dropped when the call ends before the test "
 	     "completes");
@@ -16868,6 +17140,19 @@ static void t_hook_resync(void)
 	uloop_pump(RESYNC_POSTPONE_PUMP_MS);
 	CHECK_UINT(hook_query_calls[0], 1);
 
+	/* a dump stalls the hook sample of every port, as a line test does */
+	CASE("a SLIC dump postpones the whole pass");
+	cfg_default();
+	dump_fixture_start();
+	CHECK_UINT(dump_ask(1, HAL_DUMP_RAM), LINE_DUMP_QUERY_OK);
+	memset(hook_query_calls, 0, sizeof(hook_query_calls));
+	gap_report();
+	uloop_pump(RESYNC_PASS_PUMP_MS);
+	CHECK_UINT(hook_query_calls[0], 0);
+	job_complete(HAL_OK);
+	uloop_pump(RESYNC_POSTPONE_PUMP_MS);
+	CHECK_UINT(hook_query_calls[0], 1);
+
 	/* The pass the first gap asked for reads the same hardware. A pump that
 	 * is already in trouble must not be asked once per lost record. */
 	CASE("a second gap inside the rate limit starts no second pass");
@@ -17503,6 +17788,272 @@ static void t_loop_test(void)
 				   line_test_answer_take, &answer),
 		   LINE_TEST_QUERY_OK);
 	line_test_drop(0);
+}
+
+/*
+ * The SLIC dump query of the shell (line/line.h line_dump_query). It runs the
+ * checks of the line test without its call predicate, so a call refuses no
+ * dump. One dump runs at a time, because a backend keeps one record. A
+ * metallic line test and the loop test each hold the part, and a dump refuses
+ * both in turn. Each completion of a backend reaches its consumer as its own
+ * result. The shell holds a polarity restore that a dump refuses, as it holds
+ * a bell and a stop (t_ring_hold()).
+ */
+static void t_slic_dump(void)
+{
+	struct line_test_answer answer = {};
+	struct hal_job *dump_job;
+	struct line_view v;
+
+	cfg_default();
+	dump_fixture_start();
+
+	CASE("a dump rejects a bad index, a kind above RAM and no consumer");
+	CHECK_UINT(dump_ask(CFG_CHANNEL_MAX, HAL_DUMP_REG),
+		   LINE_DUMP_QUERY_BAD_ARGUMENT);
+	CHECK_UINT(dump_ask(0, (enum hal_dump_kind)(HAL_DUMP_RAM + 1)),
+		   LINE_DUMP_QUERY_BAD_ARGUMENT);
+	CHECK_UINT(line_dump_query(0, HAL_DUMP_REG, NULL, &dump_answer),
+		   LINE_DUMP_QUERY_BAD_ARGUMENT);
+	CHECK(!hop_has(H_DUMP));
+
+	CASE("a line absent from the configuration rejects a dump");
+	cfg.channel[0].present = false;
+	CHECK_UINT(dump_ask(0, HAL_DUMP_REG), LINE_DUMP_QUERY_NO_LINE);
+	cfg.channel[0].present = true;
+
+	CASE("a port the board does not carry is a bad argument for a dump");
+	fake_cap.lines = 1;
+	CHECK_UINT(dump_ask(1, HAL_DUMP_REG), LINE_DUMP_QUERY_BAD_ARGUMENT);
+	fake_cap.lines = 2;
+
+	CASE("a dsp that is not ready rejects a dump");
+	uv.hal_state = UVOICE_HAL_STARTING;
+	CHECK_UINT(dump_ask(0, HAL_DUMP_REG), LINE_DUMP_QUERY_NOT_UP);
+	uv.hal_state = UVOICE_HAL_READY;
+
+	CASE("a backend without the dump bit rejects a dump as unsupported");
+	fake_cap.features &= ~(uint32_t)HAL_FEAT_SLIC_DUMP;
+	CHECK_UINT(dump_ask(0, HAL_DUMP_REG), LINE_DUMP_QUERY_UNSUPPORTED);
+	CHECK(!hop_has(H_DUMP));
+	fake_cap.features |= HAL_FEAT_SLIC_DUMP;
+
+	CASE("the refusals of the backend map onto the query");
+	dump_start_status = HAL_UNSUPPORTED;
+	CHECK_UINT(dump_ask(0, HAL_DUMP_REG), LINE_DUMP_QUERY_UNSUPPORTED);
+	dump_start_status = HAL_TRANSIENT;
+	CHECK_UINT(dump_ask(0, HAL_DUMP_REG), LINE_DUMP_QUERY_BUSY);
+	dump_start_status = HAL_FATAL;
+	CHECK_UINT(dump_ask(0, HAL_DUMP_REG), LINE_DUMP_QUERY_REFUSED);
+	dump_start_status = HAL_OK;
+	CHECK(job_pending == NULL);
+
+	CASE("an accepted dump reaches the backend with its kind and budget");
+	hops_reset();
+	CHECK_UINT(dump_ask(0, HAL_DUMP_RAM), LINE_DUMP_QUERY_OK);
+	CHECK_UINT(hop_count(H_DUMP), 1);
+	CHECK_UINT(hop_find(H_DUMP)->val, HAL_DUMP_RAM);
+	CHECK(job_pending != NULL);
+	CHECK_UINT(job_pending ? job_pending->budget_ms : 0, LINE_DUMP_JOB_MS);
+
+	CASE("a dump on the other line is pending until the first completes");
+	CHECK_UINT(dump_ask(1, HAL_DUMP_REG), LINE_DUMP_QUERY_PENDING);
+	CHECK_UINT(hop_count(H_DUMP), 1);
+
+	CASE("a line test is refused while a dump is busy");
+	CHECK_UINT(line_test_query(1, HAL_LINE_TEST_ROH,
+				   line_test_answer_take, &answer),
+		   LINE_TEST_QUERY_CALL_ACTIVE);
+	CHECK(!hop_has(H_LINE_TEST));
+
+	CASE("a loop arm is refused as a running test while a dump is busy");
+	CHECK_UINT(loop_arm(false), LINE_LOOP_TEST_TEST_RUNNING);
+	CHECK(!hop_has(H_LOOP));
+
+	CASE("a disarm while a dump is busy changes nothing and answers OK");
+	CHECK_UINT(loop_disarm(), LINE_LOOP_TEST_OK);
+	CHECK(!hop_has(H_LOOP));
+
+	CASE("a completion hands the record over and frees the slot");
+	fake_dump.kind = HAL_DUMP_RAM;
+	fake_dump.width = 29;
+	fake_dump.count = 2;
+	fake_dump.addr[1] = 1538;
+	fake_dump.value[1] = 0x00400000;
+	job_complete(HAL_OK);
+	CHECK_UINT(dump_answer.calls, 1);
+	CHECK_UINT(dump_answer.status, LINE_DUMP_RESULT_COMPLETE);
+	CHECK(dump_answer.priv == &dump_answer);
+	CHECK(dump_answer.has_rec);
+	CHECK_UINT(dump_answer.rec.count, 2);
+	CHECK_UINT(dump_answer.rec.addr[1], 1538);
+	CHECK_UINT(dump_answer.rec.value[1], 0x00400000);
+	CHECK_UINT(dump_ask(1, HAL_DUMP_REG), LINE_DUMP_QUERY_OK);
+
+	CASE("each completion without a record reaches the consumer");
+	job_complete(HAL_TRANSIENT);
+	CHECK_UINT(dump_answer.status, LINE_DUMP_RESULT_BUSY);
+	CHECK(!dump_answer.has_rec);
+	CHECK_UINT(dump_ask(1, HAL_DUMP_REG), LINE_DUMP_QUERY_OK);
+	job_complete(HAL_UNSUPPORTED);
+	CHECK_UINT(dump_answer.status, LINE_DUMP_RESULT_UNSUPPORTED);
+	CHECK_UINT(dump_ask(1, HAL_DUMP_REG), LINE_DUMP_QUERY_OK);
+	job_complete(HAL_FATAL);
+	CHECK_UINT(dump_answer.status, LINE_DUMP_RESULT_FATAL);
+	CHECK_UINT(dump_ask(1, HAL_DUMP_REG), LINE_DUMP_QUERY_OK);
+	job_timeout();
+	CHECK_UINT(dump_answer.status, LINE_DUMP_RESULT_TIMEOUT);
+	CHECK(!dump_answer.has_rec);
+	CHECK_UINT(dump_answer.calls, 5);
+
+	CASE("a record the backend cannot hand over is unreadable");
+	dump_result_status = HAL_UNSUPPORTED;
+	CHECK_UINT(dump_ask(0, HAL_DUMP_REG), LINE_DUMP_QUERY_OK);
+	job_complete(HAL_OK);
+	CHECK_UINT(dump_answer.status, LINE_DUMP_RESULT_UNREADABLE);
+	CHECK(!dump_answer.has_rec);
+	dump_result_status = HAL_OK;
+
+	CASE("a record whose counts pass its arrays is unreadable");
+	fake_dump.count = HAL_SLIC_DUMP_WORDS + 1;
+	CHECK_UINT(dump_ask(0, HAL_DUMP_REG), LINE_DUMP_QUERY_OK);
+	job_complete(HAL_OK);
+	CHECK_UINT(dump_answer.status, LINE_DUMP_RESULT_UNREADABLE);
+	fake_dump.count = 2;
+	fake_dump.skipped = HAL_SLIC_DUMP_SKIP_MAX + 1;
+	CHECK_UINT(dump_ask(0, HAL_DUMP_REG), LINE_DUMP_QUERY_OK);
+	job_complete(HAL_OK);
+	CHECK_UINT(dump_answer.status, LINE_DUMP_RESULT_UNREADABLE);
+	fake_dump.skipped = 0;
+
+	/* the reply names the kind of the request, and a backend need not
+	 * check the record it hands over against it */
+	CASE("a record of another kind than the request is unreadable");
+	CHECK_UINT(dump_ask(0, HAL_DUMP_REG), LINE_DUMP_QUERY_OK);
+	fake_dump.kind = HAL_DUMP_RAM;
+	job_complete(HAL_OK);
+	CHECK_UINT(dump_answer.status, LINE_DUMP_RESULT_UNREADABLE);
+	CHECK(!dump_answer.has_rec);
+
+	CASE("a busy line test slot holds the part against a dump");
+	CHECK_UINT(line_test_query(0, HAL_LINE_TEST_ROH,
+				   line_test_answer_take, &answer),
+		   LINE_TEST_QUERY_OK);
+	hops_reset();
+	CHECK_UINT(dump_ask(1, HAL_DUMP_REG), LINE_DUMP_QUERY_HELD);
+	CHECK(!hop_has(H_DUMP));
+
+	CASE("a disarm while a line test is busy changes nothing and answers "
+	     "OK");
+	CHECK_UINT(loop_disarm(), LINE_LOOP_TEST_OK);
+	CHECK(!hop_has(H_LOOP));
+	line_test_drop(0);
+
+	CASE("the loop test holds the part against a dump");
+	CHECK_UINT(loop_arm(false), LINE_LOOP_TEST_OK);
+	hops_reset();
+	CHECK_UINT(dump_ask(0, HAL_DUMP_REG), LINE_DUMP_QUERY_HELD);
+	CHECK(!hop_has(H_DUMP));
+	CHECK_UINT(loop_disarm(), LINE_LOOP_TEST_OK);
+
+	CASE("a drop frees the slot without a callback");
+	memset(&dump_answer, 0, sizeof(dump_answer));
+	CHECK_UINT(dump_ask(0, HAL_DUMP_REG), LINE_DUMP_QUERY_OK);
+	line_dump_drop(0);
+	CHECK(job_pending == NULL);
+	CHECK_UINT(dump_answer.calls, 0);
+	CHECK_UINT(dump_ask(1, HAL_DUMP_REG), LINE_DUMP_QUERY_OK);
+	line_dump_drop(1);
+
+	CASE("a call on a line does not refuse a dump");
+	cfg_default();
+	cfg.channel[1].enabled = true;
+	dump_fixture_start();
+	inject_incoming(1, 0, "1001", "caller", 0);
+	CHECK(state_is(1, "RINGING"));
+	CHECK_UINT(dump_ask(1, HAL_DUMP_REG), LINE_DUMP_QUERY_OK);
+	line_dump_drop(1);
+
+	/* the region job of the bring-up takes the one pending place of the
+	 * fake, so the free slot is what shows the drop */
+	CASE("a re-init abandons a pending dump without a callback");
+	memset(&dump_answer, 0, sizeof(dump_answer));
+	CHECK_UINT(dump_ask(0, HAL_DUMP_REG), LINE_DUMP_QUERY_OK);
+	dump_job = job_pending;
+	lines_bring_up();
+	CHECK(dump_job && job_pending && job_pending->cb != dump_job->cb);
+	CHECK_UINT(dump_answer.calls, 0);
+	region_ready();
+	CHECK_UINT(dump_ask(1, HAL_DUMP_REG), LINE_DUMP_QUERY_OK);
+	line_dump_drop(1);
+
+	/* a far end clear reverses line 0, and libudsp refuses the restore
+	 * while the dump on line 1 reads the part */
+	CASE("a polarity restore during a dump is held and issued at the "
+	     "completion");
+	fd_cfg(FD_DELAY_MS, CFG_FWD_DISC_BATT_REVERSE);
+	fake_features_extra = HAL_FEAT_SLIC_DUMP;
+	fd_connect();
+	fake_features_extra = 0;
+	memset(&dump_answer, 0, sizeof(dump_answer));
+	inject_far_end_clear(0, 0);
+	CHECK_UINT(hop_last(H_POLARITY)->val, HAL_POL_REVERSE);
+	CHECK_UINT(dump_ask(1, HAL_DUMP_REG), LINE_DUMP_QUERY_OK);
+	hops_reset();
+	polarity_status = HAL_TRANSIENT;
+	uloop_pump(FD_DELAY_WAIT_MS);
+	CHECK_UINT(hop_count(H_POLARITY), 1);
+	CHECK_UINT(hop_last(H_POLARITY)->val, HAL_POL_FORWARD);
+	view_get(0, &v);
+	CHECK(!v.fwd_disc_reversed);
+	polarity_status = HAL_OK;
+	job_complete(HAL_OK);
+	CHECK_UINT(dump_answer.status, LINE_DUMP_RESULT_COMPLETE);
+	CHECK_UINT(hop_count(H_POLARITY), 2);
+	CHECK_UINT(hop_last(H_POLARITY)->line, 0);
+	CHECK_UINT(hop_last(H_POLARITY)->val, HAL_POL_FORWARD);
+
+	CASE("and the restore it issued is not asked again");
+	uloop_pump(RING_HOLD_PUMP_MS);
+	CHECK_UINT(hop_count(H_POLARITY), 2);
+
+	/* the on-hook restores the reversal at IDLE, and the budget runs out
+	 * while the part still reads, so the hold stands with no job left */
+	CASE("a reversal that lands while a restore is held ends the hold");
+	fd_cfg(600000, CFG_FWD_DISC_BATT_REVERSE);
+	fake_features_extra = HAL_FEAT_SLIC_DUMP;
+	fd_connect();
+	fake_features_extra = 0;
+	inject_far_end_clear(0, 0);
+	CHECK(polarity_seen(HAL_POL_REVERSE));
+	CHECK_UINT(dump_ask(1, HAL_DUMP_REG), LINE_DUMP_QUERY_OK);
+	polarity_status = HAL_TRANSIENT;
+	inject_hook(0, HAL_HOOK_RELEASE, 0);
+	CHECK(state_is(0, "IDLE"));
+	job_timeout();
+	polarity_status = HAL_OK;
+	inject_hook(0, HAL_HOOK_SEIZE, 0);
+	inject_digit(0, '5', false);
+	rec_cb.answered(0, 0);
+	hops_reset();
+	inject_far_end_clear(0, 0);
+	CHECK_UINT(hop_count(H_POLARITY), 1);
+	CHECK_UINT(hop_last(H_POLARITY)->val, HAL_POL_REVERSE);
+	uloop_pump(RING_HOLD_PUMP_MS);
+	CHECK(!polarity_seen(HAL_POL_FORWARD));
+	view_get(0, &v);
+	CHECK(v.fwd_disc_reversed);
+
+	CASE("lines_done abandons a pending dump without a callback");
+	memset(&dump_answer, 0, sizeof(dump_answer));
+	CHECK_UINT(dump_ask(0, HAL_DUMP_REG), LINE_DUMP_QUERY_OK);
+	lines_done();
+	lines_live = false;
+	CHECK(job_pending == NULL);
+	CHECK_UINT(dump_answer.calls, 0);
+
+	CASE("a dump rejects a line before the line shell is up");
+	CHECK_UINT(dump_ask(0, HAL_DUMP_REG), LINE_DUMP_QUERY_NOT_UP);
 }
 
 static void t_shutdown(void)
@@ -18540,6 +19091,7 @@ int main(void)
 	t_line_down();
 	t_line_down_abort();
 	t_loop_test();
+	t_slic_dump();
 	t_shutdown();
 
 	lines_stop();

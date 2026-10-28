@@ -15,10 +15,10 @@
  * digit, ten pulses are '0') before the event reaches the protocol, the HAL
  * tone, ring and caller id ops behind the host table, ring construction
  * (default 2 s on 4 s cadence, the Alert-Info Bellcore-dr patterns, type 1
- * CID), the hold of a ring a metallic line test refuses and its re-issue when
- * that test lets the part go, the call waiting alert (CALL_WAITING tone plus
- * type 2 CID), the message waiting store and its visual record, the forward
- * disconnect signal, the service state of every line, and the
+ * CID), the hold of a ring a metallic line test or a SLIC dump refuses and
+ * its re-issue when the part is free, the call waiting alert (CALL_WAITING
+ * tone plus type 2 CID), the message waiting store and its visual record, the
+ * forward disconnect signal, the service state of every line, and the
  * detector-before-dial-tone ordering: channel_config_set with the
  * HAL_DETECT_DTMF and HAL_DETECT_PULSE bits runs on seize before the dial
  * tone op, deferred by LINE_DIAL_TONE_DEFER_MS, 0 for the stub and 500 on
@@ -87,7 +87,7 @@ void line_hal_event(const struct hal_event *ev);
  *
  * A line out of service and a line inside a battery removal window are not
  * read at all. A line the loop test holds is out of service and so not read.
- * A metallic line test postpones the whole pass.
+ * A metallic line test or a SLIC dump postpones the whole pass.
  *
  * An off-hook answer on a machine that is on hook seizes at once. A ringing
  * line is the exception: the answer of the query inside a ring cadence is not
@@ -302,7 +302,9 @@ typedef void (*line_test_cb)(void *priv, enum line_test_result_status status,
 
 /*
  * Submit one metallic line test. A test blocks hook samples on every line,
- * so the caller refuses it while any line carries a call.
+ * so the shell answers CALL_ACTIVE while any line carries a call. It answers
+ * CALL_ACTIVE also while the loop test is armed or a dump is pending, because
+ * each holds the part.
  */
 enum line_test_query_status line_test_query(unsigned int line,
 					    enum hal_line_test test,
@@ -310,6 +312,61 @@ enum line_test_query_status line_test_query(unsigned int line,
 
 /* Abandon the accepted test on this line without calling its consumer. */
 void line_test_drop(unsigned int line);
+
+/* No bench measured the bus frame cost. At a pessimistic 0.5 ms per frame a
+ * dump of the whole RAM takes about 7 s, so the budget is about three times
+ * that and below HAL_JOB_TIMEOUT_MS. */
+#define LINE_DUMP_JOB_MS	20000
+
+/*
+ * PENDING is a dump on any line that has not completed yet, because the
+ * backend keeps one record for the board. HELD is a metallic line test or the
+ * loop test, each of which owns the part. BUSY is a backend that holds the
+ * part for a job of its own.
+ */
+enum line_dump_query_status {
+	LINE_DUMP_QUERY_OK = 0,
+	LINE_DUMP_QUERY_BAD_ARGUMENT,
+	LINE_DUMP_QUERY_NO_LINE,
+	LINE_DUMP_QUERY_NOT_UP,
+	LINE_DUMP_QUERY_PENDING,
+	LINE_DUMP_QUERY_HELD,
+	LINE_DUMP_QUERY_BUSY,
+	LINE_DUMP_QUERY_UNSUPPORTED,
+	LINE_DUMP_QUERY_REFUSED,
+};
+
+/* BUSY is a completion that left no record: the part was busy at the start of
+ * the read, a stop took the dump, or the read passed its deadline. */
+enum line_dump_result_status {
+	LINE_DUMP_RESULT_COMPLETE = 0,
+	LINE_DUMP_RESULT_BUSY,
+	LINE_DUMP_RESULT_UNSUPPORTED,
+	LINE_DUMP_RESULT_FATAL,
+	LINE_DUMP_RESULT_TIMEOUT,
+	LINE_DUMP_RESULT_UNREADABLE,
+};
+
+/*
+ * The callback runs once on the uloop thread for each accepted query. rec is
+ * valid only during the callback, and it is NULL unless status is COMPLETE.
+ */
+typedef void (*line_dump_cb)(void *priv, enum line_dump_result_status status,
+			     const struct hal_slic_dump *rec);
+
+/*
+ * Submit one SLIC dump (hal.h line_dump_start). A call on any line refuses no
+ * dump, because the dump writes nothing that the part keeps. While a dump is
+ * pending, the shell refuses a metallic line test and the loop test arm. It
+ * holds a ring start, a ring stop and a polarity restore that the backend
+ * refuses, and issues them when the slot of the dump is free.
+ */
+enum line_dump_query_status line_dump_query(unsigned int line,
+					    enum hal_dump_kind kind,
+					    line_dump_cb cb, void *priv);
+
+/* Abandon the accepted dump on this line without calling its consumer. */
+void line_dump_drop(unsigned int line);
 
 /*
  * The manufacturing loop test. It rings every port the board carries while
@@ -337,10 +394,10 @@ void line_test_drop(unsigned int line);
  * OK also answers a call that asks for the state the board already holds.
  * BAD_ARGUMENT is a window or a delay outside the bounds above. NO_LINE is a
  * daemon with no lines and no board port. NOT_READY is a DSP that is not
- * ready. UNSUPPORTED is a backend with no loop of its own. CALL_ACTIVE and
- * TEST_RUNNING are a call and a metallic line test, each of which owns the
- * ports the mode would take. REFUSED is a disarm the
- * backend answered transiently: the loop may still stand on a port, so the
+ * ready. UNSUPPORTED is a backend with no loop of its own. CALL_ACTIVE is a
+ * call, which owns the ports the mode would take. TEST_RUNNING is a metallic
+ * line test or a SLIC dump, each of which owns the part. REFUSED is a disarm
+ * the backend answered transiently: the loop may still stand on a port, so the
  * mode holds every port and the operator asks again, and the repeat is let
  * through because the board is still armed. The arm makes no refusal of its
  * own: it reports a backend refusal in the log and holds the mode, because

@@ -383,6 +383,11 @@ struct hal {
 	struct uloop_timeout lec_capture;
 	uint64_t lec_ring_fail;
 	uint64_t lec_arm_fail;
+
+	/* The scratch record of line_dump_result_get. The record is 12 KiB, and
+	 * udsp_slic_dump_result() keeps one copy on its own frame, so this one
+	 * keeps the second copy off the uloop stack. */
+	struct udsp_dump dump_rec;
 };
 
 /*
