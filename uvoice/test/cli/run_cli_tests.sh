@@ -267,7 +267,7 @@ ubus list voice >/dev/null 2>&1 || bail 'the stub daemon published no voice obje
 
 voice_signature=$(ubus -v list voice 2>/dev/null)
 for voice_method in status stats cdr reload seize release dial stats_live \
-	line_test loop_test; do
+	line_test loop_test slic_dump; do
 	case $voice_signature in
 	*"\"$voice_method\":"*) ;;
 	*) bail "the voice object carries no \"$voice_method\" method, the daemon is older than this suite" ;;
@@ -1007,6 +1007,10 @@ uc_lines_out=''
 uc_lines_base1_out=''
 uc_codecs_base1_out=''
 uc_lec_base1_out=''
+uc_dump_out=''
+uc_dump_rc=''
+uc_dump_base1_out=''
+uc_dump_bad=''
 uc_rc=1
 
 if [ "$uc_ready" = 1 ]; then
@@ -1043,6 +1047,13 @@ if [ "$uc_ready" = 1 ]; then
 	uc_codecs_base1_out=$uc_out
 	run_uc_base1 lec
 	uc_lec_base1_out=$uc_out
+	run_uc slic_dump --line 0 --kind reg
+	uc_dump_out=$uc_out
+	uc_dump_rc=$uc_rc
+	run_uc_base1 slic_dump --line 0 --kind reg
+	uc_dump_base1_out=$uc_out
+	run_uc slic_dump --line 0 --kind bogus
+	uc_dump_bad="$uc_rc $uc_out"
 	run_uc help
 	ubus -t 5 call voice.stub stream '{"line":0,"stream":0,"up":false}' \
 		>/dev/null 2>&1
@@ -1170,6 +1181,21 @@ fi
 uc_check_lacks 'cli/calls prints no slic-fault flag on the stub' 'slic-fault' \
 	"$uc_calls_out"
 
+# The stub answers the pattern of the libudsp fake SLIC: on line 0 a register
+# reads its own address, and the four read-to-clear interrupt registers 18 to
+# 21 are skipped (hal/stub/stub.c dump_fill()).
+uc_check_eq 'cli/slic_dump exits 0' 0 "$uc_dump_rc"
+uc_check_has 'cli/slic_dump heads the grid with the 0-based line' \
+	'Line 0 SLIC registers' "$uc_dump_out"
+uc_check_eq 'cli/slic_dump marks the four interrupt registers as skipped' 1 \
+	"$(printf '%s\n' "$uc_dump_out" |
+		grep -cx '  16 10 11 -- -- -- -- 16 17 18 19 1a 1b 1c 1d 1e 1f')"
+uc_check_has 'cli/slic_dump heads the grid with line 1 under the base' \
+	'Line 1 SLIC registers' "$uc_dump_base1_out"
+uc_check_eq 'cli/slic_dump refuses an unknown kind' \
+	'1 Error: dump kind "bogus" is not known; expected reg, ram_brief, ram' \
+	"$uc_dump_bad"
+
 if [ "$uc_ready" = 1 ]; then
 	check_eq 'cli/help exits 0' 0 "$uc_rc"
 else
@@ -1192,6 +1218,7 @@ uc_canned_ready=0
 uc_canned_skip='no ucode interpreter'
 uc_canned_monitor=''
 uc_canned_line=''
+uc_canned_dump=''
 
 mkdir -p "$uc_fakemod"
 cat > "$uc_fakemod/ubus.uc" <<'EOF'
@@ -1332,8 +1359,16 @@ let status = {
 	monitor: [ sampled, stale, never ]
 };
 
+// A register dump of two words beside two skipped addresses. One row then
+// holds a blank cell, a read cell and two skipped cells. Rows 32 and 48 lie
+// between the two words and hold no address of the reply, so they drop out.
+let dump = {
+	line: 1, kind: "reg", width: 8, count: 2, skipped: [ 18, 19 ],
+	addr: [ 17, 65 ], value: [ 171, 5 ]
+};
+
 print(sprintf("%J", { status: status, stats: { stats: [] },
-                      cdr: { cdr: [] } }));
+                      cdr: { cdr: [] }, slic_dump: dump }));
 EOF
 
 if command -v ucode >/dev/null 2>&1; then
@@ -1361,6 +1396,8 @@ if [ "$uc_canned_ready" = 1 ]; then
 	uc_canned_line=$uc_out
 	run_uc_canned status
 	uc_canned_status=$uc_out
+	run_uc_canned slic_dump --line 1
+	uc_canned_dump=$uc_out
 fi
 
 uc_canned_check 'cli/status names the running signaling protocol' \
@@ -1426,6 +1463,42 @@ uc_canned_check 'cli/line marks a stale monitor row' \
 # stamps print as ages, which the host uptime decides.
 uc_canned_check 'cli/line reads a wrapped raw word unsigned' \
 	'pd_dcdc 0x80100014' "$uc_canned_line"
+
+# The whole render of the sparse dump: the heading, the offsets, one row with
+# a blank, a read and two skipped cells, the row of the second word, no row 32
+# or 48 for the addresses the reply leaves out, and the count of the range.
+uc_dump_want=$(cat <<'EOF'
+Reading the reg dump of line 1...
+
+Line 1 SLIC registers
+---------------------
+     +0 +1 +2 +3 +4 +5 +6 +7 +8 +9 +a +b +c +d +e +f
+  16    ab -- --
+  64    05
+
+2 of 4 read, skipped: 18 19
+EOF
+)
+
+# A count that names more entries than the two arrays hold is refused whole,
+# so no grid prints a word the reply did not carry.
+uc_dump_short_want=$(printf '%s\n%s' '1|Reading the reg dump of line 1...' \
+	'Error: voice slic_dump answered 2 addresses and 2 values for a count of 3')
+if [ "$uc_canned_ready" = 1 ]; then
+	check_eq 'cli/slic_dump renders a sparse reply whole' "$uc_dump_want" \
+		"$uc_canned_dump"
+	uc_dump_short=$(printf '%s' "$uc_replies" | jq -c '.slic_dump.count = 3')
+	uc_dump_short_out=$(FAKE_REPLIES=$uc_dump_short \
+		UVOICE_UBUS_SOCKET=$ubus_socket ucode -L "$uc_fakemod" \
+		"$cli_uc" -- slic_dump --line 1 2>&1 </dev/null)
+	uc_dump_short_rc=$?
+	check_eq 'cli/slic_dump refuses a reply whose arrays disagree with its count' \
+		"$uc_dump_short_want" "$uc_dump_short_rc|$uc_dump_short_out"
+else
+	skip 'cli/slic_dump renders a sparse reply whole' "$uc_canned_skip"
+	skip 'cli/slic_dump refuses a reply whose arrays disagree with its count' \
+		"$uc_canned_skip"
+fi
 
 # A daemon that names sip and runs no SIP table, the shape of an image with
 # the MGCP unit alone: the account verbs and the SIP client status row key on
@@ -1622,6 +1695,23 @@ schema_answer_mutation='
 schema_mutant_check 'schema/a dns_answer of addr_srv is refused' \
 	"$schema_live" "$schema_answer_mutation"
 
+# The deferred dump reply, live from the stub daemon, and its self-test: a
+# copy that lost the width every reply carries.
+schema_dump=$(ubus -t 30 call voice slic_dump '{"line":0,"kind":"reg"}' \
+	2>/dev/null | jq '{object: "voice", method: "slic_dump",
+		args: {line: 0, kind: "reg"}, reply: .}')
+schema_valid_check 'schema/the live slic_dump capture validates' "$schema_dump"
+
+schema_dump_mutation='
+	if (.reply | has("width")) | not then
+		error("the capture carries no width to remove")
+	else
+		del(.reply.width)
+	end'
+
+schema_mutant_check 'schema/a slic_dump reply without its width is refused' \
+	"$schema_dump" "$schema_dump_mutation"
+
 # The rt table is optional under hal, so the live stub capture never carries
 # it; the canned reply does, and these two mutations pin its own rule: every
 # member is required once the table is there, and the policy is a word of
@@ -1719,6 +1809,15 @@ check_eq 'looptest/every line reads out of service' 'true true' \
 check_eq 'looptest/every line carries the loop test table' 'cross cross' \
 	"$(printf '%s' "$looptest_status" |
 		jq -r '[.reply.call[].loop_test.mode] | join(" ")')"
+
+# The loop test holds the board, so a SLIC dump is refused with code 5
+# (line/line.c line_dump_query()). The client negates the status, because its
+# captured stderr is not a terminal.
+looptest_dump=$(ubus -t 30 call voice slic_dump '{"line":0,"kind":"reg"}' 2>&1)
+looptest_dump_rc=$?
+check_eq 'looptest/a dump while the loop test is armed answers code 5' \
+	'251 (No response)' "$looptest_dump_rc $(printf '%s\n' "$looptest_dump" |
+		sed -n 's/.* \((No response)\)$/\1/p')"
 
 # The self-test of the leg above: the table refuses a row that lost its mode.
 schema_looptest_mutation='
@@ -4395,8 +4494,8 @@ check_eq 'line_test/a stopped daemon prints the daemon-down line' \
 
 line_test_fake_run 5 1 ''
 check_eq 'line_test/a no-data refusal exits with status one' 1 "$cli_rc"
-line_test_refusal="voice-cli: line_test: line 1 is down, busy with a call or a \
-test, or the backend has no line test"
+line_test_refusal="voice-cli: line_test: line 1 is down, busy with a call, a \
+test or a SLIC dump, or the backend has no line test"
 check_eq 'line_test/a no-data refusal prints one friendly line' \
 	"$line_test_refusal" "$cli_out"
 
@@ -4529,8 +4628,120 @@ unsupported_check() {
 	check_has "unsupported/$unsup_name" 'not supported on the uvoice stack' "$cli_out"
 }
 
-unsupported_check 'show reg' show reg line 1
-unsupported_check 'show ram' show ram line 1
+#
+# The SLIC register and RAM dumps (voice slic_dump), rendered through the
+# formatter with the display base at 1. The stub answers the pattern of the
+# libudsp fake SLIC (hal/stub/stub.c dump_word_add()). On ubus line 0 a
+# register reads its own address and a RAM word its address shifted left by
+# 13. On ubus line 1 a register reads its address with bit 4 flipped, and a
+# RAM word also sets bit 0. The skipped addresses are the four interrupt
+# registers 18 to 21 and the patch data port 1359 (dump_fill()).
+#
+run_cli_uc show reg line 1
+dump_reg_out=$cli_out
+uc_check_eq 'slic/show reg line 1 exits 0' 0 "$cli_rc"
+uc_check_has 'slic/show reg line 1 heads the grid with line 1' \
+	'Line 1 SLIC registers' "$dump_reg_out"
+uc_check_has 'slic/show reg line 1 names the 16 offsets of a row' \
+	'     +0 +1 +2 +3 +4 +5 +6 +7 +8 +9 +a +b +c +d +e +f' "$dump_reg_out"
+uc_check_eq 'slic/show reg line 1 marks the four interrupt registers as skipped' 1 \
+	"$(printf '%s\n' "$dump_reg_out" |
+		grep -cx '  16 10 11 -- -- -- -- 16 17 18 19 1a 1b 1c 1d 1e 1f')"
+uc_check_has 'slic/show reg line 1 counts the registers it read' \
+	'124 of 128 read, skipped: 18 19 20 21' "$dump_reg_out"
+
+run_cli_uc show reg
+uc_check_eq 'slic/show reg without a line prints the bytes of line 1' \
+	"$dump_reg_out" "$cli_out"
+
+# Line 2 is ubus line 1, whose registers read their address with bit 4 flipped.
+run_cli_uc show reg line 2
+uc_check_eq 'slic/show reg line 2 reads ubus line 1' \
+	'Line 2 SLIC registers|   0 10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f' \
+	"$(printf '%s\n' "$cli_out" | grep -x 'Line 2 SLIC registers')|$(
+		printf '%s\n' "$cli_out" | grep -x '   0 .*')"
+
+# The klish default reads the named RAM words, a brief list with no skip.
+run_cli_uc show ram line 1
+uc_check_eq 'slic/show ram line 1 exits 0' 0 "$cli_rc"
+uc_check_has 'slic/show ram line 1 prints a named word' '1538  0x00c04000' \
+	"$cli_out"
+uc_check_eq 'slic/show ram line 1 prints the eleven named words and no skip' \
+	'11 0' "$(printf '%s\n' "$cli_out" |
+		grep -cE '^ *[0-9]+  0x[0-9a-f]{8}$') $(printf '%s\n' "$cli_out" |
+		grep -cE '^ *[0-9]+ .*--')"
+
+run_cli_uc show ram line 1 full
+uc_check_eq 'slic/show ram line 1 full exits 0' 0 "$cli_rc"
+uc_check_eq 'slic/show ram line 1 full marks the patch data port as skipped' 1 \
+	"$(printf '%s\n' "$cli_out" |
+		grep -cx '1352 00a90000 00a92000 00a94000 00a96000 00a98000 00a9a000 00a9c000 --------')"
+uc_check_has 'slic/show ram line 1 full counts the words it read' \
+	'1644 of 1645 read, skipped: 1359' "$cli_out"
+
+# Line 3 is ubus line 2, at the channel maximum, so the daemon's handler
+# refuses it.
+run_cli_uc show reg line 3
+uc_check_eq 'slic/show reg line 3 exits 1' 1 "$cli_rc"
+uc_check_has 'slic/show reg line 3 names the invalid argument' \
+	'Error: voice slic_dump failed: invalid argument (unknown line or dump kind)' \
+	"$cli_out"
+
+run_cli show reg line 0
+check_eq 'slic/show reg line 0 exits 1' 1 "$cli_rc"
+check_eq 'slic/show reg line 0 prints one friendly line' \
+	'voice-cli: show reg: line "0" is not a line number, lines count from 1' \
+	"$cli_out"
+
+run_cli show ram line 1 bogus
+check_eq 'slic/show ram refuses a word after the line' 1 "$cli_rc"
+check_eq 'slic/show ram names the word it refuses' \
+	'voice-cli: show ram: invalid argument "bogus"' "$cli_out"
+
+# The refusals of the daemon, one sentence per ubus status code. The stub
+# daemon of this suite answers code 2 for line 3 above, and code 5 under the
+# armed loop test of the loop test leg. Codes 4, 7 and 9 need a scratch
+# config, a hung job or UVOICE_STUB_SLIC_DUMP=fatal at the daemon start. So
+# voice-cli runs the formatter on the ubus stand-in module above, which
+# answers the message the ucode ubus binding writes for each code. For Unknown
+# error the binding writes its own message without the status word.
+uc_fakemod_shim=$tmp/fake-ucode
+export uc_fakemod
+mkdir -p "$uc_fakemod_shim"
+cat > "$uc_fakemod_shim/ucode" <<'EOF'
+#!/bin/sh
+exec "$ct_ucode" -L "$uc_fakemod" "$@"
+EOF
+chmod +x "$uc_fakemod_shim/ucode"
+
+dump_invoke="Failed to invoke function 'slic_dump' on object 'voice'"
+
+dump_refusal_check() {
+	if [ "$uc_canned_ready" != 1 ]; then
+		skip "slic/a code $1 refusal exits 1" "$uc_canned_skip"
+		skip "slic/a code $1 refusal prints one sentence" "$uc_canned_skip"
+		return
+	fi
+	dump_refusal_replies=$(jq -cn --arg e "$2" '{slic_dump: {__error: $e}}')
+	cli_out=$(PATH=$uc_fakemod_shim:$PATH UVOICE_CLI=$cli_uc \
+		FAKE_REPLIES=$dump_refusal_replies \
+		/usr/srg/scripts/voice-cli show reg line 2 2>&1 </dev/null)
+	cli_rc=$?
+	check_eq "slic/a code $1 refusal exits 1" 1 "$cli_rc"
+	check_eq "slic/a code $1 refusal prints one sentence" \
+		"$(printf 'Reading the reg dump of line 2...\nError: voice slic_dump failed: %s' "$3")" \
+		"$cli_out"
+}
+
+dump_refusal_check 2 "Invalid argument: $dump_invoke" \
+	'invalid argument (unknown line or dump kind)'
+dump_refusal_check 4 "Not found: $dump_invoke" 'line 2 is not configured'
+dump_refusal_check 5 "No response: $dump_invoke" \
+	'line 2 is down, a line test or the loop test holds the board, a dump is already running, the backend has no dump, or the part was busy'
+dump_refusal_check 7 "Request timed out: $dump_invoke" \
+	'line 2: the dump timed out in the daemon'
+dump_refusal_check 9 "$dump_invoke" \
+	'the backend refused the dump, or the record is unreadable'
 
 UVOICE_TLS_KEYLOG=$tmp/ssl.keylog
 UVOICE_TLS_STATUS=$tmp/voip_tls_stat.txt
@@ -4875,6 +5086,15 @@ if [ -r "$voip_xml_dir/voip.xml" ]; then
 	# text. It passes the text through.
 	check_eq 'xml/voip.xml reads no SIP client status row' 0 \
 		"$(grep -c 'SIP client status' "$voip_xml_dir/voip.xml")"
+	# The show ACTION hands the typed line to both SLIC dumps, so klish
+	# dumps that line and not line 1. The braces are klish words, which the
+	# shell must not expand in xml_dump_want.
+	# shellcheck disable=SC2016
+	xml_dump_want='show_which="${show_select} line ${v_line}"'
+	check_eq 'xml/voip.xml passes the line to the SLIC dumps' \
+		"$xml_dump_want" \
+		"$(grep -A1 -F '"reg" | "ram")' "$voip_xml_dir/voip.xml" |
+			sed -n '2s/^[[:space:]]*//p')"
 else
 	skip 'xml/voip.xml calls voip_cli.sh nowhere' "no voip.xml under $voip_xml_dir"
 	skip 'xml/voip.xml routes every backend call through the dispatcher' "no voip.xml under $voip_xml_dir"
@@ -4887,6 +5107,8 @@ else
 	skip 'xml/voip.xml offers the four line tests as words' "no voip.xml under $voip_xml_dir"
 	skip 'xml/voip.xml offers the six uvoice show words' "no voip.xml under $voip_xml_dir"
 	skip 'xml/voip.xml reads no SIP client status row' \
+		"no voip.xml under $voip_xml_dir"
+	skip 'xml/voip.xml passes the line to the SLIC dumps' \
 		"no voip.xml under $voip_xml_dir"
 fi
 

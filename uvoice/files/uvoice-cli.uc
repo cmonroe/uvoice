@@ -27,11 +27,14 @@ if (ubus_socket == "")
 const UBUS_TIMEOUT = 5;
 // The client outlives the daemon's 5 s stats_live backstop and its line test
 // budget, so the daemon that knows why reports a query that never completes
-// (the same margins voice-cli keeps).
+// (the same margins voice-cli keeps). The dump margin covers the 21 s safety
+// timer of voice slic_dump (ubus.c LINE_DUMP_TIMEOUT_MS).
 const UBUS_LIVE_TIMEOUT = 10;
 const UBUS_LINE_TEST_TIMEOUT = 110;
+const UBUS_SLIC_DUMP_TIMEOUT = 30;
 
 const LINE_TESTS = ["gr909", "roh", "capacitance", "loop"];
+const DUMP_KINDS = ["reg", "ram_brief", "ram"];
 const TRACE_DOMAINS = ["sip", "fsm", "hook", "hal", "dialplan", "media", "jb",
                        "mgcp"];
 const LINETEST_META_KEYS = ["version", "test_id", "code", "valid"];
@@ -527,7 +530,10 @@ function kv_print(tbl, indent, skip, legend) {
 
 // The ubus binding clears its error state on the first error() read, so the
 // message is read once and the status code is derived from the leading
-// ubus_strerror() word ("Not found: Failed to invoke ...").
+// ubus_strerror() word ("Not found: Failed to invoke ..."). For Unknown error
+// the binding prints its own message without the word, so a message that
+// leads with no word carries that status.
+const UBUS_STATUS_UNKNOWN_ERROR = 9;
 const UBUS_ERROR_WORDS = {
 	"Invalid command": 1,
 	"Invalid argument": 2,
@@ -537,15 +543,18 @@ const UBUS_ERROR_WORDS = {
 	"Permission denied": 6,
 	"Request timed out": 7,
 	"Operation not supported": 8,
-	"Unknown error": 9,
-	"Connection failed": 10
+	"Unknown error": UBUS_STATUS_UNKNOWN_ERROR,
+	"Connection failed": 10,
+	"Out of memory": 11,
+	"Parsing message data failed": 12,
+	"System error": 13
 };
 
 function ubus_error_code(err) {
 	for (let word, code in UBUS_ERROR_WORDS)
 		if (index(err, word) == 0)
 			return code;
-	return null;
+	return UBUS_STATUS_UNKNOWN_ERROR;
 }
 
 function voice_call(object, method, params, timeout) {
@@ -580,24 +589,43 @@ function call_fail(what, res) {
 	return 1;
 }
 
-// The refusal codes of the two deferred verbs, from the src/ubus.c handlers;
-// the schema carries only the success bodies.
+// The refusal prose of the deferred verbs by ubus status code, from the
+// src/ubus.c handlers; the schema carries only the success bodies. A %s
+// takes the line as line_text() prints it.
+const DEFERRED_SHARED_WHY = {
+	[2]: "invalid argument (unknown line, slot or test)",
+	[4]: "line %s is not configured, the lines are not up, or the slot has no running stream",
+	[5]: "line %s is down, busy with a call or a test, or the backend has no support",
+	[7]: "line %s: the request timed out in the daemon",
+	[9]: "the backend refused, or the result is unreadable"
+};
+
+// A SLIC dump holds the board against a line test and not against a live
+// media query, and a dump runs beside a call, so its own code 5 names the
+// holds of the board and no call.
+const DEFERRED_WHY = {
+	"voice stats_live": DEFERRED_SHARED_WHY,
+	"voice line_test": {
+		...DEFERRED_SHARED_WHY,
+		[5]: "line %s is down, busy with a call, a test or a SLIC dump, or the backend has no support"
+	},
+	"voice slic_dump": {
+		[2]: "invalid argument (unknown line or dump kind)",
+		[4]: "line %s is not configured",
+		[5]: "line %s is down, a line test or the loop test holds the board, a dump is already running, the backend has no dump, or the part was busy",
+		[7]: "line %s: the dump timed out in the daemon",
+		[9]: "the backend refused the dump, or the record is unreadable"
+	}
+};
+
 function deferred_fail(what, res, line) {
-	let why;
-	if (res.code == 2)
-		why = "invalid argument (unknown line, slot or test)";
-	else if (res.code == 4 && !voice_present())
+	let prose = DEFERRED_WHY[what]?.[res.code];
+	let why = res.err ?? "unknown error";
+
+	if (res.code == 4 && !voice_present())
 		why = "uvoiced does not answer ubus";
-	else if (res.code == 4)
-		why = sprintf("line %d is not configured, the lines are not up, or the slot has no running stream", line);
-	else if (res.code == 5)
-		why = sprintf("line %d is down, busy with a call or a test, or the backend has no support", line);
-	else if (res.code == 7)
-		why = sprintf("line %d: the request timed out in the daemon", line);
-	else if (res.code == 9)
-		why = "the backend refused, or the result is unreadable";
-	else
-		why = res.err ?? "unknown error";
+	else if (prose != null)
+		why = sprintf(prose, line_text(line));
 
 	printf("Error: %s failed: %s\n", what, why);
 	return 1;
@@ -2210,6 +2238,148 @@ function cmd_linetest(args) {
 	return data.status == "complete" ? 0 : 1;
 }
 
+const DUMP_TITLES = {
+	reg: "SLIC registers",
+	ram_brief: "SLIC RAM, named words",
+	ram: "SLIC RAM"
+};
+
+// A register is one byte and a RAM word 29 bits. A register row therefore
+// holds 16 cells and a RAM row 8, and each row fits 80 columns. The row
+// label is the decimal address of its first cell, the number the SLIC
+// driver names a register by. The header names the offset of a cell in its
+// row.
+const DUMP_GRID_BYTE = { cells: 16, fmt: "%02x", hole: "--", blank: "  " };
+const DUMP_GRID_WORD = { cells: 8, fmt: "%08x", hole: "--------",
+                         blank: "        " };
+
+// A skipped address prints the dash run of its cell. An address the reply
+// names neither way prints blank, so a row shows what the backend answered.
+function dump_cell_text(words, skips, addr, grid) {
+	if (words[addr] != null)
+		return sprintf(grid.fmt, words[addr]);
+	if (skips[addr])
+		return c_dim(grid.hole);
+	return null;
+}
+
+function dump_row_text(words, skips, row, grid) {
+	let text = c_dim(sprintf("%4d", row));
+	let used = false;
+
+	for (let a = row; a < row + grid.cells; a++) {
+		let cell = dump_cell_text(words, skips, a, grid);
+		used = used || cell != null;
+		text += " " + (cell ?? grid.blank);
+	}
+
+	return used ? rtrim(text, " ") : null;
+}
+
+function dump_grid_print(data, grid) {
+	let addrs = map(data.addr ?? [], u32fix);
+	let skipped = map(data.skipped ?? [], u32fix);
+	let words = {};
+	let skips = {};
+	let lo;
+	let hi;
+
+	for (let i = 0; i < length(addrs); i++)
+		words[addrs[i]] = u32fix(data.value[i]);
+	for (let a in skipped)
+		skips[a] = true;
+	for (let a in [...addrs, ...skipped]) {
+		lo = min(lo ?? a, a);
+		hi = max(hi ?? a, a);
+	}
+
+	let head = "    ";
+	for (let i = 0; i < grid.cells; i++)
+		head += " " + pad_left(sprintf("+%x", i), length(grid.blank));
+	printf("%s\n", c_dim(head));
+
+	if (lo == null)
+		return;
+
+	for (let row = lo - lo % grid.cells; row <= hi; row += grid.cells) {
+		let text = dump_row_text(words, skips, row, grid);
+		if (text != null)
+			print(text + "\n");
+	}
+}
+
+function dump_brief_print(data) {
+	let addrs = data.addr ?? [];
+
+	printf("%s\n", c_dim("addr  value"));
+	for (let i = 0; i < length(addrs); i++)
+		printf("%4d  0x%08x\n", u32fix(addrs[i]), u32fix(data.value[i]));
+}
+
+// The reply carries the words read and the addresses skipped, and the two
+// together are the range of the kind.
+function dump_trailer_print(data) {
+	let skipped = map(data.skipped ?? [], u32fix);
+	let count = u32fix(data.count) ?? 0;
+	let text = sprintf("%d of %d read", count, count + length(skipped));
+
+	if (length(skipped))
+		text += ", skipped: " + join(" ", skipped);
+	printf("\n%s\n", text);
+}
+
+// addr and value are parallel arrays of count entries (schema
+// SlicDumpReply). A reply whose three lengths disagree is refused whole,
+// because its grid would print a value the reply did not carry.
+function dump_print(data, line) {
+	let count = u32fix(data.count);
+	let addrs = length(data.addr);
+	let values = length(data.value);
+
+	if (count == null || addrs != count || values != count) {
+		printf("Error: voice slic_dump answered %s addresses and %s values for a count of %s\n",
+		       addrs ?? "no", values ?? "no", count ?? "none");
+		return 1;
+	}
+
+	print("\n");
+	underline(sprintf("Line %s %s", line_text(data.line ?? line),
+	                  DUMP_TITLES[data.kind] ?? data.kind), "-");
+
+	if (data.kind == "ram_brief")
+		dump_brief_print(data);
+	else
+		dump_grid_print(data, u32fix(data.width) > 8 ? DUMP_GRID_WORD :
+		                DUMP_GRID_BYTE);
+
+	dump_trailer_print(data);
+	return 0;
+}
+
+function cmd_slic_dump(args) {
+	let line = line_arg_get(args, "slic_dump");
+	if (line == null)
+		return 1;
+
+	let kind = "reg";
+	if (args.kind != null && args.kind !== true)
+		kind = args.kind;
+	if (index(DUMP_KINDS, kind) < 0) {
+		printf("Error: dump kind \"%s\" is not known; expected %s\n",
+		       kind, join(", ", DUMP_KINDS));
+		return 1;
+	}
+
+	printf("Reading the %s dump of line %s%s...\n", kind, line_text(line),
+	       kind == "ram" ? " (the whole RAM takes seconds)" : "");
+	let res = voice_call("voice", "slic_dump", { line: line, kind: kind },
+	                     UBUS_SLIC_DUMP_TIMEOUT);
+	if (res.err != null)
+		return deferred_fail("voice slic_dump", res, line);
+
+	return dump_print(res.data, line);
+}
+
 // The manufacturing loop test (ubus voice loop_test). The two numbers keep
 // their ubus names, and the daemon bounds them: this verb sends what the
 // operator typed and prints the mode the daemon answered with.
@@ -2286,8 +2456,8 @@ function cmd_looptest(args) {
 			why = "a value is out of range, or the mode word is " +
 			      "not self or cross";
 		else if (res.code == 5)
-			why = "the dsp is not ready, a call or a line test " +
-			      "is running, or the backend carries no loop";
+			why = "the dsp is not ready, a call, a line test or a " +
+			      "SLIC dump is running, or the backend carries no loop";
 		printf("Error: voice loop_test failed: %s\n", why);
 		return 1;
 	}
@@ -2764,6 +2934,9 @@ function usage() {
 	print("                         Live media counters of a running call leg\n");
 	print("  linetest --line N [--test gr909|roh|capacitance|loop]\n");
 	print("                         Run a metallic line test (default gr909)\n");
+	print("  slic_dump --line N [--kind reg|ram_brief|ram]\n");
+	print("                         Dump the SLIC registers (default), the named\n");
+	print("                         RAM words or the whole RAM of a line\n");
 	print("  looptest --start|--stop [--mode self|cross] [--ring-s N]\n");
 	print("      [--delay-ms N]\n");
 	print("                         Arm or disarm the manufacturing loop test;\n");
@@ -2829,6 +3002,7 @@ let commands = {
 	stats_reset: cmd_stats_reset,
 	config: cmd_config,
 	linetest: cmd_linetest,
+	slic_dump: cmd_slic_dump,
 	looptest: cmd_looptest,
 	trace: cmd_trace,
 	trace_set: cmd_trace_set,

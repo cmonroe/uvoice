@@ -109,6 +109,9 @@ uvoice shell helpers (lines and slots are 0-based):
     uvoice.config.codecs       - Codec table
     uvoice.linetest LINE [TEST] - Metallic line test (default gr909;
                                  gr909|roh|capacitance|loop)
+    uvoice.slic.reg LINE       - SLIC registers of a line as a hex grid
+    uvoice.slic.ram LINE [brief] - The whole SLIC RAM of a line as a hex
+                                 grid; brief prints the named words alone
     uvoice.looptest start|stop [MODE]
                                - Manufacturing loop test on every line
                                  (MODE: self|cross); every line is out of
@@ -148,6 +151,8 @@ uvoice shell helpers (lines and slots are 0-based):
     uvoice.ubus.stats.live LINE [SLOT] - voice stats_live (10s timeout)
     uvoice.ubus.stats.reset    - voice stats_reset
     uvoice.ubus.linetest LINE [TEST] - voice line_test (110s timeout)
+    uvoice.ubus.slic.dump LINE [KIND] - voice slic_dump (30s timeout; KIND
+                                 reg|ram_brief|ram, default reg)
     uvoice.ubus.looptest start|stop [MODE] - voice loop_test
     uvoice.ubus.register LINE  - voice register
     uvoice.ubus.unregister LINE - voice unregister
@@ -325,6 +330,35 @@ uvoice.linetest() {
 		return 1
 	fi
 	_uvoice_table linetest --line "$1" --test "${2:-gr909}"
+}
+
+uvoice.slic.reg() {
+	if ! _uvoice_uint_check "${1:-}"; then
+		echo "Usage: uvoice.slic.reg <LINE>"
+		return 1
+	fi
+	_uvoice_table slic_dump --line "$1" --kind reg
+}
+
+# The raw debug interface dumps the whole RAM by default; the klish backend
+# defaults to the named words.
+uvoice.slic.ram() {
+	if ! _uvoice_uint_check "${1:-}"; then
+		echo "Usage: uvoice.slic.ram <LINE> [brief]"
+		return 1
+	fi
+	case ${2:-} in
+	'')
+		_uvoice_table slic_dump --line "$1" --kind ram
+		;;
+	brief)
+		_uvoice_table slic_dump --line "$1" --kind ram_brief
+		;;
+	*)
+		echo "Usage: uvoice.slic.ram <LINE> [brief]"
+		return 1
+		;;
+	esac
 }
 
 uvoice.looptest() {
@@ -624,6 +658,23 @@ uvoice.ubus.linetest() {
 	# 110s outlives the daemon's line test budget so the daemon reports a
 	# test that never completes
 	_uvoice_ubus -t 110 call voice line_test "{ \"line\": $1, \"test\": \"${2:-gr909}\" }"
+}
+
+uvoice.ubus.slic.dump() {
+	if ! _uvoice_uint_check "${1:-}"; then
+		echo "Usage: uvoice.ubus.slic.dump <LINE> [reg|ram_brief|ram]"
+		return 1
+	fi
+	case ${2:-reg} in
+	reg | ram_brief | ram) ;;
+	*)
+		echo "KIND must be reg, ram_brief or ram"
+		return 1
+		;;
+	esac
+	# 30s outlives the daemon's 21s dump safety timer, so the daemon
+	# reports a dump that never completes
+	_uvoice_ubus -t 30 call voice slic_dump "{ \"line\": $1, \"kind\": \"${2:-reg}\" }"
 }
 
 uvoice.ubus.looptest() {

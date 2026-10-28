@@ -171,8 +171,8 @@ every ubus method of the `voice`, `voice.trace`, `voice.calltrace` and
 The schema is versioned. Its `version` key is a dotted triple, and a schema
 change moves it. `test/cli/schema_check.py` validates one capture against the
 schema. It needs `python3` and the `jsonschema` module 4.18 or later. The
-schema leg of the CLI suite validates status captures with it, and skips
-without those two.
+schema leg of the CLI suite validates live and canned reply captures with it,
+and skips without those two.
 
 ## Test timing
 

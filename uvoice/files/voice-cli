@@ -13,11 +13,10 @@
 # The command set is the one that /usr/srg/scripts/voip_cli.sh gives the other
 # voice stack, so a single klish tree drives either stack through
 # voip-cli-dispatch. The commands that only the other stack serves answer one
-# line and exit 1: the log module and preset tables, and the SLIC register and
-# RAM dumps. The views this stack owns alone (the daemon, the line, the
-# account table, the call table, the line monitor and the call records) render
-# through /usr/share/uvoice/uvoice-cli.uc, the formatter behind uvoice.sh, so
-# the two surfaces share one renderer.
+# line and exit 1: the log module and preset tables. The daemon, the line, the
+# account table, the call table, the line monitor, the call records and the
+# SLIC register and RAM dumps render through /usr/share/uvoice/uvoice-cli.uc,
+# the formatter behind uvoice.sh, so the two surfaces share one renderer.
 #
 # The CLI is 1 based and the ubus surface is 0 based. The single decrement of
 # the whole script lives in line_index_get(). The formatter prints its line
@@ -92,7 +91,7 @@ calltrace wait: wait for an archive; the wait deadline exits 2
 
 show: show voip information
    arg1: <config|version|global|channel1|channel2|daemon|lines|calls|monitor|
-          cdr|status|statistics|log|raw>
+          cdr|status|statistics|reg|ram|log|raw>
    global [field]: the loaded configuration, or one uci option
    channelN [config|field]: the line view, its loaded configuration, or one
           uci option
@@ -101,6 +100,9 @@ show: show voip information
    cdr [last N|seq N]: the call records, the last N, or one record in full
    statistics [line N|live N [slot]]: the per line counters, or the live
           media of a running call
+   reg [line N]: the SLIC registers of a line, line 1 when omitted
+   ram [line N] [full]: the named SLIC RAM words of a line, line 1 when
+          omitted; full prints the whole RAM
 
 set: set a parameter
    arg1: <global|line|profile>
@@ -307,8 +309,8 @@ line_test_error_show() {
 		line_test_error="line $2 is not configured"
 		;;
 	5 | 251)
-		line_test_error="line $2 is down, busy with a call or a test, or the \
-backend has no line test"
+		line_test_error="line $2 is down, busy with a call, a \
+test or a SLIC dump, or the backend has no line test"
 		;;
 	7 | 249)
 		line_test_error="line $2 test timed out in the daemon"
@@ -340,8 +342,8 @@ looptest_error_show() {
 		looptest_error='this board carries no line'
 		;;
 	5 | 251)
-		looptest_error="the dsp is not ready, a call or a line test is \
-running, or the backend carries no loop"
+		looptest_error="the dsp is not ready, a call, a line test \
+or a SLIC dump is running, or the backend carries no loop"
 		;;
 	9 | 247)
 		looptest_error='the daemon refused the loop test'
@@ -990,8 +992,41 @@ cdr_show() {
 	fi
 }
 
+# "reg" and "ram" take "line N", the shape the klish show ACTION builds, and
+# read line 1 without it, the default of the shared command set (file header).
+# klish never sends "full", so its users read the named RAM words and not the
+# whole RAM.
+dump_show() {
+	dump_verb=$1
+	shift
+	dump_line=1
+
+	if [ "${1:-}" = line ]; then
+		[ $# -ge 2 ] ||
+			fail "show $dump_verb line: a line number is required, lines count from 1"
+		dump_line=$2
+		shift 2
+	fi
+
+	dump_index=$(line_index_get "$dump_line") ||
+		fail "show $dump_verb: line \"$dump_line\" is not a line number, lines count from 1"
+
+	dump_kind=$dump_verb
+	if [ "$dump_verb" = ram ]; then
+		dump_kind=ram_brief
+		if [ "${1:-}" = full ]; then
+			dump_kind=ram
+			shift
+		fi
+	fi
+
+	[ $# -eq 0 ] || fail "show $dump_verb: invalid argument \"$1\""
+
+	formatter_run slic_dump --line "$dump_index" --kind "$dump_kind"
+}
+
 voice_show() {
-	[ $# -ge 1 ] || fail 'show: not enough arguments; show <config|version|global|channelN|daemon|lines|calls|monitor|cdr|status|statistics|log|raw>'
+	[ $# -ge 1 ] || fail 'show: not enough arguments; show <config|version|global|channelN|daemon|lines|calls|monitor|cdr|status|statistics|reg|ram|log|raw>'
 
 	show_what=$1
 	shift
@@ -1051,7 +1086,7 @@ voice_show() {
 		fi
 		;;
 	reg | ram)
-		unsupported "show $show_what"
+		dump_show "$show_what" "$@"
 		;;
 	*)
 		fail "show: invalid argument \"$show_what\""
