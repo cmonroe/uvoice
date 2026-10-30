@@ -1544,8 +1544,13 @@ static void lf_rec_emit(struct udsp_chan *c, struct chan_batch *b,
 {
 	struct slic_rec *r = batch_add(b, type, c->line, arg);
 
-	if (r)
-		r->lf_seq = ++c->lf_seq_emit;
+	if (!r)
+		return;
+	r->lf_seq = ++c->lf_seq_emit;
+	if (type != SLIC_REC_RING_RELAY)
+		c->lf_queued = arg;
+	else
+		c->lf_queued = arg ? UDSP_LF_RINGING : UDSP_LF_FWD_ACTIVE;
 }
 
 /* The confirmed value is not touched here: only a successful linefeed_set on
@@ -1571,6 +1576,13 @@ static bool chan_lf_in_flight(const struct udsp_chan *c)
 	return c->lf_seq_emit !=
 	       (uint32_t)atomic_load_explicit(&c->lf_seq_done,
 					      memory_order_acquire);
+}
+
+/* The feed the part holds once the queued feed writes ran (chan.h
+ * lf_queued). */
+static uint8_t lf_settled(const struct udsp_chan *c)
+{
+	return chan_lf_in_flight(c) ? c->lf_queued : lf_confirmed(c);
 }
 
 /* The one writer of the published fault word (chan.h UDSP_FAULT_PUB_*), called
@@ -2101,9 +2113,10 @@ static void chan_journal_run(struct udsp *s, struct udsp_chan *c,
 		}
 		chan_event_post(s, &rec->u.event);
 		/* The ring machine owns the relay; base_lf is what the end of
-		 * a session restores. */
+		 * a session restores. A relay-off can still be queued here, and
+		 * the vendor ring stop it runs writes the active feed. */
 		if (rec->u.event.type == UDSP_EV_RING_END &&
-		    lf_confirmed(c) != c->base_lf)
+		    lf_settled(c) != c->base_lf)
 			lf_emit(c, b, c->base_lf);
 	}
 	line_out_reset(&c->out);
@@ -3968,6 +3981,7 @@ void udsp_chan_reset(struct udsp *s, unsigned line, unsigned rate)
 	line_cidseq_init(&c->cid, line);
 	c->base_lf = UDSP_LF_OPEN;
 	atomic_init(&c->lf_confirmed, UDSP_LF_OPEN);
+	c->lf_queued = UDSP_LF_OPEN;
 	atomic_init(&c->ps_confirmed, false);
 	atomic_init(&c->gain_confirmed, 0u);
 	c->state = UDSP_LINE_DOWN;

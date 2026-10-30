@@ -500,6 +500,12 @@ struct udsp_chan {
 	 */
 	uint32_t lf_seq_emit;			/* engine tick only */
 	_Atomic uint_least32_t lf_seq_done;
+	/* Engine tick only: the feed the queued feed records leave on the
+	 * part, the vendor ring stop's active feed included. It is a
+	 * prediction and holds only while a feed write is in flight: a record
+	 * that failed or was dropped never confirms, and lf_confirmed is then
+	 * the feed. */
+	uint8_t lf_queued;			/* enum udsp_linefeed */
 	/* Engine tick only: lf_seq_emit when the caller identity sequence
 	 * armed. Only the failure of a later feed write aborts the sequence
 	 * (chan.c chan_up_rec_fail). */

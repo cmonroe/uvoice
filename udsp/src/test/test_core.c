@@ -11203,6 +11203,143 @@ static void tc_fault_held_until_start(struct eh *t, uint32_t bit)
 	tc_down(t);
 }
 
+static void tc_ring_end_base_set(struct eh *t, uint8_t base)
+{
+	switch (base) {
+	case UDSP_LF_OPEN:
+		CHECK(udsp_line_state(t->s, 0, UDSP_LINE_DOWN) == UDSP_OK);
+		break;
+	case UDSP_LF_REV_ACTIVE:
+		CHECK(udsp_line_polarity(t->s, 0, UDSP_POL_REVERSE) == UDSP_OK);
+		break;
+	case UDSP_LF_FWD_OHT:
+		CHECK(udsp_line_state(t->s, 0, UDSP_LINE_OHT) == UDSP_OK);
+		break;
+	default:
+		break;
+	}
+}
+
+/* A ring stopped inside its first burst: the relay-off of the stop is still
+ * queued when the session ends, and the vendor ring stop it runs writes the
+ * active feed. writes is the count of feed writes the end owes the base. */
+static void tc_ring_end_burst(uint8_t base, unsigned writes)
+{
+	struct udsp_ring ring;
+	struct eh t;
+	unsigned n;
+
+	if (!tc_up_ports(&t, "USA", 1)) {
+		CHECK(false);
+		return;
+	}
+	eh_wait_ms(&t, 100);
+	tc_ring_end_base_set(&t, base);
+	eh_wait_ms(&t, 100);
+	CHECK_UINT(tc_lf_confirmed(&t, 0), base);
+	n = tc_linefeed_count(&t, 0);
+	tc_ring_fill(&ring, 2000, 4000, 30000);
+	CHECK(udsp_ring_start(t.s, 0, &ring) == UDSP_OK);
+	eh_wait_ms(&t, 200);
+	CHECK(udsp_ring_stop(t.s, 0) == UDSP_OK);
+	eh_wait_ms(&t, 300);
+	CHECK(eh_ev_find(UDSP_EV_RING_END, 0) != NULL);
+	CHECK_UINT(tc_lf_confirmed(&t, 0), base);
+	CHECK_UINT(tc_linefeed_count(&t, 0), n + writes);
+	tc_down(&t);
+}
+
+static void case_ring_end_feed(void)
+{
+	struct udsp_ring ring;
+	struct eh t;
+	unsigned n;
+
+	CASE("a ring stopped in its first burst leaves a line held down open");
+	tc_ring_end_burst(UDSP_LF_OPEN, 1);
+
+	CASE("a ring stopped in its first burst restores the reversed feed");
+	tc_ring_end_burst(UDSP_LF_REV_ACTIVE, 1);
+
+	CASE("a ring stopped in its first burst restores on-hook transmission");
+	tc_ring_end_burst(UDSP_LF_FWD_OHT, 1);
+
+	CASE("a ring stopped in its first burst writes no active feed twice");
+	tc_ring_end_burst(UDSP_LF_FWD_ACTIVE, 0);
+
+	CASE("a stop with the silence relay-off queued restores the base feed");
+	{
+		if (!tc_up_ports(&t, "USA", 1)) {
+			CHECK(false);
+			return;
+		}
+		eh_wait_ms(&t, 100);
+		CHECK(udsp_line_polarity(t.s, 0, UDSP_POL_REVERSE) == UDSP_OK);
+		eh_wait_ms(&t, 100);
+		n = tc_linefeed_count(&t, 0);
+		/* The relay-off at the end of the burst holds the slic thread
+		 * for 200 ms, so the stop finds it queued. */
+		udsp_slic_fake_delay_set(t.s->slic, UDSP_SLIC_FAKE_RING_STOP,
+					 200);
+		tc_ring_fill(&ring, 100, 2000, 30000);
+		CHECK(udsp_ring_start(t.s, 0, &ring) == UDSP_OK);
+		eh_wait_ms(&t, 160);
+		CHECK(udsp_ring_stop(t.s, 0) == UDSP_OK);
+		eh_wait_ms(&t, 400);
+		udsp_slic_fake_delay_set(t.s->slic, UDSP_SLIC_FAKE_RING_STOP,
+					 0);
+		CHECK(eh_ev_find(UDSP_EV_RING_END, 0) != NULL);
+		CHECK_UINT(tc_lf_confirmed(&t, 0), UDSP_LF_REV_ACTIVE);
+		CHECK_UINT(tc_linefeed_count(&t, 0), n + 1);
+		tc_down(&t);
+	}
+
+	CASE("a ring stopped in a silence writes no active feed twice");
+	{
+		if (!tc_up_ports(&t, "USA", 1)) {
+			CHECK(false);
+			return;
+		}
+		eh_wait_ms(&t, 100);
+		n = tc_linefeed_count(&t, 0);
+		tc_ring_fill(&ring, 100, 2000, 30000);
+		CHECK(udsp_ring_start(t.s, 0, &ring) == UDSP_OK);
+		eh_wait_ms(&t, 400);
+		CHECK(udsp_ring_stop(t.s, 0) == UDSP_OK);
+		eh_wait_ms(&t, 300);
+		CHECK(eh_ev_find(UDSP_EV_RING_END, 0) != NULL);
+		CHECK_UINT(tc_lf_confirmed(&t, 0), UDSP_LF_FWD_ACTIVE);
+		CHECK_UINT(tc_linefeed_count(&t, 0), n);
+		tc_down(&t);
+	}
+
+	CASE("a held ring stop on a line held down writes one open feed");
+	{
+		if (!tc_up_ports(&t, "USA", 1)) {
+			CHECK(false);
+			return;
+		}
+		tc_pace_fast();
+		eh_wait_ms(&t, 60);
+		CHECK(udsp_line_state(t.s, 0, UDSP_LINE_DOWN) == UDSP_OK);
+		eh_wait_ms(&t, 100);
+		tc_ring_fill(&ring, 2000, 4000, 30000);
+		CHECK(udsp_ring_start(t.s, 0, &ring) == UDSP_OK);
+		eh_wait_ms(&t, 200);
+		udsp_slic_fake_fault_set(t.s->slic, 0, UDSP_FAULT_SLIC_CLOCK);
+		eh_wait_ms(&t, 1400);
+		CHECK_UINT(tc_fault_events(0, false), 1);
+		n = tc_linefeed_count(&t, 0);
+		CHECK(udsp_ring_stop(t.s, 0) == UDSP_OK);
+		eh_wait_ms(&t, 300);
+		CHECK(eh_ev_find(UDSP_EV_RING_END, 0) != NULL);
+		CHECK_UINT(tc_lf_confirmed(&t, 0), UDSP_LF_OPEN);
+		CHECK_UINT(tc_linefeed_count(&t, 0), n + 1);
+		udsp_slic_fake_fault_set(t.s->slic, 0, 0);
+		tc_down(&t);
+	}
+}
+
 static void case_fault(void)
 {
 	struct eh t;
@@ -19278,6 +19415,7 @@ int main(void)
 	case_slic_gain();
 	case_slic_region();
 	case_fault();
+	case_ring_end_feed();
 	case_recover();
 	case_dead_retry();
 	case_start_down();
