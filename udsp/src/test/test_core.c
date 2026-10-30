@@ -11544,8 +11544,13 @@ static void case_fault(void)
 
 	CASE("a fault on a DOWN line clears only once the line takes a feed");
 	{
+		/* The DOWN line rests. A 1 ms down cadence reads its faults on
+		 * every ordinary pass, which the fast pace runs every 10 ms of
+		 * wall clock. */
+		setenv("UDSP_SLIC_DOWN_FAULT_MS", "1", 1);
 		if (!tc_up_ports(&t, "USA", 1)) {
 			CHECK(false);
+			unsetenv("UDSP_SLIC_DOWN_FAULT_MS");
 			return;
 		}
 		tc_pace_fast();
@@ -11568,6 +11573,7 @@ static void case_fault(void)
 		CHECK_UINT(tc_lf_confirmed(&t, 0), UDSP_LF_FWD_ACTIVE);
 		CHECK_UINT(tc_fault_events(0, true), 1);
 		tc_down(&t);
+		unsetenv("UDSP_SLIC_DOWN_FAULT_MS");
 	}
 
 	CASE("a reinit verdict on a plug-in without the op holds the line");
@@ -11769,8 +11775,11 @@ static void case_fault(void)
 
 	CASE("a DOWN request during a hold leaves the lifted line open");
 	{
+		/* The lift needs a fault read of the DOWN line at rest. */
+		setenv("UDSP_SLIC_DOWN_FAULT_MS", "1", 1);
 		if (!tc_up_ports(&t, "USA", 1)) {
 			CHECK(false);
+			unsetenv("UDSP_SLIC_DOWN_FAULT_MS");
 			return;
 		}
 		tc_pace_fast();
@@ -11793,6 +11802,7 @@ static void case_fault(void)
 		CHECK_UINT(tc_lf_confirmed(&t, 0), UDSP_LF_FWD_ACTIVE);
 		CHECK_UINT(tc_fault_events(0, true), 1);
 		tc_down(&t);
+		unsetenv("UDSP_SLIC_DOWN_FAULT_MS");
 	}
 }
 
@@ -12665,8 +12675,12 @@ static void case_start_down(void)
 
 	CASE("a recovery DONE keeps a line the consumer holds down open");
 	{
+		/* The REINIT read comes on the down cadence of the line at
+		 * rest. */
+		setenv("UDSP_SLIC_DOWN_FAULT_MS", "1", 1);
 		if (!tc_up_ports(&t, "USA", 1)) {
 			CHECK(false);
+			unsetenv("UDSP_SLIC_DOWN_FAULT_MS");
 			return;
 		}
 		tc_pace_fast();
@@ -12687,6 +12701,7 @@ static void case_start_down(void)
 		CHECK_UINT(tc_lf_confirmed(&t, 0), UDSP_LF_FWD_ACTIVE);
 		CHECK_UINT(tc_fault_events(0, true), 1);
 		tc_down(&t);
+		unsetenv("UDSP_SLIC_DOWN_FAULT_MS");
 	}
 
 	CASE("a dead line's return keeps a line the handle started down open");
@@ -12743,6 +12758,463 @@ static void case_start_down(void)
 		CHECK_UINT(tc_lf_confirmed(&t, 0), UDSP_LF_OPEN);
 		tc_down(&t);
 		tc_region_fast_drop();
+	}
+}
+
+static unsigned tc_monitor_reads(struct eh *t, unsigned line)
+{
+	struct udsp_slic_fake_chan_state st;
+
+	if (!udsp_slic_fake_chan_state_get(t->s->slic, line, &st))
+		return 0;
+	return st.monitor_count;
+}
+
+static unsigned tc_hook_errors(void)
+{
+	unsigned n = 0;
+
+	for (unsigned i = 0; i < eh_ev_len; i++)
+		n += eh_ev[i].type == UDSP_EV_HOOK &&
+		     eh_ev[i].u.hook.state == UDSP_HOOK_ERROR;
+
+	return n;
+}
+
+static bool tc_hook_transient(struct eh *t, unsigned line)
+{
+	bool off = false;
+
+	return udsp_line_hook_query(t->s, line, &off) == UDSP_TRANSIENT;
+}
+
+/* An edge source for the IDLE cases, with the down cadence of env. */
+static bool tc_up_down_idle(struct eh *t, int efd, const char *env)
+{
+	if (env)
+		setenv("UDSP_SLIC_DOWN_FAULT_MS", env, 1);
+	udsp_slic_irq_override(efd, POLLIN);
+
+	return tc_up_down(t, 2, false);
+}
+
+static void tc_down_idle(struct eh *t, int efd)
+{
+	tc_down(t);
+	udsp_slic_irq_override(-1, 0);
+	close(efd);
+	unsetenv("UDSP_SLIC_DOWN_FAULT_MS");
+}
+
+/*
+ * The down rest (slic_thread.c slic_down_rest_update): a line the consumer
+ * holds down on an open feed, with its hook machine idle on hook, takes no hook
+ * sample and no periodic monitor reading, and reads its faults on the down
+ * cadence. The fake reports the injected level whatever the feed, so a case
+ * sets the level the open feed would give.
+ */
+static void case_down_rest(void)
+{
+	struct udsp_counters cn;
+	struct udsp_ring ring;
+	struct eh t;
+	uint64_t one = 1;
+	unsigned h0, h1, m0, m1, f0, f1, n;
+	bool off;
+	int efd;
+
+	CASE("the down cadence takes its production default");
+	{
+		CHECK_UINT(SLIC_DOWN_FAULT_MS, 10000);
+		unsetenv("UDSP_SLIC_DOWN_FAULT_MS");
+		if (!tc_up_down(&t, 1, false)) {
+			CHECK(false);
+			return;
+		}
+		CHECK_UINT(t.s->down_fault_ms, SLIC_DOWN_FAULT_MS);
+		tc_down(&t);
+		setenv("UDSP_SLIC_DOWN_FAULT_MS", "0", 1);
+		if (!tc_up_down(&t, 1, false)) {
+			CHECK(false);
+			unsetenv("UDSP_SLIC_DOWN_FAULT_MS");
+			return;
+		}
+		CHECK_UINT(t.s->down_fault_ms, SLIC_DOWN_FAULT_MS);
+		tc_down(&t);
+		unsetenv("UDSP_SLIC_DOWN_FAULT_MS");
+	}
+
+	CASE("a line at down rest takes no hook sample and no monitor reading");
+	{
+		if (!tc_up_down(&t, 2, false)) {
+			CHECK(false);
+			return;
+		}
+		CHECK(udsp_line_state(t.s, 1, UDSP_LINE_ACTIVE) == UDSP_OK);
+		tc_pace_fast();
+		eh_wait_ms(&t, 200);
+		h0 = tc_hook_reads(&t, 0);
+		h1 = tc_hook_reads(&t, 1);
+		m0 = tc_monitor_reads(&t, 0);
+		m1 = tc_monitor_reads(&t, 1);
+		f0 = tc_fault_reads(&t, 0);
+		eh_wait_ms(&t, 11000);
+		CHECK_UINT(tc_hook_reads(&t, 0), h0);
+		CHECK_UINT(tc_monitor_reads(&t, 0), m0);
+		CHECK(tc_hook_reads(&t, 1) - h1 >= 1000);
+		CHECK(tc_monitor_reads(&t, 1) - m1 >= 1);
+		/* Line 1 is in service, so line 0 keeps the ordinary cadence:
+		 * it carries the device reset verdict (event.h). */
+		CHECK(tc_fault_reads(&t, 0) - f0 >= 10);
+		CHECK(tc_hook_transient(&t, 0));
+		tc_down(&t);
+	}
+
+	CASE("line 1 at down rest keeps the down cadence while line 0 serves");
+	{
+		setenv("UDSP_SLIC_DOWN_FAULT_MS", "60000", 1);
+		if (!tc_up_down(&t, 2, false)) {
+			CHECK(false);
+			unsetenv("UDSP_SLIC_DOWN_FAULT_MS");
+			return;
+		}
+		CHECK(udsp_line_state(t.s, 0, UDSP_LINE_ACTIVE) == UDSP_OK);
+		tc_pace_fast();
+		eh_wait_ms(&t, 200);
+		f0 = tc_fault_reads(&t, 0);
+		f1 = tc_fault_reads(&t, 1);
+		eh_wait_ms(&t, 5000);
+		CHECK(tc_fault_reads(&t, 0) - f0 >= 4);
+		CHECK_UINT(tc_fault_reads(&t, 1), f1);
+		tc_down(&t);
+		unsetenv("UDSP_SLIC_DOWN_FAULT_MS");
+	}
+
+	CASE("lines at down rest read their faults on the down cadence");
+	{
+		setenv("UDSP_SLIC_DOWN_FAULT_MS", "500", 1);
+		if (!tc_up_down(&t, 2, false)) {
+			CHECK(false);
+			unsetenv("UDSP_SLIC_DOWN_FAULT_MS");
+			return;
+		}
+		tc_pace_fast();
+		eh_wait_ms(&t, 200);
+		f0 = tc_fault_reads(&t, 0);
+		f1 = tc_fault_reads(&t, 1);
+		h0 = tc_hook_reads(&t, 0);
+		/* The deadline is wall clock; the read comes at the first
+		 * ordinary pass at or after it, 10 ms of wall at this pace. */
+		tc_wait_real_ms(&t, 2200);
+		CHECK(tc_fault_reads(&t, 0) - f0 >= 2);
+		CHECK(tc_fault_reads(&t, 0) - f0 <= 5);
+		CHECK(tc_fault_reads(&t, 1) - f1 >= 2);
+		CHECK(tc_fault_reads(&t, 1) - f1 <= 5);
+		CHECK_UINT(tc_hook_reads(&t, 0), h0);
+		tc_down(&t);
+		unsetenv("UDSP_SLIC_DOWN_FAULT_MS");
+	}
+
+	CASE("an edge in idle reads the faults of a line at down rest");
+	{
+		efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+		CHECK(efd >= 0);
+		if (!tc_up_down_idle(&t, efd, "60000")) {
+			CHECK(false);
+			tc_down_idle(&t, efd);
+			return;
+		}
+		eh_wait_ms(&t, 2100);
+		CHECK_UINT(t.s->slic_mode, SLIC_MODE_IDLE);
+		f0 = tc_fault_reads(&t, 0);
+		h0 = tc_hook_reads(&t, 0);
+		n = tc_fault_events(0, false);
+		udsp_slic_fake_fault_set(t.s->slic, 0, UDSP_FAULT_SLIC_THERMAL);
+		CHECK(write(efd, &one, sizeof(one)) == (ssize_t)sizeof(one));
+		/* The 60 s cadence leaves the edge as the one read in the
+		 * window, so the count is exact however long the wait runs. */
+		tc_wait_real_ms(&t, 200);
+		CHECK_UINT(tc_fault_reads(&t, 0), f0 + 1);
+		CHECK_UINT(tc_hook_reads(&t, 0), h0);
+		CHECK(tc_fault_events(0, false) > n);
+		udsp_slic_fake_fault_set(t.s->slic, 0, 0);
+		tc_down_idle(&t, efd);
+	}
+
+	CASE("an asserted pin reads a resting line's faults on every pass");
+	{
+		setenv("UDSP_SLIC_DOWN_FAULT_MS", "60000", 1);
+		if (!tc_up_down(&t, 2, false)) {
+			CHECK(false);
+			unsetenv("UDSP_SLIC_DOWN_FAULT_MS");
+			return;
+		}
+		tc_pace_fast();
+		eh_wait_ms(&t, 300);
+		f0 = tc_fault_reads(&t, 0);
+		h0 = tc_hook_reads(&t, 0);
+		udsp_slic_irq_level_override(0);
+		eh_wait_ms(&t, 200);
+		udsp_slic_irq_level_override(-1);
+		CHECK(tc_fault_reads(&t, 0) - f0 >= 10);
+		CHECK_UINT(tc_hook_reads(&t, 0), h0);
+		tc_down(&t);
+		unsetenv("UDSP_SLIC_DOWN_FAULT_MS");
+	}
+
+	CASE("a raise publishes a fresh level and seizes once");
+	{
+		efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+		CHECK(efd >= 0);
+		if (!tc_up_down_idle(&t, efd, NULL)) {
+			CHECK(false);
+			tc_down_idle(&t, efd);
+			return;
+		}
+		eh_wait_ms(&t, 2100);
+		CHECK_UINT(t.s->slic_mode, SLIC_MODE_IDLE);
+		CHECK(tc_hook_transient(&t, 0));
+		udsp_counters(t.s, &cn);
+		h0 = (unsigned)cn.hook_gaps;
+		eh_ev_poll(&t);
+		n = eh_seize_count();
+		CHECK(udsp_line_state(t.s, 0, UDSP_LINE_ACTIVE) == UDSP_OK);
+		off = true;
+		CHECK(udsp_line_hook_query(t.s, 0, &off) == UDSP_OK);
+		CHECK(!off);
+		CHECK_UINT(t.s->slic_mode, SLIC_MODE_BURST);
+		tc_hook_set(&t, true);
+		eh_wait_ms(&t, 500);
+		CHECK_UINT(eh_seize_count(), n + 1);
+		CHECK_UINT(tc_hook_errors(), 0);
+		udsp_counters(t.s, &cn);
+		CHECK_UINT(cn.hook_gaps, h0);
+		tc_hook_set(&t, false);
+		tc_down_idle(&t, efd);
+	}
+
+	CASE("a handset lifted before the raise seizes once at the raise");
+	{
+		if (!tc_up_down(&t, 2, false)) {
+			CHECK(false);
+			return;
+		}
+		eh_wait_ms(&t, 300);
+		eh_ev_poll(&t);
+		n = eh_seize_count();
+		tc_hook_set(&t, true);
+		eh_wait_ms(&t, 300);
+		CHECK_UINT(eh_seize_count(), n);
+		CHECK(udsp_line_state(t.s, 0, UDSP_LINE_ACTIVE) == UDSP_OK);
+		eh_wait_ms(&t, 300);
+		CHECK_UINT(eh_seize_count(), n + 1);
+		CHECK_UINT(tc_hook_errors(), 0);
+		tc_hook_set(&t, false);
+		tc_down(&t);
+	}
+
+	CASE("a line that goes down off hook is sampled until its release");
+	{
+		if (!tc_up_ports(&t, "USA", 1)) {
+			CHECK(false);
+			return;
+		}
+		eh_wait_ms(&t, 100);
+		tc_hook_set(&t, true);
+		eh_wait_ms(&t, 300);
+		CHECK_UINT(tc_hook_last(), UDSP_HOOK_SEIZE);
+		CHECK(udsp_line_state(t.s, 0, UDSP_LINE_DOWN) == UDSP_OK);
+		h0 = tc_hook_reads(&t, 0);
+		eh_wait_ms(&t, 300);
+		CHECK(tc_hook_reads(&t, 0) - h0 >= 10);
+		tc_hook_set(&t, false);
+		eh_wait_ms(&t, 2000);
+		CHECK_UINT(tc_hook_last(), UDSP_HOOK_RELEASE);
+		eh_wait_ms(&t, 100);
+		h0 = tc_hook_reads(&t, 0);
+		eh_wait_ms(&t, 500);
+		CHECK_UINT(tc_hook_reads(&t, 0), h0);
+		CHECK(tc_hook_transient(&t, 0));
+		tc_down(&t);
+	}
+
+	CASE("a short removal off hook never rests and reports no release");
+	{
+		if (!tc_up_ports(&t, "USA", 1)) {
+			CHECK(false);
+			return;
+		}
+		eh_wait_ms(&t, 100);
+		tc_hook_set(&t, true);
+		eh_wait_ms(&t, 300);
+		CHECK(udsp_line_state(t.s, 0, UDSP_LINE_DOWN) == UDSP_OK);
+		h0 = tc_hook_reads(&t, 0);
+		eh_wait_ms(&t, 500);
+		CHECK(udsp_line_state(t.s, 0, UDSP_LINE_ACTIVE) == UDSP_OK);
+		CHECK(tc_hook_reads(&t, 0) - h0 >= 20);
+		eh_wait_ms(&t, 300);
+		CHECK_UINT(tc_hook_last(), UDSP_HOOK_SEIZE);
+		tc_hook_set(&t, false);
+		tc_down(&t);
+	}
+
+	CASE("a gap candidate goes out before the line rests");
+	{
+		if (!tc_up_ports(&t, "USA", 1)) {
+			CHECK(false);
+			return;
+		}
+		eh_wait_ms(&t, 100);
+		/* Each hook read takes 40 ms of wall clock, so the feed record
+		 * of the DOWN runs between the read that finds the candidate
+		 * and the read that resolves it. */
+		udsp_slic_fake_delay_set(t.s->slic, UDSP_SLIC_FAKE_HOOK_READ,
+					 40);
+		udsp_slic_fake_hook_inject(t.s->slic, 0, false, 2);
+		tc_wait_real_ms(&t, 20);
+		CHECK(udsp_line_state(t.s, 0, UDSP_LINE_DOWN) == UDSP_OK);
+		udsp_slic_fake_delay_set(t.s->slic, UDSP_SLIC_FAKE_HOOK_READ,
+					 0);
+		tc_wait_real_ms(&t, 300);
+		udsp_counters(t.s, &cn);
+		CHECK_UINT(cn.hook_moved_gaps, 1);
+		h0 = tc_hook_reads(&t, 0);
+		tc_wait_real_ms(&t, 300);
+		CHECK_UINT(tc_hook_reads(&t, 0), h0);
+		tc_down(&t);
+	}
+
+	CASE("a ring ends the down rest with its relay record");
+	{
+		int end_at = -1, seize_at = -1;
+
+		if (!tc_up_down(&t, 2, false)) {
+			CHECK(false);
+			return;
+		}
+		eh_wait_ms(&t, 300);
+		h0 = tc_hook_reads(&t, 0);
+		tc_ring_fill(&ring, 2000, 4000, 30000);
+		CHECK(udsp_ring_start(t.s, 0, &ring) == UDSP_OK);
+		eh_wait_ms(&t, 200);
+		CHECK(tc_hook_reads(&t, 0) - h0 >= 10);
+		tc_hook_set(&t, true);
+		eh_wait_ms(&t, 300);
+		for (unsigned i = 0; i < eh_ev_len; i++) {
+			if (eh_ev[i].type == UDSP_EV_RING_END && end_at < 0)
+				end_at = (int)i;
+			if (eh_ev[i].type == UDSP_EV_HOOK &&
+			    eh_ev[i].line == 0 &&
+			    eh_ev[i].u.hook.state == UDSP_HOOK_SEIZE &&
+			    seize_at < 0)
+				seize_at = (int)i;
+		}
+		CHECK(end_at >= 0);
+		CHECK(seize_at >= 0);
+		CHECK(end_at < seize_at);
+		tc_hook_set(&t, false);
+		tc_down(&t);
+	}
+
+	CASE("a line returns to down rest after a ring that ends unanswered");
+	{
+		if (!tc_up_down(&t, 2, false)) {
+			CHECK(false);
+			return;
+		}
+		eh_wait_ms(&t, 300);
+		tc_ring_fill(&ring, 200, 300, 600);
+		CHECK(udsp_ring_start(t.s, 0, &ring) == UDSP_OK);
+		eh_wait_ms(&t, 1500);
+		CHECK(eh_ev_find(UDSP_EV_RING_END, 0) != NULL);
+		CHECK_UINT(tc_lf_confirmed(&t, 0), UDSP_LF_OPEN);
+		h0 = tc_hook_reads(&t, 0);
+		eh_wait_ms(&t, 300);
+		CHECK_UINT(tc_hook_reads(&t, 0), h0);
+		tc_down(&t);
+	}
+
+	CASE("an MWI lamp ends the down rest while it is on");
+	{
+		if (!tc_up_down(&t, 2, false)) {
+			CHECK(false);
+			return;
+		}
+		eh_wait_ms(&t, 300);
+		h0 = tc_hook_reads(&t, 0);
+		CHECK(udsp_mwi(t.s, 0, true) == UDSP_OK);
+		eh_wait_ms(&t, 200);
+		CHECK(tc_hook_reads(&t, 0) - h0 >= 10);
+		CHECK(udsp_mwi(t.s, 0, false) == UDSP_OK);
+		eh_wait_ms(&t, 200);
+		h0 = tc_hook_reads(&t, 0);
+		eh_wait_ms(&t, 300);
+		CHECK_UINT(tc_hook_reads(&t, 0), h0);
+		tc_down(&t);
+	}
+
+	CASE("a recovery ends the lamp, and the line returns to down rest");
+	{
+		setenv("UDSP_SLIC_DOWN_FAULT_MS", "1", 1);
+		if (!tc_up_down(&t, 2, false)) {
+			CHECK(false);
+			unsetenv("UDSP_SLIC_DOWN_FAULT_MS");
+			return;
+		}
+		tc_pace_fast();
+		eh_wait_ms(&t, 300);
+		CHECK(udsp_mwi(t.s, 0, true) == UDSP_OK);
+		eh_wait_ms(&t, 200);
+		h0 = tc_hook_reads(&t, 0);
+		eh_wait_ms(&t, 200);
+		CHECK(tc_hook_reads(&t, 0) - h0 >= 10);
+		/* The reinit ends at the open feed, so the lamp is off and the
+		 * line rests once the DONE wrote its base. */
+		udsp_slic_fake_fault_set(t.s->slic, 0, UDSP_FAULT_SLIC_REINIT);
+		eh_wait_ms(&t, 4000);
+		CHECK_UINT(tc_reinit_count(&t, 0), 1);
+		udsp_slic_fake_fault_set(t.s->slic, 0, 0);
+		eh_wait_ms(&t, 500);
+		h0 = tc_hook_reads(&t, 0);
+		eh_wait_ms(&t, 300);
+		CHECK_UINT(tc_hook_reads(&t, 0), h0);
+		tc_down(&t);
+		unsetenv("UDSP_SLIC_DOWN_FAULT_MS");
+	}
+
+	CASE("a polarity change at down rest writes no feed and reads no hook");
+	{
+		if (!tc_up_down(&t, 2, false)) {
+			CHECK(false);
+			return;
+		}
+		eh_wait_ms(&t, 300);
+		n = tc_linefeed_count(&t, 0);
+		h0 = tc_hook_reads(&t, 0);
+		CHECK(udsp_line_polarity(t.s, 0, UDSP_POL_REVERSE) == UDSP_OK);
+		eh_wait_ms(&t, 200);
+		CHECK_UINT(tc_linefeed_count(&t, 0), n);
+		CHECK_UINT(tc_hook_reads(&t, 0), h0);
+		tc_down(&t);
+	}
+
+	CASE("a line test at down rest reads no hook and keeps it transient");
+	{
+		struct udsp_slic_fake_chan_state st;
+		int32_t status = -1;
+
+		if (!tc_up_down(&t, 2, false)) {
+			CHECK(false);
+			return;
+		}
+		eh_wait_ms(&t, 300);
+		h0 = tc_hook_reads(&t, 0);
+		CHECK(tc_test_run(&t, 0, UDSP_TEST_GR909, &status));
+		CHECK_UINT(tc_hook_reads(&t, 0), h0);
+		CHECK(tc_hook_transient(&t, 0));
+		CHECK(udsp_slic_fake_chan_state_get(t.s->slic, 0, &st));
+		CHECK_UINT(st.mlt_count, 1);
+		tc_down(&t);
 	}
 }
 
@@ -19419,6 +19891,7 @@ int main(void)
 	case_recover();
 	case_dead_retry();
 	case_start_down();
+	case_down_rest();
 	case_monitor();
 	case_emitter();
 	case_restart();

@@ -53,6 +53,7 @@
  * and on the timeout to the next SAFETY sample (SLIC_IDLE_SAMPLE_MS, which
  * catches a level change whose edge was lost) or fault poll
  * (SLIC_IDLE_FAULT_MS). An edge or a changed level in IDLE enters BURST.
+ * Every mode skips a line at down rest (slic_thread.c slic_down_rest_update).
  */
 enum slic_mode {
 	SLIC_MODE_POLL = 0,
@@ -90,6 +91,17 @@ enum slic_mode {
  */
 #define SLIC_DEAD_RETRY_MS	10000u
 /*
+ * The fault read cadence of a line at down rest: the consumer holds it open,
+ * so no call waits on an alarm, but the shared interrupt pin still needs the
+ * alarms read off it. The read runs on the first ordinary fault pass at or
+ * after the deadline, on the CLOCK_MONOTONIC wall clock; an edge in IDLE and
+ * an asserted pin read the line at once.
+ *
+ * This is the production cadence. A test shortens it through the env var
+ * UDSP_SLIC_DOWN_FAULT_MS, read once at open into udsp.down_fault_ms.
+ */
+#define SLIC_DOWN_FAULT_MS	10000u
+/*
  * The engine holds a line whose recovery DONE never came. It
  * does so after two deadlines of half this window pass with the recovery
  * still in flight. The window outlasts the slic thread's DONE re-post budget
@@ -99,7 +111,7 @@ enum slic_mode {
 #define SLIC_RECOVER_LOST_MS	40000u
 /* The line monitor cadence: every SLIC_IDLE_MONITOR_MS of wall clock in
  * IDLE, every SLIC_MONITOR_PERIOD passes in BURST and POLL (the same ten
- * seconds at tick rate). */
+ * seconds at tick rate). A line at down rest takes no periodic reading. */
 #define SLIC_IDLE_MONITOR_MS	10000u
 #define SLIC_MONITOR_PERIOD	1000u
 

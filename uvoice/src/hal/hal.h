@@ -1857,7 +1857,8 @@ struct hal_ops {
 	enum hal_status (*line_polarity_set)(struct hal *h, unsigned int line,
 					     enum hal_polarity pol);
 	/* fast: current hook state, for start-up and for resynchronising after
-	 * a dropped event. */
+	 * a dropped event. A line held down answers HAL_TRANSIENT while it
+	 * rests: the backend takes no hook sample there. */
 	enum hal_status (*line_hook_query)(struct hal *h, unsigned int line,
 					   bool *offhook);
 	/* fast: pushed once per line at bring-up; the backend decides flash vs

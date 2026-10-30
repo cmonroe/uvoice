@@ -460,7 +460,8 @@ struct udsp_chan {
 	 * handle opened with udsp_config.lines_start_down and no request came
 	 * yet. Every feed raise the engine makes on its own (the start, a
 	 * recovery DONE, a dead line's return) reads it: a line the consumer
-	 * holds down stays open through them. Engine-owned. */
+	 * holds down stays open through them. Engine-owned; down_pub carries
+	 * it to the slic thread. */
 	bool down_wanted;
 	bool core_windows;		/* udsp_line_hook_timing was used */
 	/* Mute, read by the media hooks. Atomic so a test can observe the
@@ -800,7 +801,9 @@ struct udsp_chan {
 	bool rec_fail_logged;
 	bool slic_level;		/* slic thread only: the last sample */
 	bool slic_primed;		/* slic thread only */
-	_Atomic bool sampling;		/* slic thread reads, control sets */
+	/* Slic thread reads, control sets. A line at down rest keeps it set;
+	 * down_rest stops its reads. */
+	_Atomic bool sampling;
 	/* True from the slic thread's line gate until the metallic line test
 	 * returns. The plug-in holds the line for that whole time: it opens
 	 * the linefeed and rings the line for the ringer measurement, so every
@@ -813,6 +816,23 @@ struct udsp_chan {
 	 * that rings or carries a burst, and the slic thread tests it again
 	 * before it calls the plug-in. */
 	_Atomic bool owned;
+	/* The engine's answers for the down rest of the slic thread
+	 * (slic_thread.c slic_down_rest_update). down_pub follows down_wanted.
+	 * hook_idle_pub says the hook machine is started and idle; every tick
+	 * clears it before its pops and sets it after the machine ran. A fault
+	 * hold pops records without the machine (chan.c chan_fault_hold) and
+	 * leaves it as it stands, because the stage did not move either. */
+	_Atomic bool down_pub;
+	_Atomic bool hook_idle_pub;
+	/* Slic thread only. down_rest: the line rests, with no hook sample and
+	 * no periodic monitor reading. relay_on and lamp_on: the last ring
+	 * relay and MWI lamp state the part took; both power the line and
+	 * leave lf_confirmed as it was. down_fault_us: the CLOCK_MONOTONIC
+	 * instant of the next fault read of a resting line. */
+	bool down_rest;
+	bool relay_on;
+	bool lamp_on;
+	uint64_t down_fault_us;
 
 	int16_t ul[UDSP_FRAME_MAX];
 	int16_t dl[UDSP_FRAME_MAX];
@@ -961,5 +981,8 @@ void chan_digit_hold_arm(struct udsp *s, struct udsp_chan *c);
 bool udsp_hook_edge_push(struct udsp_hook_edges *e, uint32_t stamp_ms, bool level,
 			 uint8_t flags, uint16_t gap_ms);
 bool udsp_hook_edge_pop(struct udsp_hook_edges *e, struct udsp_hook_edge *out);
+/* True when the engine popped every record the slic thread pushed. Either
+ * side may ask. */
+bool udsp_hook_edge_empty(struct udsp_hook_edges *e);
 
 #endif

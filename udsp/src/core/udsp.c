@@ -202,6 +202,13 @@ static uint32_t dead_retry_ms_get(void)
 	return env_ms_get("UDSP_SLIC_DEAD_RETRY_MS", SLIC_DEAD_RETRY_MS);
 }
 
+/* The fault read cadence of a resting line, SLIC_DOWN_FAULT_MS unless a test
+ * overrides it. */
+static uint32_t down_fault_ms_get(void)
+{
+	return env_ms_get("UDSP_SLIC_DOWN_FAULT_MS", SLIC_DOWN_FAULT_MS);
+}
+
 /* The watchdog cadence, UDSP_WATCHDOG_MS unless a test overrides it. The tick
  * freeze it declares fatal is two runs, so a test that shortens the cadence
  * shortens that deadline with it. */
@@ -2404,6 +2411,7 @@ udsp_t *udsp_open(const struct udsp_config *cfg, int event_fd)
 		goto fail;
 	s->max_ticks = max_ticks_get();
 	s->dead_retry_ms = dead_retry_ms_get();
+	s->down_fault_ms = down_fault_ms_get();
 	/* The lost-end bound of a rendered telephone-event is read once, and
 	 * this is the control thread, where a getenv is safe. Every later read
 	 * belongs to the engine tick and takes the cached value. */

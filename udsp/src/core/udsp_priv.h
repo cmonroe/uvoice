@@ -213,6 +213,11 @@ struct udsp {
 	 * production value is SLIC_DEAD_RETRY_MS; a test sets a short cadence
 	 * through UDSP_SLIC_DEAD_RETRY_MS. The slic thread reads it alone. */
 	uint32_t dead_retry_ms;
+	/* The fault read cadence of a resting line in ms, read once at open.
+	 * The production value is SLIC_DOWN_FAULT_MS; a test sets a short
+	 * cadence through UDSP_SLIC_DOWN_FAULT_MS. The slic thread reads it
+	 * alone. */
+	uint32_t down_fault_ms;
 	/* The lost-end bound of a telephone-event the receive side renders, in
 	 * ms, read once at open so the engine tick never runs a getenv. The
 	 * production value is UDSP_TEV_PLAY_TIMEOUT_MS; a test sets a short
@@ -591,6 +596,10 @@ void udsp_tdm_override(const struct udsp_tdm_ops *ops);
  * eight bytes from at offset 0 to acknowledge an edge, so an eventfd serves.
  * fd -1 restores the host path. Read at udsp_open. */
 void udsp_slic_irq_override(int fd, short events);
+/* The level of the interrupt pin a test injects in place of the host's gpio
+ * read: 0 asserted (the pin is active low), 1 idle, -1 restores the host
+ * read. Safe from another thread. */
+void udsp_slic_irq_level_override(int level);
 /* The same injection point for the T.38 gateway: set before udsp_open, NULL
  * restores the dlopen of udsp_config.fax_plugin. */
 void udsp_fax_override(const struct udsp_fax_ops *ops);

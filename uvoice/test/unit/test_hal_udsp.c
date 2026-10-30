@@ -729,6 +729,26 @@ static void probe_down(struct probe *p)
 	probe_close(p);
 }
 
+/*
+ * The raise that line/line.c lines_start makes for every line in service. The
+ * backend opens with lines_start_down, and the library samples no hook and
+ * reads no monitor on a line left open (udsp slic_thread.c
+ * slic_down_rest_update). A case that drives the hook or the monitor raises
+ * its lines first.
+ */
+static bool probe_raise(struct probe *p)
+{
+	const struct hal_cap *cap = hal_backend_ops.cap_get(p->h);
+
+	for (unsigned int line = 0; line < cap->lines; line++) {
+		if (hal_backend_ops.line_state_set(p->h, line,
+						   HAL_LINE_ACTIVE) != HAL_OK)
+			return false;
+	}
+
+	return true;
+}
+
 /* --- the fake slic oracles ------------------------------------------------- */
 
 /*
@@ -2332,6 +2352,18 @@ static void test_hook_events(void)
 	probe_wait(&p, 200);
 	p.ev_len = 0;
 
+	CASE("a line left down answers transient and reports no hook");
+	CHECK(hal_backend_ops.line_hook_query(p.h, 0, &offhook) ==
+	      HAL_TRANSIENT);
+	udsp_slic_fake_hook_set(p.h->s->slic, 0, true);
+	probe_wait(&p, 400);
+	CHECK(hook_find(&p, HAL_HOOK_SEIZE) == NULL);
+	udsp_slic_fake_hook_set(p.h->s->slic, 0, false);
+
+	CHECK(probe_raise(&p));
+	probe_wait(&p, 200);
+	p.ev_len = 0;
+
 	CASE("the line reads on hook before anything is injected");
 	CHECK(hal_backend_ops.line_hook_query(p.h, 0, &offhook) == HAL_OK);
 	CHECK(!offhook);
@@ -2932,6 +2964,8 @@ static void test_completion_queue(void)
 
 	/* The other half of the rule. A hook edge under the same full fd is a
 	 * class (a) record: it is dropped and counted, and nothing holds it. */
+	CHECK(probe_raise(&p));
+	probe_wait(&p, 100);
 	probe_discard(&p);
 	hal_backend_ops.counters_get(p.h, &before);
 	CHECK(probe_fill(&p) > 0);
@@ -5387,6 +5421,7 @@ static void test_lec_stats_get(void)
 		probe_down(&p);
 		return;
 	}
+	CHECK(probe_raise(&p));
 
 	memset(&lec, 0xa5, sizeof(lec));
 
@@ -5716,6 +5751,7 @@ static void test_monitor_get(void)
 		probe_down(&p);
 		return;
 	}
+	CHECK(probe_raise(&p));
 
 	CASE("a line with no reading yet answers valid zero and no instant");
 	memset(&mon, 0xa5, sizeof(mon));
@@ -7099,6 +7135,8 @@ static bool lec_canceller_up(struct probe *p, struct wire *w)
 	if (!media_up(p, w, &m))
 		return false;
 
+	if (!probe_raise(p))
+		return false;
 	udsp_slic_fake_hook_set(p->h->s->slic, 0, true);
 	probe_wait(p, 400);
 
@@ -8053,6 +8091,7 @@ static void test_media_refusals(void)
 	ccfg.ec_tail_ms = 32;
 	CHECK(hal_backend_ops.channel_config_set(p.h, 0, &ccfg) == HAL_OK);
 	/* Off hook, because the library runs no canceller on an open loop. */
+	CHECK(probe_raise(&p));
 	udsp_slic_fake_hook_set(p.h->s->slic, 0, true);
 	probe_wait(&p, 400);
 
@@ -8849,6 +8888,7 @@ static void test_monitor_dead_line(void)
 		probe_down(&p);
 		return;
 	}
+	CHECK(probe_raise(&p));
 
 	/* Only line 0 samples while the fake returns hook errors, so the other
 	 * line stays live, the shape the dead-line stream case uses. */
@@ -8886,6 +8926,7 @@ static void test_dead_line_stream_fault(void)
 		probe_down(&p);
 		return;
 	}
+	CHECK(probe_raise(&p));
 
 	media_build(&m, &w, HAL_CODEC_PCMU, 0, 20);
 	SUITE_CHECK(media_up(&p, &w, &m));

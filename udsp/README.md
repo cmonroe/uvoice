@@ -187,6 +187,8 @@ applies unchanged:
 - `UDSP_WATCHDOG_MS`: watchdog cadence that publishes the engine counters
   (default 1000 ms).
 - `UDSP_SLIC_DEAD_RETRY_MS`: dead-line init retry cadence (default 10000 ms).
+- `UDSP_SLIC_DOWN_FAULT_MS`: fault read cadence of a line at down rest
+  (default 10000 ms).
 - `UDSP_TEV_PLAY_TIMEOUT_MS`: lost-end bound of a received telephone event
   (default 120 ms).
 

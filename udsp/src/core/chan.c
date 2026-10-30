@@ -1457,6 +1457,12 @@ bool udsp_hook_edge_pop(struct udsp_hook_edges *e, struct udsp_hook_edge *out)
 	return true;
 }
 
+bool udsp_hook_edge_empty(struct udsp_hook_edges *e)
+{
+	return atomic_load_explicit(&e->head, memory_order_acquire) ==
+	       atomic_load_explicit(&e->tail, memory_order_acquire);
+}
+
 /* --- slic record batching ------------------------------------------------ */
 
 static struct slic_rec *batch_add(struct chan_batch *b, enum slic_rec_type type,
@@ -2568,6 +2574,10 @@ static int chan_cmd_run(struct udsp *s, const struct udsp_cmd *cmd,
 		bool sleep = st == UDSP_LINE_SLEEP;
 
 		c->down_wanted = st == UDSP_LINE_DOWN;
+		/* Before the feed record, so the slic thread that runs it
+		 * reads the new request. */
+		atomic_store_explicit(&c->down_pub, c->down_wanted,
+				      memory_order_release);
 		chan_base_lf_set(s, c, b, chan_state_lf(c, st));
 		if (s->ops->powersave &&
 		    sleep != atomic_load_explicit(&c->ps_confirmed,
@@ -3185,6 +3195,10 @@ static void chan_line_control(struct udsp *s, struct udsp_chan *c,
 	bool stall;
 	unsigned n = 0;
 
+	/* Cleared before any pop, also of a record pushed after this store: a
+	 * slic thread that reads the ring empty then cannot read the idle
+	 * answer of the machine before that record. */
+	atomic_store_explicit(&c->hook_idle_pub, false, memory_order_release);
 	while (n++ < UDSP_HOOK_EDGE_PER_TICK && udsp_hook_edge_pop(&c->edges, &edge)) {
 		uint32_t stamp = edge.stamp_ms;
 
@@ -3222,6 +3236,10 @@ static void chan_line_control(struct udsp *s, struct udsp_chan *c,
 		hook_trace_stall_push(s, c, now_ms, jump);
 	}
 	chan_machines_run(s, c, now_ms, c->hook_level, &sample);
+	atomic_store_explicit(&c->hook_idle_pub,
+			      c->hook.started &&
+			      c->hook.stage == LINE_HOOK_IDLE,
+			      memory_order_release);
 	chan_journal_run(s, c, &b);
 	batch_flush(s, &b, 0, NULL);
 }
@@ -3986,6 +4004,8 @@ void udsp_chan_reset(struct udsp *s, unsigned line, unsigned rate)
 	atomic_init(&c->gain_confirmed, 0u);
 	c->state = UDSP_LINE_DOWN;
 	c->down_wanted = s->cfg.lines_start_down;
+	atomic_init(&c->down_pub, c->down_wanted);
+	atomic_init(&c->hook_idle_pub, false);
 }
 
 void udsp_chan_all_reset(struct udsp *s, unsigned lines, unsigned rate)

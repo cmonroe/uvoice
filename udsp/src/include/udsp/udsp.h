@@ -358,7 +358,9 @@ struct udsp_config {
 	 * udsp_line_state asks for a state above UDSP_LINE_DOWN. Zero keeps
 	 * the default: every initialised line takes the active feed at start.
 	 * A consumer whose lines carry battery only while they are in service
-	 * sets it and raises each line itself.
+	 * sets it and raises each line itself. A line held open goes to down
+	 * rest after its boot report: no hook sample, and udsp_line_hook_query
+	 * answers UDSP_TRANSIENT until the raise.
 	 */
 	bool lines_start_down;
 };
@@ -1155,7 +1157,8 @@ enum udsp_status udsp_stop(udsp_t *s, struct udsp_job *job);
 /* --- line control (SYNC-SLIC unless noted) --- */
 enum udsp_status udsp_line_state(udsp_t *s, unsigned line, enum udsp_line_state st);
 enum udsp_status udsp_line_polarity(udsp_t *s, unsigned line, enum udsp_polarity pol);
-/* fastpath: cached hook state, never touches SPI. */
+/* fastpath: cached hook state, never touches SPI. UDSP_TRANSIENT for a line
+ * at down rest, which takes no hook sample. */
 enum udsp_status udsp_line_hook_query(udsp_t *s, unsigned line, bool *offhook);
 enum udsp_status udsp_line_hook_timing(udsp_t *s, unsigned line,
 				       uint32_t flash_min_ms, uint32_t flash_max_ms,
@@ -1251,7 +1254,9 @@ enum udsp_status udsp_line_lec_latch_clear(udsp_t *s, unsigned line);
 /*
  * The newest line-monitor reading of one analog line. The slic thread samples
  * every line on a 10 s cadence while it idles, on a fixed pass count while it
- * polls hooks, and once at every fault edge; the getter copies
+ * polls hooks, and once at every fault edge. A line at down rest (a line held
+ * down on an open feed, its hook machine idle) takes no periodic sample and
+ * keeps its last reading; the getter copies
  * the double-buffer snapshot, the shape udsp_line_lec_stats uses.
  *
  * valid is 0 until the first reading arrives; the measurement fields, the raw

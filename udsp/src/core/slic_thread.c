@@ -7,7 +7,8 @@
  * The slic thread. It blocks in ppoll over the command eventfd and the tick
  * eventfd, and per wake it executes the SLIC records the engine produced, runs
  * at most one SLOW job step, samples the hook of every live line once and
- * polls the fault sources.
+ * polls the fault sources. A line at down rest takes no hook sample
+ * (slic_down_rest_update).
  *
  * Time. Its clock is the engine's tick counter, never its own: every stamp it
  * puts on a hook edge is in the engine time base, so the line machines see one
@@ -37,6 +38,9 @@
  * libudsp decodes none of those bytes (slic.h); it only refuses a length that
  * cannot hold a head. */
 #define SLIC_MLT_HEAD_BYTES	8u
+
+static void slic_down_rest_update(struct udsp *s, struct udsp_chan *c,
+				  bool sample);
 
 /*
  * The thread runs SCHED_FIFO below the net thread (udsp.slic_prio), so a hook
@@ -210,15 +214,22 @@ static void slic_rec_confirm(struct udsp *s, const struct slic_rec *rec)
 	case SLIC_REC_POLARITY:
 		atomic_store_explicit(&c->lf_confirmed, rec->arg,
 				      memory_order_release);
+		slic_down_rest_update(s, c, true);
 		return;
 	case SLIC_REC_RING_RELAY:
 		/* The vendor ring stop leaves the active feed on the part:
 		 * ProSLIC_RingStop writes LF_FWD_ACTIVE. The confirmed feed
 		 * follows it, so a held line's OPEN after it is retried. */
+		c->relay_on = rec->arg != 0;
 		if (!rec->arg)
 			atomic_store_explicit(&c->lf_confirmed,
 					      UDSP_LF_FWD_ACTIVE,
 					      memory_order_release);
+		slic_down_rest_update(s, c, true);
+		return;
+	case SLIC_REC_MWI_LAMP:
+		c->lamp_on = rec->arg != 0;
+		slic_down_rest_update(s, c, true);
 		return;
 	case SLIC_REC_POWERSAVE:
 		atomic_store_explicit(&c->ps_confirmed, rec->arg != 0,
@@ -738,7 +749,8 @@ static bool slic_hook_sample(struct udsp *s, struct udsp_chan *c, uint32_t stamp
 	return true;
 }
 
-/* Samples every line that is sampling; true when any level moved. */
+/* Samples every line that is sampling and not at down rest; true when any
+ * level moved. */
 static bool slic_hooks_sample(struct udsp *s, uint32_t stamp, bool timed,
 			      bool irq)
 {
@@ -749,6 +761,9 @@ static bool slic_hooks_sample(struct udsp *s, uint32_t stamp, bool timed,
 
 		if (!atomic_load_explicit(&c->sampling, memory_order_acquire) ||
 		    atomic_load_explicit(&c->dead, memory_order_acquire))
+			continue;
+		slic_down_rest_update(s, c, false);
+		if (c->down_rest)
 			continue;
 		changed |= slic_hook_sample(s, c, stamp, timed, irq);
 	}
@@ -994,7 +1009,8 @@ static void slic_monitor_periodic(struct udsp *s)
 		struct udsp_chan *c = &s->chan[i];
 
 		if (!atomic_load_explicit(&c->sampling, memory_order_acquire) ||
-		    atomic_load_explicit(&c->dead, memory_order_acquire))
+		    atomic_load_explicit(&c->dead, memory_order_acquire) ||
+		    c->down_rest)
 			continue;
 		slic_monitor_sample(s, c, false);
 	}
@@ -1090,8 +1106,46 @@ static void slic_recover_want_set(struct udsp *s, struct udsp_chan *c,
 		c->recover_want = UDSP_RECOVER_NONE;
 }
 
-static void slic_fault_lines_scan(struct udsp *s)
+/* True while a live sampled line is not at down rest: a line in service. */
+static bool slic_lines_serve(const struct udsp *s)
 {
+	for (unsigned i = 0; i < s->cap.lines; i++) {
+		const struct udsp_chan *c = &s->chan[i];
+
+		if (atomic_load_explicit(&c->sampling, memory_order_acquire) &&
+		    !atomic_load_explicit(&c->dead, memory_order_acquire) &&
+		    !c->down_rest)
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * Whether this scan reads the line. A line at down rest is read on a drain
+ * and at its own deadline, which every read arms again. Line 0 keeps the
+ * ordinary cadence while a line is in service: event.h reports
+ * UDSP_FAULT_DEVICE_RESET on line 0, and that verdict takes every line down.
+ */
+static bool slic_fault_due(struct udsp *s, struct udsp_chan *c, bool drain,
+			   bool serve, uint64_t now_us)
+{
+	if (!c->down_rest)
+		return true;
+	if (!drain && !(c->line == 0 && serve) && now_us < c->down_fault_us)
+		return false;
+	c->down_fault_us = now_us + (uint64_t)s->down_fault_ms * 1000u;
+
+	return true;
+}
+
+/* drain: an interrupt edge or an asserted pin started this scan, so a line at
+ * down rest is read too. */
+static void slic_fault_lines_scan(struct udsp *s, bool drain)
+{
+	bool serve = slic_lines_serve(s);
+	uint64_t now_us = udsp_mono_us();
+
 	for (unsigned i = 0; i < s->cap.lines; i++) {
 		struct udsp_chan *c = &s->chan[i];
 		struct slic_up_rec rec;
@@ -1100,6 +1154,8 @@ static void slic_fault_lines_scan(struct udsp *s)
 		int rc;
 
 		if (!atomic_load_explicit(&c->sampling, memory_order_acquire))
+			continue;
+		if (!slic_fault_due(s, c, drain, serve, now_us))
 			continue;
 		rc = s->ops->fault_read(s->slic, i, &bits);
 		if (rc < 0) {
@@ -1136,11 +1192,23 @@ static void slic_fault_lines_scan(struct udsp *s)
  * by every channel's interrupt sources, so a level still asserted after the
  * fault read means a source nothing cleared holds it, and no further edge
  * can come until it drops. */
+static atomic_int slic_irq_test_level = -1;
+
+void udsp_slic_irq_level_override(int level)
+{
+	atomic_store_explicit(&slic_irq_test_level, level,
+			      memory_order_release);
+}
+
 static bool slic_irq_asserted(struct udsp *s)
 {
 	const struct udsp_slic_host *h;
+	int test = atomic_load_explicit(&slic_irq_test_level,
+					memory_order_acquire);
 	int value = 1;
 
+	if (test >= 0)
+		return test == 0;
 	if (!s->cfg.gpio_interrupt[0] || !s->host)
 		return false;
 	h = slic_host_hooks(s->host);
@@ -1151,22 +1219,23 @@ static bool slic_irq_asserted(struct udsp *s)
 	return value == 0;
 }
 
-static void slic_fault_lines_read(struct udsp *s)
+static void slic_fault_lines_read(struct udsp *s, bool drain)
 {
-	slic_fault_lines_scan(s);
+	slic_fault_lines_scan(s, drain);
 	s->slic_last_fault_us = udsp_mono_us();
 }
 
 /* The per-tick modes' fault poll: on every pass while the pin is asserted,
  * once per SLIC_FAULT_PERIOD passes otherwise. True while the pin is still
- * asserted after it. */
+ * asserted after it. An edge alone reads no fault here: an alarm holds the
+ * pin until its read, so the asserted pass drains it. */
 static bool slic_fault_scan(struct udsp *s)
 {
 	bool asserted = slic_irq_asserted(s);
 
 	if (!asserted && s->periodic_pass % SLIC_FAULT_PERIOD)
 		return false;
-	slic_fault_lines_read(s);
+	slic_fault_lines_read(s, asserted);
 	return asserted && slic_irq_asserted(s);
 }
 
@@ -1198,6 +1267,83 @@ static void slic_burst_enter(struct udsp *s)
 static bool slic_burst_over(const struct udsp *s, uint32_t stamp_ms)
 {
 	return (int32_t)(stamp_ms - s->slic_burst_until_ms) >= 0;
+}
+
+/* --- the down rest ------------------------------------------------------- */
+
+/* The line half of the down rest: the consumer holds the line down, the part
+ * took the open feed, and no ring relay or MWI lamp powers the line. */
+static bool slic_down_rest_held(struct udsp_chan *c)
+{
+	return atomic_load_explicit(&c->down_pub, memory_order_acquire) &&
+	       atomic_load_explicit(&c->lf_confirmed, memory_order_acquire) ==
+	       UDSP_LF_OPEN &&
+	       !c->relay_on && !c->lamp_on;
+}
+
+/* The hook half: the last sample read on hook, no gap candidate waits, and
+ * the hook machine consumed every record and stands idle. The ring is read
+ * before the idle answer, so a record the engine popped is either in the
+ * answer or keeps it false (chan.c chan_line_control). */
+static bool slic_down_rest_ready(struct udsp_chan *c)
+{
+	return c->slic_primed && !c->slic_level && !c->gap_pending &&
+	       udsp_hook_edge_empty(&c->edges) &&
+	       atomic_load_explicit(&c->hook_idle_pub, memory_order_acquire);
+}
+
+/* The published level goes, so udsp_line_hook_query answers UDSP_TRANSIENT:
+ * no sample backs a level while the line rests. */
+static void slic_down_rest_enter(struct udsp *s, struct udsp_chan *c)
+{
+	c->down_rest = true;
+	atomic_store_explicit(&c->hook_pub, 0u, memory_order_release);
+	c->down_fault_us = udsp_mono_us() + (uint64_t)s->down_fault_ms * 1000u;
+	udsp_log(s, UDSP_LOG_DEBUG, "slic line %u at down rest", c->line);
+}
+
+/*
+ * The open feed hid the loop, so the uncertainty of the next sample starts
+ * here and not at the last sample before the rest: that sample is no stall,
+ * and a seize it finds is not poisoned. sample takes the sample at once, so
+ * the published level is valid when the record that ended the rest is acked.
+ */
+static void slic_down_rest_leave(struct udsp *s, struct udsp_chan *c,
+				 bool sample)
+{
+	uint32_t stamp = udsp_clock_stamp_ms(&s->clock);
+
+	c->down_rest = false;
+	c->hook_sample_us = udsp_mono_us();
+	c->hook_gap_armed = false;
+	c->hook_stamp_prev_ms = stamp;
+	udsp_log(s, UDSP_LOG_DEBUG, "slic line %u leaves down rest", c->line);
+	if (!atomic_load_explicit(&c->sampling, memory_order_acquire) ||
+	    atomic_load_explicit(&c->dead, memory_order_acquire) ||
+	    atomic_load_explicit(&c->under_test, memory_order_acquire))
+		return;
+	if (sample)
+		slic_hook_sample(s, c, stamp, false, false);
+	slic_burst_enter(s);
+}
+
+/*
+ * A line enters the rest when both halves hold, and leaves it when the line
+ * half fails. The hook half cannot move during the rest, because the line
+ * takes no sample.
+ */
+static void slic_down_rest_update(struct udsp *s, struct udsp_chan *c,
+				  bool sample)
+{
+	bool held = slic_down_rest_held(c);
+
+	if (c->down_rest) {
+		if (!held)
+			slic_down_rest_leave(s, c, sample);
+		return;
+	}
+	if (held && slic_down_rest_ready(c))
+		slic_down_rest_enter(s, c);
 }
 
 /* The fault cadence carries across the modes: the next read is due one
@@ -1285,7 +1431,7 @@ static bool slic_idle_pass(struct udsp *s)
 					 (uint64_t)SLIC_IDLE_SAMPLE_MS * 1000u;
 	}
 	if (fault) {
-		slic_fault_lines_read(s);
+		slic_fault_lines_read(s, edge);
 		s->slic_next_fault_us = s->slic_last_fault_us +
 					(uint64_t)SLIC_IDLE_FAULT_MS * 1000u;
 		/* A pin still asserted after the read raises no edge for the
@@ -1534,6 +1680,9 @@ static void slic_line_up(struct udsp *s, struct udsp_chan *c)
 	c->gap_pending = false;
 	c->gap_stall = false;
 	c->edge_lost = false;
+	c->down_rest = false;
+	c->relay_on = false;
+	c->lamp_on = false;
 	c->live = true;
 	slic_region_line_start(s, c, udsp_region_active(s));
 }
@@ -1692,15 +1841,17 @@ static bool slic_line_hold(struct udsp *s, struct udsp_chan *c)
 }
 
 /* One fresh sample before the line is handed back, so the published level is
- * the level the line holds now and not the one it held before the test. */
+ * the level the line holds now and not the one it held before the test. A
+ * line at down rest takes none and keeps no published level. */
 static void slic_line_release(struct udsp *s, struct udsp_chan *c,
 				   bool was)
 {
 	atomic_store_explicit(&c->sampling, was, memory_order_release);
 	/* A level that moved during the test is a hook change like any
 	 * other: the machine gets tick-rate samples behind it. */
-	if (was && slic_hook_sample(s, c, udsp_clock_stamp_ms(&s->clock), false,
-				    false))
+	if (was && !c->down_rest &&
+	    slic_hook_sample(s, c, udsp_clock_stamp_ms(&s->clock), false,
+			     false))
 		slic_burst_enter(s);
 	atomic_store_explicit(&c->under_test, false, memory_order_release);
 }
@@ -1809,11 +1960,13 @@ static int slic_test_fail(struct udsp *s, unsigned line, int rc,
  * hold stops sampling for the whole test, so a handset lifted shortly before
  * it, inside the debounce of the machine above, would hear the metallic test
  * and no dial tone until the test ends. The sample posts its edge like any
- * other sample does, so the machine gets the seize at once.
+ * other sample does, so the machine gets the seize at once. A line at down
+ * rest has an open feed and read on hook last, so it takes no sample.
  */
 static bool slic_line_test_offhook(struct udsp *s, struct udsp_chan *c)
 {
-	if (!atomic_load_explicit(&c->sampling, memory_order_acquire))
+	if (!atomic_load_explicit(&c->sampling, memory_order_acquire) ||
+	    c->down_rest)
 		return false;
 	if (slic_hook_sample(s, c, udsp_clock_stamp_ms(&s->clock), false,
 			     false))
@@ -2073,6 +2226,10 @@ static void slic_line_recover(struct udsp *s, struct udsp_chan *c)
 		return;
 	}
 	if (!rc) {
+		/* Both ops end at UDSP_LF_OPEN (slic.h), so no ring relay or
+		 * lamp powers the line any more. */
+		c->relay_on = false;
+		c->lamp_on = false;
 		slic_region_line_start(s, c, udsp_region_active(s));
 		atomic_store_explicit(&c->gain_confirmed, 0u,
 				      memory_order_release);
