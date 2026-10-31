@@ -487,7 +487,9 @@ struct udsp_chan {
 	 * only a successful op advances them. Write suppression compares the
 	 * confirmed value, so a retry to the same target after a failed write
 	 * reaches the register instead of being answered UDSP_OK against a
-	 * state the hardware never entered.
+	 * state the hardware never entered. While a feed write is in flight, a
+	 * feed compare takes lf_queued instead (chan.c lf_settled), because a
+	 * queued ring relay-off still changes the feed.
 	 */
 	_Atomic uint_least8_t lf_confirmed;	/* enum udsp_linefeed */
 	/*
@@ -505,8 +507,16 @@ struct udsp_chan {
 	 * part, the vendor ring stop's active feed included. It is a
 	 * prediction and holds only while a feed write is in flight: a record
 	 * that failed or was dropped never confirms, and lf_confirmed is then
-	 * the feed. */
+	 * the feed. A base request that a queued write stands for keeps the
+	 * base restore due, so a clean fault read writes the feed if that
+	 * write failed. A relay-on predicts UDSP_LF_RINGING, which no confirm
+	 * stores, so a compare against it always differs. */
 	uint8_t lf_queued;			/* enum udsp_linefeed */
+	/* Engine tick only: the write generation of the newest feed record
+	 * that carries an ack token. Its waiter can leave before it runs, and
+	 * the slic thread then drops it, so lf_queued is no prediction while
+	 * that record waits. */
+	uint32_t lf_ack_seq;
 	/* Engine tick only: lf_seq_emit when the caller identity sequence
 	 * armed. Only the failure of a later feed write aborts the sequence
 	 * (chan.c chan_up_rec_fail). */

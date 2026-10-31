@@ -11313,6 +11313,89 @@ static void case_ring_end_feed(void)
 		tc_down(&t);
 	}
 
+	CASE("a raise behind a queued ring end writes the active feed");
+	{
+		uint64_t t0;
+
+		if (!tc_up_ports(&t, "USA", 1)) {
+			CHECK(false);
+			return;
+		}
+		eh_wait_ms(&t, 100);
+		CHECK_UINT(tc_lf_confirmed(&t, 0), UDSP_LF_FWD_ACTIVE);
+		/* The relay-off of the expiry holds the slic thread for 150 ms
+		 * of wall clock. The DOWN asked during the ring makes the end
+		 * queue OPEN behind it, and the raise comes while both wait:
+		 * the confirmed feed still reads active then. */
+		udsp_slic_fake_delay_set(t.s->slic, UDSP_SLIC_FAKE_RING_STOP,
+					 150);
+		tc_ring_fill(&ring, 300, 300, 300);
+		CHECK(udsp_ring_start(t.s, 0, &ring) == UDSP_OK);
+		eh_wait_ms(&t, 100);
+		CHECK(udsp_line_state(t.s, 0, UDSP_LINE_DOWN) == UDSP_OK);
+		t0 = eh_mono_us();
+		while (!eh_ev_find(UDSP_EV_RING_END, 0) &&
+		       eh_mono_us() < t0 + 2000000u) {
+			eh_ev_poll(&t);
+			eh_sleep_ms(1);
+		}
+		CHECK(eh_ev_find(UDSP_EV_RING_END, 0) != NULL);
+		CHECK(udsp_line_state(t.s, 0, UDSP_LINE_ACTIVE) == UDSP_OK);
+		tc_wait_real_ms(&t, 400);
+		udsp_slic_fake_delay_set(t.s->slic, UDSP_SLIC_FAKE_RING_STOP,
+					 0);
+		CHECK_UINT(tc_lf_confirmed(&t, 0), UDSP_LF_FWD_ACTIVE);
+		tc_down(&t);
+	}
+
+	CASE("a failed ring-end restore is written again on a clean read");
+	{
+		if (!tc_up_ports(&t, "USA", 1)) {
+			CHECK(false);
+			return;
+		}
+		eh_wait_ms(&t, 100);
+		tc_ring_fill(&ring, 300, 300, 300);
+		CHECK(udsp_ring_start(t.s, 0, &ring) == UDSP_OK);
+		eh_wait_ms(&t, 100);
+		/* The DOWN waits for the ring, and the end writes its open
+		 * feed: the next linefeed write, which the arm fails. */
+		CHECK(udsp_line_state(t.s, 0, UDSP_LINE_DOWN) == UDSP_OK);
+		udsp_slic_fake_error_set(t.s->slic, UDSP_SLIC_FAKE_LINEFEED_SET,
+					 -EIO);
+		eh_wait_ms(&t, 400);
+		CHECK(eh_ev_find(UDSP_EV_RING_END, 0) != NULL);
+		/* One clean fault read later, 1 s of passes, the base is
+		 * written again. */
+		eh_wait_ms(&t, 1500);
+		CHECK_UINT(tc_lf_confirmed(&t, 0), UDSP_LF_OPEN);
+		tc_down(&t);
+	}
+
+	CASE("a retry of a timed-out DOWN writes the open feed");
+	{
+		if (!tc_up_ports(&t, "USA", 1)) {
+			CHECK(false);
+			return;
+		}
+		eh_wait_ms(&t, 100);
+		CHECK_UINT(tc_lf_confirmed(&t, 0), UDSP_LF_FWD_ACTIVE);
+		/* A 400 ms hook read holds the slic thread past the 250 ms
+		 * bound of the first DOWN, which then leaves its record to be
+		 * dropped. The retry must not count that record as its own. */
+		udsp_slic_fake_delay_set(t.s->slic, UDSP_SLIC_FAKE_HOOK_READ,
+					 400);
+		tc_wait_real_ms(&t, 5);
+		CHECK(udsp_line_state(t.s, 0, UDSP_LINE_DOWN) ==
+		      UDSP_TRANSIENT);
+		CHECK(udsp_line_state(t.s, 0, UDSP_LINE_DOWN) == UDSP_OK);
+		udsp_slic_fake_delay_set(t.s->slic, UDSP_SLIC_FAKE_HOOK_READ,
+					 0);
+		tc_wait_real_ms(&t, 100);
+		CHECK_UINT(tc_lf_confirmed(&t, 0), UDSP_LF_OPEN);
+		tc_down(&t);
+	}
+
 	CASE("a held ring stop on a line held down writes one open feed");
 	{
 		if (!tc_up_ports(&t, "USA", 1)) {

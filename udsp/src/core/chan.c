@@ -1498,6 +1498,8 @@ static bool batch_flush(struct udsp *s, struct chan_batch *b, uint32_t token,
 		 * thread charges their failures to the ack instead of counting
 		 * them twice; only the last one carries the ack itself. */
 		b->rec[i].token = token;
+		if (token && slic_rec_seq_carried(b->rec[i].type))
+			s->chan[b->rec[i].line].lf_ack_seq = b->rec[i].lf_seq;
 		if (ack && i + 1 == b->count) {
 			b->rec[i].ack = ack;
 			b->rec[i].last = true;
@@ -1584,11 +1586,25 @@ static bool chan_lf_in_flight(const struct udsp_chan *c)
 					      memory_order_acquire);
 }
 
+/* True while a queued feed record of an acked command waits: its waiter can
+ * leave, and the slic thread then drops it (chan.h lf_ack_seq). */
+static bool lf_ack_queued(const struct udsp_chan *c)
+{
+	uint32_t done = (uint32_t)atomic_load_explicit(&c->lf_seq_done,
+						       memory_order_acquire);
+
+	return (int32_t)(c->lf_ack_seq - done) > 0;
+}
+
 /* The feed the part holds once the queued feed writes ran (chan.h
- * lf_queued). */
+ * lf_queued), or the confirmed feed while a queued write can still be
+ * dropped. */
 static uint8_t lf_settled(const struct udsp_chan *c)
 {
-	return chan_lf_in_flight(c) ? c->lf_queued : lf_confirmed(c);
+	if (!chan_lf_in_flight(c) || lf_ack_queued(c))
+		return lf_confirmed(c);
+
+	return c->lf_queued;
 }
 
 /* The one writer of the published fault word (chan.h UDSP_FAULT_PUB_*), called
@@ -2066,8 +2082,8 @@ static void chan_cmd_apply(struct udsp *s, struct udsp_chan *c,
 		/* A ring into a held or recovering line is dropped like a
 		 * powered feed write. The relay-off of a ring stop still runs,
 		 * because the relay must open. The vendor ring stop writes the
-		 * active feed, which lf_confirmed does not track, so a held
-		 * line is put back open and lf_confirmed follows it. */
+		 * active feed, so a held line is put back open after it and
+		 * lf_confirmed follows both writes. */
 		if (cmd->u.relay.on && (c->fault_held || c->fault_reinit))
 			return;
 		lf_rec_emit(c, b, SLIC_REC_RING_RELAY, cmd->u.relay.on);
@@ -2121,9 +2137,14 @@ static void chan_journal_run(struct udsp *s, struct udsp_chan *c,
 		/* The ring machine owns the relay; base_lf is what the end of
 		 * a session restores. A relay-off can still be queued here, and
 		 * the vendor ring stop it runs writes the active feed. */
-		if (rec->u.event.type == UDSP_EV_RING_END &&
-		    lf_settled(c) != c->base_lf)
-			lf_emit(c, b, c->base_lf);
+		if (rec->u.event.type != UDSP_EV_RING_END ||
+		    lf_settled(c) == c->base_lf)
+			continue;
+		lf_emit(c, b, c->base_lf);
+		/* A session that ends on the tick has no ack for this write,
+		 * so the restore stays due until it confirms
+		 * (chan_feed_restore). */
+		c->fault_restore = true;
 	}
 	line_out_reset(&c->out);
 	/* Every path that starts or ends a ring session or a burst ends here,
@@ -2175,8 +2196,14 @@ static void chan_base_lf_set(struct udsp *s, struct udsp_chan *c,
 	 * its end restores instead of cutting the burst here. */
 	if (line_ring_active(&c->ring) || line_cidseq_busy(&c->cid))
 		return;
-	if (lf_confirmed(c) == lf)
+	if (lf_settled(c) == lf) {
+		/* A queued write stands for the request, and it can fail on
+		 * the bus. The restore stays due until the base confirms
+		 * (chan_feed_restore). */
+		if (lf_confirmed(c) != lf)
+			c->fault_restore = true;
 		return;
+	}
 	lf_emit(c, b, lf);
 }
 
@@ -2534,7 +2561,7 @@ static void chan_lines_safe(struct udsp *s, struct chan_batch *b, uint32_t now_m
 		c->base_lf_wanted = UDSP_LF_OPEN;
 		c->fault_restore = false;
 		c->state = UDSP_LINE_DOWN;
-		if (lf_confirmed(c) != UDSP_LF_OPEN)
+		if (lf_settled(c) != UDSP_LF_OPEN)
 			lf_emit(c, b, UDSP_LF_OPEN);
 	}
 }
@@ -2757,7 +2784,7 @@ static void chan_fault_open(struct udsp *s, struct udsp_chan *c,
 
 	c->fault_open = true;
 	c->fault_until_ms = now_ms + UDSP_FAULT_RETRY_MS;
-	if (lf_confirmed(c) != UDSP_LF_OPEN)
+	if (lf_settled(c) != UDSP_LF_OPEN)
 		lf_emit(c, b, UDSP_LF_OPEN);
 }
 
@@ -2957,7 +2984,7 @@ static void chan_recover_begin(struct udsp *s, struct udsp_chan *c,
 	chan_journal_run(s, c, b);
 	playout_stop(&c->slot[UDSP_SLOT_API]);
 	playout_stop(&c->slot[UDSP_SLOT_SEQ]);
-	if (lf_confirmed(c) != UDSP_LF_OPEN)
+	if (lf_settled(c) != UDSP_LF_OPEN)
 		lf_emit(c, b, UDSP_LF_OPEN);
 	chan_fault_publish(c);
 }
@@ -3023,7 +3050,7 @@ static void chan_recover_hold(struct udsp_chan *c, struct chan_batch *b,
 {
 	chan_fault_held_set(c, reason);
 	c->fault_open = true;
-	if (lf_confirmed(c) != UDSP_LF_OPEN)
+	if (lf_settled(c) != UDSP_LF_OPEN)
 		lf_emit(c, b, UDSP_LF_OPEN);
 	chan_fault_publish(c);
 }
