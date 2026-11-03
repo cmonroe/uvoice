@@ -421,7 +421,7 @@ struct udsp {
 	 * (core/chan.c lec_capture_publish). */
 	uint64_t lec_skip_total;
 	struct udsp_net net;
-	bool srtp_ready;		/* udsp_srtp_init succeeded */
+	bool srtp_ready;		/* uvsrtp_init succeeded */
 
 	/* Engine tick only: the CLOCK_MONOTONIC stamp of this tick. */
 	uint64_t tick_ns;

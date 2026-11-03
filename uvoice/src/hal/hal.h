@@ -2317,7 +2317,7 @@ struct hal_ops {
 
 /*
  * Defined by exactly one backend translation unit, picked at build time
- * (UVOICE_HAL_STUB or UVOICE_HAL_UDSP). No registration
+ * (UVOICE_HAL_STUB, UVOICE_HAL_UDSP or UVOICE_HAL_CSS). No registration
  * machinery: the linker is the selector.
  */
 extern const struct hal_ops hal_backend_ops;

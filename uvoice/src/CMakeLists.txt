@@ -9,8 +9,8 @@ cmake_minimum_required(VERSION 3.13)
 
 project(uvoice C)
 
-set(UVOICE_HAL "stub" CACHE STRING "HAL backend: stub or udsp")
-set_property(CACHE UVOICE_HAL PROPERTY STRINGS stub udsp)
+set(UVOICE_HAL "stub" CACHE STRING "HAL backend: stub, udsp or css")
+set_property(CACHE UVOICE_HAL PROPERTY STRINGS stub udsp css)
 
 option(UVOICE_TESTS "build the unit test suites and the fuzz targets" OFF)
 
@@ -702,7 +702,7 @@ if(UVOICE_TESTS)
 		  HINTS ${UVOICE_UDSP_SRCDIR}
 			${CMAKE_CURRENT_SOURCE_DIR}/../../udsp/src
 		  NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
-	# libudsp's SRTP layer moved into libuvsrtp, compiled into the target from
+	# The SRTP layer of libudsp is libuvsrtp, compiled into the target from
 	# its source tree the way the udsp sources are.
 	find_path(UVSRTP_SRC_DIR uvsrtp.c
 		  HINTS ${UVOICE_UVSRTP_SRCDIR}

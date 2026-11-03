@@ -205,7 +205,7 @@
 
 /*
  * The media socket ownership and the completion token space of this backend
- * now live in the shared HAL code: struct hal_media_sock and HAL_MEDIA_DSCP_NONE
+ * are in the shared HAL code: struct hal_media_sock and HAL_MEDIA_DSCP_NONE
  * in hal_media.h, and the completion queue, the drop counters and the reserved
  * token space (HAL_RELAY_STATS_TOKEN_BASE) in hal_relay.h.
  *
