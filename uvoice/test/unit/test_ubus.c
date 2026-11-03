@@ -1453,7 +1453,7 @@ static void test_hal_feature_names(void)
 	field = nested_field_get(field_get(reply, "hal", BLOBMSG_TYPE_TABLE),
 				 "features", BLOBMSG_TYPE_ARRAY);
 	CHECK(field != NULL);
-	CHECK_UINT(array_len(field), 20);
+	CHECK_UINT(array_len(field), 21);
 	CHECK(array_has_string(field, "g729"));
 	CHECK(array_has_string(field, "g726"));
 	CHECK(array_has_string(field, "t38"));
@@ -1502,6 +1502,11 @@ static void test_hal_feature_names(void)
 	CASE("voice status names the SLIC dump capability");
 	CHECK(array_has_string(field, "slic_dump"));
 
+	/* the core reads no desk bit, so this word is the only place where an
+	 * operator sees that the backend drives a desk phone */
+	CASE("voice status names the desk capability");
+	CHECK(array_has_string(field, "desk"));
+
 	/* it is a bit of its own: a board with Annex A alone names g729 and
 	 * not g729b, which is what makes the word worth reading */
 	CASE("and it leaves with its own bit, not with the G.729 one");
@@ -1514,6 +1519,26 @@ static void test_hal_feature_names(void)
 	CHECK_UINT(array_len(field), 1);
 	CHECK(array_has_string(field, "g729"));
 	CHECK(!array_has_string(field, "g729b"));
+
+	/* bits 19 and 20 sit side by side; a desk phone has no SLIC to dump
+	 * and an FXS board is no desk phone */
+	CASE("the desk and the SLIC dump words each leave with their own bit");
+	fake_cap.features = HAL_FEAT_DESK;
+	CHECK_UINT(voice_status(&request_context, NULL, &request, "status",
+				NULL), 0);
+	field = nested_field_get(field_get(reply, "hal", BLOBMSG_TYPE_TABLE),
+				 "features", BLOBMSG_TYPE_ARRAY);
+	CHECK(field != NULL);
+	CHECK_UINT(array_len(field), 1);
+	CHECK(array_has_string(field, "desk"));
+	fake_cap.features = HAL_FEAT_SLIC_DUMP;
+	CHECK_UINT(voice_status(&request_context, NULL, &request, "status",
+				NULL), 0);
+	field = nested_field_get(field_get(reply, "hal", BLOBMSG_TYPE_TABLE),
+				 "features", BLOBMSG_TYPE_ARRAY);
+	CHECK(field != NULL);
+	CHECK_UINT(array_len(field), 1);
+	CHECK(array_has_string(field, "slic_dump"));
 
 	fake_cap.features = 0;
 }
