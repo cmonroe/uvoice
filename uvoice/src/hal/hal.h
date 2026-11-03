@@ -319,7 +319,13 @@ enum hal_feature {
 						 * dump, and a backend that
 						 * never sets it can leave both
 						 * dump ops NULL. */
-	HAL_FEAT_DESK		= (1 << 20),
+	HAL_FEAT_DESK		= (1 << 20),	/* the backend drives a desk
+						 * phone: it sets the five
+						 * desk ops and sends
+						 * HAL_EVENT_INPUT for its
+						 * keys. The core reads no
+						 * desk bit; the status reply
+						 * names it. */
 };
 
 enum hal_codec {
@@ -2283,12 +2289,28 @@ struct hal_ops {
 	enum hal_status (*line_dump_result_get)(struct hal *h,
 						unsigned int line,
 						struct hal_slic_dump *out);
+	/*
+	 * The desk ops. Each one sets one control of a desk phone and returns.
+	 * HAL_UNSUPPORTED for a value outside its enum or range, HAL_FATAL when
+	 * the backend cannot reach its audio device. Nullable: NULL on a
+	 * backend without HAL_FEAT_DESK, and the core then answers
+	 * HAL_UNSUPPORTED to the desk call control. Their place at the end of
+	 * the table is no layout rule (see the diagnostic getters).
+	 */
+	/* fast: routes the call audio to a path, or to none. */
 	enum hal_status (*audio_path_set)(struct hal *h,
 					  enum hal_audio_path path);
+	/* fast: the receive volume, 0 to HAL_VOLUME_MAX. */
 	enum hal_status (*volume_set)(struct hal *h, unsigned int level);
+	/* fast: mutes or unmutes the microphone of every path. */
 	enum hal_status (*mute_set)(struct hal *h, bool mute);
+	/* fast: one LED of the phone to one mode. */
 	enum hal_status (*led_set)(struct hal *h, enum hal_led led,
 				   enum hal_led_mode mode);
+	/*
+	 * fast: the microphone and output gains and the ring sound. The core
+	 * keeps the last record and pushes it at start and at each reload.
+	 */
 	enum hal_status (*audio_tune_set)(struct hal *h,
 					  const struct hal_audio_tune *tune);
 };
