@@ -11,11 +11,12 @@
  *
  * The suite runs the device path: the spawn of spawn_run.h and the
  * uloop_process reap. UVOICE_NFT names a generated script in place of nft.
- * That script appends its arguments to a file as one line. With
- * UVOICE_NFT_FIFO set, it then waits on that fifo, so a case decides when the
- * write ends. It exits with the code in UVOICE_NFT_EXIT. Each case reads its
- * writes back from that file. Reason: a recorder inside the layer proves only
- * itself.
+ * That script appends its arguments to a file as one line.
+ *
+ * With UVOICE_NFT_FIFO set, the script then waits on that fifo, so a case
+ * decides when the write ends. It exits with the code in UVOICE_NFT_EXIT.
+ * Each case reads its writes back from that file. Reason: a recorder inside
+ * the layer proves only itself.
  *
  * net_ct_udp_bound_test_set() puts a conntrack bound of 2 s in place, so a
  * hold writes again every second. Every wait drives uloop to a deadline.
