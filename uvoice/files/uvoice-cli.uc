@@ -8,7 +8,7 @@
 // Licensed under GPL-2.0-only with the linking exception stated in LICENSE.
 //
 //
-// uvoice-cli.uc: the table formatter behind /usr/srg/scripts/uvoice.sh.
+// uvoice-cli.uc: the table formatter behind /usr/share/uvoice/uvoice.sh.
 //
 // The contract of every reply this script reads is the API schema,
 // schema/uvoice-api-schema.json. Lines and slots are 0-based on input,

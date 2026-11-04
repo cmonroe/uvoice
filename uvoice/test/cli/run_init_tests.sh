@@ -27,7 +27,7 @@
 # stubbed, so start_service() runs the same wiring it runs on a target.
 #
 # Every leg runs under every interpreter the host offers among dash and
-# busybox sh, the run_seed_tests.sh shape.
+# busybox sh, the shape of run_board_tests.sh in voice-scripts.
 #
 #   INIT      the script under test (default ../../files/uvoice.init)
 #

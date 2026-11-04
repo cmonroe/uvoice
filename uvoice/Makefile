@@ -136,17 +136,14 @@ define Package/uvoice/install
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/sbin/uvoiced $(1)/usr/sbin/uvoiced
 	$(INSTALL_BIN) ./files/uvoice_tls_cert.sh $(1)/usr/sbin/uvoice_tls_cert.sh
+	$(INSTALL_BIN) ./files/voice-cli $(1)/usr/sbin/voice-cli
 
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/uvoice.init $(1)/etc/init.d/uvoice
 
-	$(INSTALL_DIR) $(1)/usr/srg/scripts
-	$(INSTALL_BIN) ./files/voice-cli $(1)/usr/srg/scripts/voice-cli
-	$(INSTALL_BIN) ./files/uvoice-defaults.sh $(1)/usr/srg/scripts/uvoice-defaults.sh
-	$(INSTALL_DATA) ./files/uvoice.sh $(1)/usr/srg/scripts/uvoice.sh
-
 	$(INSTALL_DIR) $(1)/usr/share/uvoice
 	$(if $(CONFIG_UVOICE_HAL_CSS),echo css > $(1)/usr/share/uvoice/hal)
+	$(INSTALL_DATA) ./files/uvoice.sh $(1)/usr/share/uvoice/uvoice.sh
 	$(INSTALL_BIN) ./files/uvoice-cli.uc $(1)/usr/share/uvoice/uvoice-cli.uc
 	$(INSTALL_BIN) ./files/calltrace-wire.sh $(1)/usr/share/uvoice/calltrace-wire.sh
 	$(INSTALL_BIN) ./files/calltrace-finish.sh $(1)/usr/share/uvoice/calltrace-finish.sh
@@ -155,9 +152,6 @@ define Package/uvoice/install
 	$(INSTALL_DATA) ./files/voip-defaults.sh \
 		$(1)/usr/share/uvoice/voip-defaults.sh
 
-	$(INSTALL_DIR) $(1)/usr/srg/scripts/techlog
-	$(INSTALL_BIN) ./files/techlog-uvoice.sh $(1)/usr/srg/scripts/techlog/techlog-uvoice.sh
-
 	$(INSTALL_DIR) $(1)/usr/share/nftables.d/table-pre
 	$(INSTALL_DATA) ./files/nftables.d/table-pre/20-uvoice.nft $(1)/usr/share/nftables.d/table-pre/20-uvoice.nft
 	$(INSTALL_DIR) $(1)/usr/share/nftables.d/chain-pre/input
@@ -165,7 +159,6 @@ define Package/uvoice/install
 
 	$(INSTALL_DIR) $(1)/etc/uci-defaults
 	$(INSTALL_BIN) ./files/uvoice.defaults $(1)/etc/uci-defaults/90-uvoice
-	$(INSTALL_BIN) ./files/uvoice-voip-rules.default $(1)/etc/uci-defaults/95-uvoice-voip-rules
 endef
 
 $(eval $(call BuildPackage,uvoice))

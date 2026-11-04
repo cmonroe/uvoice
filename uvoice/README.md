@@ -129,18 +129,26 @@ UVOICED=$PWD/uvoice/build/uvoiced UVOICE_PREFIX=<libuci prefix> \
 ```
 
 Output is TAP with a plan line, and a skipped check still counts. `test/cli`
-also holds three more suites, which run under `unshare -rm`:
+also holds two more suites, which run under `unshare -rm`:
 
-- `run_seed_tests.sh` for the board helper `files/uvoice-defaults.sh`;
 - `run_defaults_tests.sh` for the defaults library `files/voip-defaults.sh`
   and the uci-defaults step `files/uvoice.defaults`;
 - `run_init_tests.sh` for the init script `files/uvoice.init`.
 
 ## Build in OpenWrt
 
-`Makefile` builds the package `uvoice`: `uvoiced`, an init script,
-`voice-cli`, call trace tools and helper scripts. A package build copies
-`src/` only, so it builds no tests. Four config options apply:
+`Makefile` builds the package `uvoice`. It installs these files:
+
+- `uvoiced`, `voice-cli` and `uvoice_tls_cert.sh` in `/usr/sbin`;
+- init script `/etc/init.d/uvoice`;
+- `uvoice.sh`, the formatter `uvoice-cli.uc`, the call trace tools and the
+  defaults library `voip-defaults.sh` in `/usr/share/uvoice`;
+- on a css image, the marker file `/usr/share/uvoice/hal`, which holds `css`;
+- two nftables snippets in `/usr/share/nftables.d`;
+- uci-defaults step `/etc/uci-defaults/90-uvoice`.
+
+A package build copies `src/` only, so it builds no tests. Four config
+options apply:
 
 - HAL backend choice: `UVOICE_HAL_STUB` (default, no hardware) or
   `UVOICE_HAL_UDSP` (software voice DSP on ALSA and spidev). The package

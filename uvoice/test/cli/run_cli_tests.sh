@@ -14,12 +14,13 @@
 # against a host prefix that holds libuci and the uci CLI. It runs the daemon
 # under "unshare -rmn": a user namespace, widened by a mount and a network
 # namespace. ubusd refuses object publication to a non root client.
-# The two scripts name absolute paths (/usr/srg/scripts, /etc/init.d) that only
-# a mount namespace can supply off target, so an unprivileged overlay over /usr
-# and /etc puts the real paths in place and the suite exercises the shipped
-# strings and not a rewritten copy. The network namespace keeps the SIP port
-# the account binds free whatever else the build host runs, which is what makes
-# the rendered registration state repeatable.
+# The two scripts name absolute paths (/usr/sbin/voice-cli, /etc/init.d, and
+# the scripts of the other voice stack that the dispatcher names) that only a
+# mount namespace can supply off target, so an unprivileged overlay over /usr
+# and a bind over /etc/init.d put the real paths in place, and the suite
+# exercises the shipped strings and not a rewritten copy. The network
+# namespace keeps the SIP port the account binds free whatever else the build
+# host runs, which is what makes the rendered registration state repeatable.
 #
 #   UVOICED         stub daemon binary   (default $WORK/build/uvoiced)
 #   UVOICE_PREFIX   host prefix with libuci and the uci CLI
@@ -89,13 +90,13 @@ trap 'cleanup' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
 
-mkdir -p "$tmp/usr-up/share" "$tmp/usr-work" "$tmp/initd" \
-	"$tmp/bin" "$tmp/cfg" "$tmp/uci-delta" "$tmp/rec"
+mkdir -p "$tmp/usr-up/sbin" "$tmp/usr-up/share" "$tmp/usr-work" \
+	"$tmp/initd" "$tmp/bin" "$tmp/cfg" "$tmp/uci-delta" "$tmp/rec"
 
-# /usr/srg does not exist on a build host, so /usr takes an overlay and the new
-# path lands in its upper layer. /etc/init.d does exist, and a directory the
-# lower layer owns cannot be written from a user namespace, so that one takes a
-# bind mount of a directory this suite owns.
+# A directory of the lower layer cannot take a new entry from the user
+# namespace, so the upper layer holds sbin and share before the mount, and
+# /etc/init.d takes a bind. A bind over /usr/sbin would hide the host binaries
+# there, ubusd among them.
 mount -t overlay overlay \
 	-o "lowerdir=/usr,upperdir=$tmp/usr-up,workdir=$tmp/usr-work" /usr ||
 	bail 'cannot overlay /usr, the kernel refuses an unprivileged overlay mount'
@@ -124,9 +125,10 @@ chmod +x /usr/share/uvoice/calltrace-finish.sh
 #
 # The device layout the two scripts name
 #
+cp "$voice_cli_src" /usr/sbin/voice-cli || bail 'cannot install voice-cli'
+chmod +x /usr/sbin/voice-cli
+
 mkdir -p /usr/srg/scripts
-cp "$voice_cli_src" /usr/srg/scripts/voice-cli || bail 'cannot install voice-cli'
-chmod +x /usr/srg/scripts/voice-cli
 
 dispatch_present=0
 if [ -r "$dispatch_src" ]; then
@@ -333,7 +335,7 @@ check_lacks() {
 }
 
 run_cli() {
-	cli_out=$(/usr/srg/scripts/voice-cli "$@" 2>&1 </dev/null)
+	cli_out=$(/usr/sbin/voice-cli "$@" 2>&1 </dev/null)
 	cli_rc=$?
 }
 
@@ -356,7 +358,7 @@ status_field_get() {
 #
 if [ "$dispatch_present" = 1 ]; then
 	dispatch_text=$(cat "$dispatch_src")
-	check_has 'dispatch/names voice-cli' '/usr/srg/scripts/voice-cli' "$dispatch_text"
+	check_has 'dispatch/names voice-cli' '/usr/sbin/voice-cli' "$dispatch_text"
 	check_has 'dispatch/names voip_cli.sh' '/usr/srg/scripts/voip_cli.sh' "$dispatch_text"
 else
 	skip 'dispatch/names voice-cli' "no dispatcher at $dispatch_src"
@@ -969,7 +971,7 @@ chmod +x "$tmp/ct-ucode/ucode"
 run_cli_uc() {
 	cli_out=$(PATH=$tmp/ct-ucode:$PATH UVOICE_CLI=$cli_uc \
 		UVOICE_UBUS_SOCKET=$ubus_socket \
-		/usr/srg/scripts/voice-cli "$@" 2>&1 </dev/null)
+		/usr/sbin/voice-cli "$@" 2>&1 </dev/null)
 	cli_rc=$?
 }
 
@@ -2993,29 +2995,6 @@ calltrace_wire_tests() {
 }
 calltrace_wire_tests
 
-calltrace_techlog_test() {
-	if ! command -v bash >/dev/null 2>&1; then
-		skip 'calltrace/techlog notes absent archive, omits nothing' \
-			'no bash command'
-		return
-	fi
-	mkdir -p /usr/srg/scripts/techlog /tmp/uvoice/calltrace "$tmp/no-traces"
-	mount --bind "$tmp/no-traces" /tmp/uvoice/calltrace ||
-		bail 'cannot isolate completed archives for techlog'
-	cat > /usr/srg/scripts/techlog/techlog.src <<'EOF'
-techlog_cmd_capture() { return 0; }
-my_cp_file() { return 0; }
-techlog_omit() { printf 'OMITTED: %s\n' "$*"; }
-EOF
-	bash "$uvoice_dir/files/techlog-uvoice.sh" > "$tmp/techlog.out" 2>&1
-	ct_techlog_rc=$?
-	check_eq 'calltrace/techlog notes absent archive, omits nothing' \
-		'0 no completed call trace available' \
-		"$ct_techlog_rc $(cat "$tmp/techlog.out")"
-	umount /tmp/uvoice/calltrace || bail 'cannot release the techlog fixture'
-}
-calltrace_techlog_test
-
 #
 # The summary report. files/calltrace-summary.uc reads one archive directory
 # and writes SUMMARY.txt. Three inputs drive it: a fixture directory with the
@@ -4806,7 +4785,7 @@ dump_refusal_check() {
 	dump_refusal_replies=$(jq -cn --arg e "$2" '{slic_dump: {__error: $e}}')
 	cli_out=$(PATH=$uc_fakemod_shim:$PATH UVOICE_CLI=$cli_uc \
 		FAKE_REPLIES=$dump_refusal_replies \
-		/usr/srg/scripts/voice-cli show reg line 2 2>&1 </dev/null)
+		/usr/sbin/voice-cli show reg line 2 2>&1 </dev/null)
 	cli_rc=$?
 	check_eq "slic/a code $1 refusal exits 1" 1 "$cli_rc"
 	check_eq "slic/a code $1 refusal prints one sentence" \
@@ -5299,11 +5278,13 @@ show channel1 sip_proxy' "$(cat "$voip_cli_rec")"
 	check_has 'dispatch/voice present reaches voice-cli for the loop test' \
 		'enabled=false' "$dispatch_out"
 
-	chmod -x /usr/srg/scripts/voice-cli /usr/srg/scripts/voip_cli.sh
+	chmod -x /usr/sbin/voice-cli /usr/srg/scripts/voip_cli.sh
 	run_dispatch show version
-	chmod +x /usr/srg/scripts/voice-cli /usr/srg/scripts/voip_cli.sh
+	chmod +x /usr/sbin/voice-cli /usr/srg/scripts/voip_cli.sh
 	check_eq 'dispatch/no backend exits 1' 1 "$dispatch_rc"
-	check_has 'dispatch/no backend names the paths' 'no voice CLI backend' "$dispatch_out"
+	check_has 'dispatch/no backend names the paths' \
+		'no voice CLI backend: /usr/sbin/voice-cli needs a live ubus' \
+		"$dispatch_out"
 else
 	skip 'dispatch/voice present exit' 'no dispatcher'
 	skip 'dispatch/voice present reaches voice-cli' 'no dispatcher'

@@ -10,13 +10,13 @@
 #
 # voice-cli: the command line backend of the uvoice stack.
 #
-# The command set is the one that /usr/srg/scripts/voip_cli.sh gives the other
-# voice stack, so a single klish tree drives either stack through
-# voip-cli-dispatch. The commands that only the other stack serves answer one
-# line and exit 1: the log module and preset tables. The daemon, the line, the
-# account table, the call table, the line monitor, the call records and the
-# SLIC register and RAM dumps render through /usr/share/uvoice/uvoice-cli.uc,
-# the formatter behind uvoice.sh, so the two surfaces share one renderer.
+# The command set matches the klish backend of the other voice stack, so a
+# single klish tree drives either stack through voip-cli-dispatch. The
+# commands that only the other stack serves answer one line and exit 1: the
+# log module and preset tables. The daemon, the line, the account table, the
+# call table, the line monitor, the call records and the SLIC register and RAM
+# dumps render through /usr/share/uvoice/uvoice-cli.uc, the formatter behind
+# uvoice.sh, so the two surfaces share one renderer.
 #
 # The CLI is 1 based and the ubus surface is 0 based. The single decrement of
 # the whole script lives in line_index_get(). The formatter prints its line
