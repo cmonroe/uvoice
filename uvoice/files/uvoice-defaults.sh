@@ -9,22 +9,23 @@
 
 PLATFORMDB=/usr/srg/scripts/platformdb
 
-# The voice-scripts seeder calls this helper with the device model as $1 when
-# the voice stack is uvoice, after it created /etc/config/voip and the channel
-# sections. The seeder gates on the stack, so the model argument is the whole
-# answer. A standalone run (bench, a live opkg install) reads the platform
-# database itself and applies the same stack gate, so a board another stack
-# owns keeps its file untouched. The helper writes an option only when it is
-# unset.
+# The voice-scripts seeder calls this helper with the device model as $1 and
+# the port count as $2 when the voice stack is uvoice, after it created
+# /etc/config/voip and the channel sections. The seeder gates on the stack, so
+# the two arguments are the whole answer. A standalone run (bench, a live opkg
+# install) reads the platform database itself and applies the same stack
+# gate, so a board another stack owns keeps its file untouched. The helper
+# writes an option only when it is unset.
 device_model="$1"
+port_count="$2"
 if [ -z "$device_model" ]; then
-	# Use a subshell because platformdb can exit. The precedent is the
-	# uvoice.init PDB_NUM_POTS subshell idiom. A read that exits prints
+	# Use a subshell because platformdb can exit. A read that exits prints
 	# nothing, which the model check below turns into a retry.
 	pdb_answer="$(
 		if [ -r "$PLATFORMDB" ]; then
 			. "$PLATFORMDB" >/dev/null 2>&1
-			printf '%s %s\n' "${PDB_VOICE_STACK:-none}" "${PDB_DEVICE_MODEL:-}"
+			printf '%s %s %s\n' "${PDB_VOICE_STACK:-none}" \
+				"${PDB_NUM_POTS:-}" "${PDB_DEVICE_MODEL:-}"
 		fi
 	)"
 	pdb_stack="${pdb_answer%% *}"
@@ -35,7 +36,9 @@ if [ -z "$device_model" ]; then
 		exit 0
 		;;
 	esac
-	device_model="${pdb_answer#* }"
+	pdb_rest="${pdb_answer#* }"
+	port_count="${pdb_rest%% *}"
+	device_model="${pdb_rest#* }"
 fi
 
 # No answer is not "not served": a failed platform database read must leave
@@ -106,6 +109,14 @@ if [ -f "$fax_plugin" ]; then
 fi
 
 seed sample_rate "$sample_rate"
+
+# uvoiced takes the port count from this option alone. In the schema, 0 means
+# unset and 8 is the maximum, so only the counts 1 to 8 are written.
+case "$port_count" in
+[1-8])
+	seed num_ports "$port_count"
+	;;
+esac
 
 uci commit voip >/dev/null 2>&1
 exit 0

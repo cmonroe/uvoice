@@ -5843,7 +5843,6 @@ static void hal_default_tests(void)
 	const struct cfg_hal *hal;
 
 	CASE("a config without a HAL section takes every board default");
-	setenv("PDB_NUM_POTS", "4", 1);
 	FIXTURE_LOAD_OR_RETURN(fixture, fixture_load("config base 'base'\n"));
 	hal = &fixture.cfg->hal;
 	CHECK_CSTR(hal->tdm_backend, "alsa-raw");
@@ -5854,8 +5853,8 @@ static void hal_default_tests(void)
 	CHECK_CSTR(hal->spidev, "/dev/spidev0.0");
 	CHECK_CSTR(hal->gpio_reset, "slic_reset");
 	CHECK_CSTR(hal->gpio_interrupt, "slic_interrupt");
-	CHECK_UINT(hal->populated_ports_cfg, 0);
-	CHECK_UINT(hal->populated_ports, 4);
+	CHECK_UINT(hal->num_ports_cfg, 0);
+	CHECK_UINT(hal->num_ports, 1);
 	CHECK_UINT(hal->channels, 2);
 	CHECK_UINT(hal->prefill_periods, 3);
 	CHECK_UINT(hal->engine_cpu, 3);
@@ -5870,17 +5869,15 @@ static void hal_default_tests(void)
 	CHECK_UINT(hal->ring_sound, 0);
 	CHECK_UINT(hal->ring_volume, 5);
 	fixture_free(&fixture);
-	unsetenv("PDB_NUM_POTS");
 
 	CASE("a missing voip package takes the HAL board defaults");
-	setenv("PDB_NUM_POTS", "5", 1);
 	FIXTURE_LOAD_OR_RETURN(fixture, fixture_load(NULL));
 	CHECK(!fixture.cfg->loaded);
 	CHECK_CSTR(fixture.cfg->hal.tdm_playback, "plughw:0,0");
 	CHECK_CSTR(fixture.cfg->hal.slic_plugin,
 		   "/usr/lib/udsp/udsp-slic-proslic-mt798x.so");
-	CHECK_UINT(fixture.cfg->hal.populated_ports_cfg, 0);
-	CHECK_UINT(fixture.cfg->hal.populated_ports, 5);
+	CHECK_UINT(fixture.cfg->hal.num_ports_cfg, 0);
+	CHECK_UINT(fixture.cfg->hal.num_ports, 1);
 	CHECK_UINT(fixture.cfg->hal.channels, 2);
 	CHECK_UINT(fixture.cfg->hal.prefill_periods, 3);
 	CHECK_UINT(fixture.cfg->hal.engine_cpu, 3);
@@ -5888,7 +5885,6 @@ static void hal_default_tests(void)
 	CHECK_UINT(fixture.cfg->hal.pcm_offset_bits, 0);
 	CHECK_UINT(fixture.cfg->hal.sample_rate, 8000);
 	fixture_free(&fixture);
-	unsetenv("PDB_NUM_POTS");
 }
 
 static void hal_explicit_tests(void)
@@ -5902,7 +5898,7 @@ static void hal_explicit_tests(void)
 		"\toption spidev '/dev/spidev1.2'\n"
 		"\toption gpio_reset 'reset-x'\n"
 		"\toption gpio_interrupt 'irq-x'\n"
-		"\toption populated_ports '6'\n"
+		"\toption num_ports '6'\n"
 		"\toption channels '1'\n"
 		"\toption prefill_periods '9'\n"
 		"\toption engine_cpu '-1'\n"
@@ -5913,7 +5909,6 @@ static void hal_explicit_tests(void)
 	const struct cfg_hal *hal;
 
 	CASE("every explicit HAL option loads from the named section");
-	setenv("PDB_NUM_POTS", "8", 1);
 	FIXTURE_LOAD_OR_RETURN(fixture, hal_option_load(config));
 	hal = &fixture.cfg->hal;
 	CHECK_CSTR(hal->tdm_backend, "file");
@@ -5924,8 +5919,8 @@ static void hal_explicit_tests(void)
 	CHECK_CSTR(hal->spidev, "/dev/spidev1.2");
 	CHECK_CSTR(hal->gpio_reset, "reset-x");
 	CHECK_CSTR(hal->gpio_interrupt, "irq-x");
-	CHECK_UINT(hal->populated_ports_cfg, 6);
-	CHECK_UINT(hal->populated_ports, 6);
+	CHECK_UINT(hal->num_ports_cfg, 6);
+	CHECK_UINT(hal->num_ports, 6);
 	CHECK_UINT(hal->channels, 1);
 	CHECK_UINT(hal->prefill_periods, 9);
 	CHECK_UINT(hal->engine_cpu, -1);
@@ -5933,7 +5928,6 @@ static void hal_explicit_tests(void)
 	CHECK_UINT(hal->pcm_offset_bits, 7);
 	CHECK_UINT(hal->sample_rate, 16000);
 	fixture_free(&fixture);
-	unsetenv("PDB_NUM_POTS");
 
 	CASE("alsa-raw HAL backend loads from the named section");
 	FIXTURE_LOAD_OR_RETURN(fixture,
@@ -5942,7 +5936,6 @@ static void hal_explicit_tests(void)
 	fixture_free(&fixture);
 
 	CASE("an anonymous HAL section loads as the first HAL section");
-	setenv("PDB_NUM_POTS", "2", 1);
 	FIXTURE_LOAD_OR_RETURN(fixture, fixture_load(
 		"config hal\n\toption channels '1'\n"));
 	CHECK_UINT(fixture.cfg->hal.channels, 1);
@@ -5958,7 +5951,6 @@ static void hal_explicit_tests(void)
 	CHECK_UINT(warn_capture_count("additional hal section ignored"), 2);
 	warn_capture_end();
 	fixture_free(&fixture);
-	unsetenv("PDB_NUM_POTS");
 }
 
 static void hal_validation_tests(void)
@@ -5971,7 +5963,6 @@ static void hal_validation_tests(void)
 	char config[2048];
 
 	CASE("an invalid HAL backend takes the enum default");
-	setenv("PDB_NUM_POTS", "2", 1);
 	FIXTURE_LOAD_OR_RETURN(fixture,
 		hal_option_load("\toption tdm_backend 'socket'\n"));
 	CHECK_CSTR(fixture.cfg->hal.tdm_backend, "alsa-raw");
@@ -6022,14 +6013,13 @@ static void hal_validation_tests(void)
 	CHECK_UINT(strlen(fixture.cfg->hal.gpio_interrupt), 31);
 	fixture_free(&fixture);
 
-	CASE("HAL integers below their bounds clamp or take the environment");
-	setenv("PDB_NUM_POTS", "3", 1);
+	CASE("HAL integers below their bounds clamp; num_ports resolves to 1");
 	FIXTURE_LOAD_OR_RETURN(fixture, hal_option_load(
-		"\toption populated_ports '-1'\n\toption channels '0'\n"
+		"\toption num_ports '-1'\n\toption channels '0'\n"
 		"\toption prefill_periods '0'\n\toption engine_cpu '-2'\n"
 		"\toption engine_prio '-1'\n"));
-	CHECK_UINT(fixture.cfg->hal.populated_ports_cfg, 0);
-	CHECK_UINT(fixture.cfg->hal.populated_ports, 3);
+	CHECK_UINT(fixture.cfg->hal.num_ports_cfg, 0);
+	CHECK_UINT(fixture.cfg->hal.num_ports, 1);
 	CHECK_UINT(fixture.cfg->hal.channels, 1);
 	CHECK_UINT(fixture.cfg->hal.prefill_periods, 1);
 	CHECK_UINT(fixture.cfg->hal.engine_cpu, -1);
@@ -6038,12 +6028,12 @@ static void hal_validation_tests(void)
 
 	CASE("HAL integers above their bounds clamp to each maximum");
 	FIXTURE_LOAD_OR_RETURN(fixture, hal_option_load(
-		"\toption populated_ports '9'\n\toption channels '3'\n"
+		"\toption num_ports '9'\n\toption channels '3'\n"
 		"\toption prefill_periods '17'\n\toption engine_cpu '256'\n"
 		"\toption engine_prio '100'\n"
 		"\toption pcm_offset_bits '16'\n"));
-	CHECK_UINT(fixture.cfg->hal.populated_ports_cfg, 8);
-	CHECK_UINT(fixture.cfg->hal.populated_ports, 8);
+	CHECK_UINT(fixture.cfg->hal.num_ports_cfg, 8);
+	CHECK_UINT(fixture.cfg->hal.num_ports, 8);
 	CHECK_UINT(fixture.cfg->hal.channels, 2);
 	CHECK_UINT(fixture.cfg->hal.prefill_periods, 16);
 	CHECK_UINT(fixture.cfg->hal.engine_cpu, 255);
@@ -6103,12 +6093,12 @@ static void hal_validation_tests(void)
 	CASE("malformed HAL integers take their schema defaults");
 	warn_capture_begin();
 	FIXTURE_LOAD_OR_RETURN(fixture, hal_option_load(
-		"\toption populated_ports 'bad'\n\toption channels 'bad'\n"
+		"\toption num_ports 'bad'\n\toption channels 'bad'\n"
 		"\toption prefill_periods 'bad'\n\toption engine_cpu 'bad'\n"
 		"\toption engine_prio 'bad'\n"
 		"\toption pcm_offset_bits 'bad'\n"));
-	CHECK_UINT(fixture.cfg->hal.populated_ports_cfg, 0);
-	CHECK_UINT(fixture.cfg->hal.populated_ports, 3);
+	CHECK_UINT(fixture.cfg->hal.num_ports_cfg, 0);
+	CHECK_UINT(fixture.cfg->hal.num_ports, 1);
 	CHECK_UINT(fixture.cfg->hal.channels, 2);
 	CHECK_UINT(fixture.cfg->hal.prefill_periods, 3);
 	CHECK_UINT(fixture.cfg->hal.engine_cpu, 3);
@@ -6129,68 +6119,99 @@ static void hal_validation_tests(void)
 	CHECK_UINT(warn_capture_count("is not a number"), 1);
 	fixture_free(&fixture);
 	warn_capture_end();
-	unsetenv("PDB_NUM_POTS");
 }
 
-static void hal_environment_tests(void)
+static void hal_num_ports_tests(void)
 {
+	enum { DUMP_HAL, DUMP_MAX };
+	enum { PORTS_CFG, PORTS, PORTS_MAX };
+	static const struct blobmsg_policy dump_policy[DUMP_MAX] = {
+		[DUMP_HAL] = { .name = "hal", .type = BLOBMSG_TYPE_TABLE },
+	};
+	static const struct blobmsg_policy ports_policy[PORTS_MAX] = {
+		[PORTS_CFG] = {
+			.name = "num_ports_cfg", .type = BLOBMSG_TYPE_INT32,
+		},
+		[PORTS] = { .name = "num_ports", .type = BLOBMSG_TYPE_INT32 },
+	};
+	struct blob_attr *dump_fields[DUMP_MAX] = { 0 };
+	struct blob_attr *ports_fields[PORTS_MAX] = { 0 };
 	struct cfg_fixture fixture;
+	struct blob_buf buf = { 0 };
 
-	CASE("PDB_NUM_POTS one is the accepted lower edge");
-	setenv("PDB_NUM_POTS", "1", 1);
+	CASE("an absent num_ports warns once and resolves to one port");
 	warn_capture_begin();
 	FIXTURE_LOAD_OR_RETURN(fixture, hal_option_load(""));
-	CHECK_UINT(fixture.cfg->hal.populated_ports, 1);
-	CHECK_UINT(warn_capture_count("PDB_NUM_POTS"), 0);
+	CHECK_UINT(fixture.cfg->hal.num_ports_cfg, 0);
+	CHECK_UINT(fixture.cfg->hal.num_ports, 1);
+	CHECK_UINT(warn_capture_count(
+		"voip.hal.num_ports unset or 0, using 1"), 1);
 	warn_capture_end();
 	fixture_free(&fixture);
 
-	CASE("PDB_NUM_POTS eight is the accepted upper edge");
-	setenv("PDB_NUM_POTS", "8", 1);
-	warn_capture_begin();
-	FIXTURE_LOAD_OR_RETURN(fixture, hal_option_load(""));
-	CHECK_UINT(fixture.cfg->hal.populated_ports, 8);
-	CHECK_UINT(warn_capture_count("PDB_NUM_POTS"), 0);
-	warn_capture_end();
-	fixture_free(&fixture);
-
-	CASE("populated_ports zero resolves from PDB_NUM_POTS");
-	setenv("PDB_NUM_POTS", "7", 1);
-	FIXTURE_LOAD_OR_RETURN(fixture,
-		hal_option_load("\toption populated_ports '0'\n"));
-	CHECK_UINT(fixture.cfg->hal.populated_ports_cfg, 0);
-	CHECK_UINT(fixture.cfg->hal.populated_ports, 7);
-	fixture_free(&fixture);
-
-	CASE("an unset PDB_NUM_POTS falls back to one and warns");
-	unsetenv("PDB_NUM_POTS");
-	warn_capture_begin();
-	FIXTURE_LOAD_OR_RETURN(fixture, hal_option_load(""));
-	CHECK_UINT(fixture.cfg->hal.populated_ports, 1);
-	CHECK_UINT(warn_capture_count("PDB_NUM_POTS is unset or invalid"), 1);
-	warn_capture_end();
-	fixture_free(&fixture);
-
-	CASE("an invalid PDB_NUM_POTS falls back to one and warns");
-	setenv("PDB_NUM_POTS", "9", 1);
-	warn_capture_begin();
-	FIXTURE_LOAD_OR_RETURN(fixture, hal_option_load(""));
-	CHECK_UINT(fixture.cfg->hal.populated_ports, 1);
-	CHECK_UINT(warn_capture_count("PDB_NUM_POTS is unset or invalid"), 1);
-	warn_capture_end();
-	fixture_free(&fixture);
-
-	CASE("a configured port count overrides PDB_NUM_POTS");
-	setenv("PDB_NUM_POTS", "bad", 1);
+	CASE("num_ports 0 warns once and resolves to one port");
 	warn_capture_begin();
 	FIXTURE_LOAD_OR_RETURN(fixture,
-		hal_option_load("\toption populated_ports '5'\n"));
-	CHECK_UINT(fixture.cfg->hal.populated_ports_cfg, 5);
-	CHECK_UINT(fixture.cfg->hal.populated_ports, 5);
-	CHECK_UINT(warn_capture_count("PDB_NUM_POTS"), 0);
+		hal_option_load("\toption num_ports '0'\n"));
+	CHECK_UINT(fixture.cfg->hal.num_ports_cfg, 0);
+	CHECK_UINT(fixture.cfg->hal.num_ports, 1);
+	CHECK_UINT(warn_capture_count(
+		"voip.hal.num_ports unset or 0, using 1"), 1);
 	warn_capture_end();
 	fixture_free(&fixture);
-	unsetenv("PDB_NUM_POTS");
+
+	CASE("num_ports 1, the lower edge, resolves without a warning");
+	warn_capture_begin();
+	FIXTURE_LOAD_OR_RETURN(fixture,
+		hal_option_load("\toption num_ports '1'\n"));
+	CHECK_UINT(fixture.cfg->hal.num_ports, 1);
+	CHECK_UINT(warn_capture_count("num_ports"), 0);
+	warn_capture_end();
+	fixture_free(&fixture);
+
+	CASE("num_ports 8, the upper edge, resolves without a warning");
+	warn_capture_begin();
+	FIXTURE_LOAD_OR_RETURN(fixture,
+		hal_option_load("\toption num_ports '8'\n"));
+	CHECK_UINT(fixture.cfg->hal.num_ports, 8);
+	CHECK_UINT(warn_capture_count("num_ports"), 0);
+	warn_capture_end();
+	fixture_free(&fixture);
+
+	CASE("a configured num_ports is taken as num_ports_cfg and num_ports");
+	warn_capture_begin();
+	FIXTURE_LOAD_OR_RETURN(fixture,
+		hal_option_load("\toption num_ports '5'\n"));
+	CHECK_UINT(fixture.cfg->hal.num_ports_cfg, 5);
+	CHECK_UINT(fixture.cfg->hal.num_ports, 5);
+	CHECK_UINT(warn_capture_count("num_ports"), 0);
+	warn_capture_end();
+	fixture_free(&fixture);
+
+	CASE("the dump reports an unset count: num_ports_cfg 0, num_ports 1");
+	FIXTURE_LOAD_OR_RETURN(fixture, hal_option_load(""));
+	blobmsg_buf_init(&buf);
+	CHECK(buf.head != NULL);
+	if (!buf.head) {
+		blob_buf_free(&buf);
+		fixture_free(&fixture);
+		return;
+	}
+
+	cfg_dump(fixture.cfg, &buf);
+	blobmsg_parse_attr(dump_policy, DUMP_MAX, dump_fields, buf.head);
+	CHECK(dump_fields[DUMP_HAL] != NULL);
+	if (dump_fields[DUMP_HAL])
+		blobmsg_parse_attr(ports_policy, PORTS_MAX, ports_fields,
+				   dump_fields[DUMP_HAL]);
+	CHECK(ports_fields[PORTS_CFG] != NULL);
+	if (ports_fields[PORTS_CFG])
+		CHECK_UINT(blobmsg_get_u32(ports_fields[PORTS_CFG]), 0);
+	CHECK(ports_fields[PORTS] != NULL);
+	if (ports_fields[PORTS])
+		CHECK_UINT(blobmsg_get_u32(ports_fields[PORTS]), 1);
+	blob_buf_free(&buf);
+	fixture_free(&fixture);
 }
 
 static void hal_dump_test(void)
@@ -6199,7 +6220,7 @@ static void hal_dump_test(void)
 	enum {
 		HAL_TDM_BACKEND, HAL_TDM_PLAYBACK, HAL_TDM_CAPTURE,
 		HAL_SLIC_PLUGIN, HAL_FAX_PLUGIN, HAL_SPIDEV, HAL_GPIO_RESET,
-		HAL_GPIO_INTERRUPT, HAL_POPULATED_PORTS_CFG, HAL_POPULATED_PORTS,
+		HAL_GPIO_INTERRUPT, HAL_NUM_PORTS_CFG, HAL_NUM_PORTS,
 		HAL_CHANNELS, HAL_PREFILL_PERIODS, HAL_ENGINE_CPU, HAL_ENGINE_PRIO,
 		HAL_PCM_OFFSET_BITS, HAL_SAMPLE_RATE,
 		HAL_MAX,
@@ -6232,11 +6253,11 @@ static void hal_dump_test(void)
 		[HAL_GPIO_INTERRUPT] = {
 			.name = "gpio_interrupt", .type = BLOBMSG_TYPE_STRING,
 		},
-		[HAL_POPULATED_PORTS_CFG] = {
-			.name = "populated_ports_cfg", .type = BLOBMSG_TYPE_INT32,
+		[HAL_NUM_PORTS_CFG] = {
+			.name = "num_ports_cfg", .type = BLOBMSG_TYPE_INT32,
 		},
-		[HAL_POPULATED_PORTS] = {
-			.name = "populated_ports", .type = BLOBMSG_TYPE_INT32,
+		[HAL_NUM_PORTS] = {
+			.name = "num_ports", .type = BLOBMSG_TYPE_INT32,
 		},
 		[HAL_CHANNELS] = {
 			.name = "channels", .type = BLOBMSG_TYPE_INT32,
@@ -6263,7 +6284,6 @@ static void hal_dump_test(void)
 	struct blob_buf buf = { 0 };
 
 	CASE("the dump carries the loaded value of every HAL row");
-	setenv("PDB_NUM_POTS", "7", 1);
 	FIXTURE_LOAD_OR_RETURN(fixture, hal_option_load(
 		"\toption tdm_backend 'file'\n"
 		"\toption tdm_playback '/tmp/play.raw'\n"
@@ -6273,7 +6293,7 @@ static void hal_dump_test(void)
 		"\toption spidev '/dev/spidev1.2'\n"
 		"\toption gpio_reset 'reset-x'\n"
 		"\toption gpio_interrupt 'irq-x'\n"
-		"\toption populated_ports '0'\n"
+		"\toption num_ports '4'\n"
 		"\toption channels '1'\n"
 		"\toption prefill_periods '9'\n"
 		"\toption engine_cpu '-1'\n"
@@ -6284,7 +6304,6 @@ static void hal_dump_test(void)
 	CHECK(buf.head != NULL);
 	if (!buf.head) {
 		fixture_free(&fixture);
-		unsetenv("PDB_NUM_POTS");
 		return;
 	}
 	cfg_dump(fixture.cfg, &buf);
@@ -6323,12 +6342,12 @@ static void hal_dump_test(void)
 	if (hal_fields[HAL_GPIO_INTERRUPT])
 		CHECK_CSTR(blobmsg_get_string(hal_fields[HAL_GPIO_INTERRUPT]),
 			   "irq-x");
-	CHECK(hal_fields[HAL_POPULATED_PORTS_CFG] != NULL);
-	if (hal_fields[HAL_POPULATED_PORTS_CFG])
-		CHECK_UINT(blobmsg_get_u32(hal_fields[HAL_POPULATED_PORTS_CFG]), 0);
-	CHECK(hal_fields[HAL_POPULATED_PORTS] != NULL);
-	if (hal_fields[HAL_POPULATED_PORTS])
-		CHECK_UINT(blobmsg_get_u32(hal_fields[HAL_POPULATED_PORTS]), 7);
+	CHECK(hal_fields[HAL_NUM_PORTS_CFG] != NULL);
+	if (hal_fields[HAL_NUM_PORTS_CFG])
+		CHECK_UINT(blobmsg_get_u32(hal_fields[HAL_NUM_PORTS_CFG]), 4);
+	CHECK(hal_fields[HAL_NUM_PORTS] != NULL);
+	if (hal_fields[HAL_NUM_PORTS])
+		CHECK_UINT(blobmsg_get_u32(hal_fields[HAL_NUM_PORTS]), 4);
 	CHECK(hal_fields[HAL_CHANNELS] != NULL);
 	if (hal_fields[HAL_CHANNELS])
 		CHECK_UINT(blobmsg_get_u32(hal_fields[HAL_CHANNELS]), 1);
@@ -6349,7 +6368,6 @@ static void hal_dump_test(void)
 		CHECK_UINT(blobmsg_get_u32(hal_fields[HAL_SAMPLE_RATE]), 16000);
 	blob_buf_free(&buf);
 	fixture_free(&fixture);
-	unsetenv("PDB_NUM_POTS");
 }
 
 /*
@@ -6768,7 +6786,7 @@ int main(void)
 	hal_default_tests();
 	hal_explicit_tests();
 	hal_validation_tests();
-	hal_environment_tests();
+	hal_num_ports_tests();
 	hal_dump_test();
 	fax_t38_support_test();
 	g726_support_test();

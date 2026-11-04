@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "uvoice-api-schema.json",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "title": "uvoice ubus API",
   "description": "Every ubus method the uvoiced daemon answers, on the voice, voice.trace, voice.calltrace and voice.stub objects (voice.stub exists on the UVOICE_HAL_STUB build only). With voip.base.ui desk the voice object also emits the notifications call, device and registration; registration and cdr go out under every ui. Their payloads are $defs DeskCallEvent, DeskDevice, RegistrationEvent and CdrEvent. The root validates one capture envelope {object, method, args, reply}; args may be absent for a NOARG method, reply may be absent for a call answered with a bare status code. Owning functions are cited per property.",
   "type": "object",
@@ -2017,8 +2017,8 @@
         "spidev": { "type": "string" },
         "gpio_reset": { "type": "string" },
         "gpio_interrupt": { "type": "string" },
-        "populated_ports_cfg": { "$ref": "#/$defs/U32" },
-        "populated_ports": { "$ref": "#/$defs/U32" },
+        "num_ports_cfg": { "$ref": "#/$defs/U32" },
+        "num_ports": { "$ref": "#/$defs/U32" },
         "channels": { "$ref": "#/$defs/U32" },
         "prefill_periods": { "$ref": "#/$defs/U32" },
         "engine_cpu": { "$ref": "#/$defs/U32", "description": "Signed value cast to u32." },
@@ -2033,7 +2033,7 @@
         "ring_sound": { "$ref": "#/$defs/RingSoundWord" },
         "ring_volume": { "$ref": "#/$defs/U32", "description": "Desk ring volume 0..8 at start and at each reload." }
       },
-      "required": ["tdm_backend", "tdm_playback", "tdm_capture", "slic_plugin", "fax_plugin", "spidev", "gpio_reset", "gpio_interrupt", "populated_ports_cfg", "populated_ports", "channels", "prefill_periods", "engine_cpu", "engine_prio", "pcm_offset_bits", "sample_rate", "handset_mic_gain", "headset_mic_gain", "speaker_mic_gain", "handset_out_gain", "headset_out_gain", "ring_sound", "ring_volume"],
+      "required": ["tdm_backend", "tdm_playback", "tdm_capture", "slic_plugin", "fax_plugin", "spidev", "gpio_reset", "gpio_interrupt", "num_ports_cfg", "num_ports", "channels", "prefill_periods", "engine_cpu", "engine_prio", "pcm_offset_bits", "sample_rate", "handset_mic_gain", "headset_mic_gain", "speaker_mic_gain", "handset_out_gain", "headset_out_gain", "ring_sound", "ring_volume"],
       "additionalProperties": false
     },
 

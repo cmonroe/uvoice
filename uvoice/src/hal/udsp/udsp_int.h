@@ -111,10 +111,10 @@
 #include "../hal_relay.h"
 
 /*
- * The line count file, which this backend writes at attach. The consumer is
- * /usr/srg/scripts and the ubus surface of the platform, which ask "how many
+ * The line count file, which this backend writes at attach. The platform
+ * scripts and the ubus interface of the platform read it to ask "how many
  * FXS ports does this unit really have" without talking to uvoiced (udsp.h:
- * the SLIC part number describes the silicon, the platform DB describes
+ * the SLIC part number describes the silicon, voip.hal.num_ports describes
  * the board, and cap.lines is the minimum of the two).
  */
 #define HAL_UDSP_FXSNUM_RUN	"/var/run/voip.fxsnum"

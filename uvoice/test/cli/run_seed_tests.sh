@@ -11,14 +11,15 @@
 # run_seed_tests.sh: the uvoice board defaults helper (uvoice-defaults.sh)
 # against a fake platformdb and a recording uci.
 #
-# The helper takes the device model as $1 from the voice-scripts seeder, or
-# sources /usr/srg/scripts/platformdb for PDB_DEVICE_MODEL on its own; it
-# tests /etc/config/voip and calls plain uci, and a build host has none of
-# the three. The suite re-enters itself under "unshare -rm" (a user and a
-# mount namespace, the run_cli_tests.sh recipe without its network
-# namespace) and puts an unprivileged overlay over /usr and /etc, so the
-# shipped script runs with its own strings and not a rewritten copy. uci is
-# a PATH shim that keeps the option state in a file and records every call.
+# The helper takes the device model as $1 and the port count as $2 from the
+# voice-scripts seeder, or sources /usr/srg/scripts/platformdb for
+# PDB_DEVICE_MODEL and PDB_NUM_POTS on its own; it tests /etc/config/voip and
+# calls plain uci, and a build host has none of the three. The suite
+# re-enters itself under "unshare -rm" (a user and a mount namespace, the
+# run_cli_tests.sh recipe without its network namespace) and puts an
+# unprivileged overlay over /usr and /etc, so the shipped script runs with its
+# own strings and not a rewritten copy. uci is a PATH shim that keeps the
+# option state in a file and records every call.
 #
 # Every leg runs under every interpreter the host offers among dash and
 # busybox sh: the helper ships as #!/bin/sh and both run it, on a target and
@@ -173,8 +174,10 @@ state_lines() {
 # seed_fixture model present [preset...]: an empty model means no platformdb;
 # present 1 creates /etc/config/voip, 0 removes it; every preset is one
 # "key=value" line of prior uci state. The platformdb names the uvoice stack
-# unless fixture_stack says otherwise; NONE leaves the stack variable out.
+# unless fixture_stack says otherwise; NONE leaves the stack variable out. It
+# names a port count only when fixture_pots holds one.
 fixture_stack=uvoice
+fixture_pots=
 
 seed_fixture() {
 	model=$1
@@ -191,6 +194,9 @@ seed_fixture() {
 	if [ -n "$model" ]; then
 		[ "$fixture_stack" = NONE ] ||
 			printf 'PDB_VOICE_STACK=%s\n' "$fixture_stack" > "$platformdb"
+		[ -z "$fixture_pots" ] ||
+			printf 'PDB_NUM_POTS=%s\n' "$fixture_pots" \
+				>> "$platformdb"
 		printf 'PDB_DEVICE_MODEL=%s\n' "$model" >> "$platformdb"
 	fi
 	[ "$present" = 1 ] && : > "$voip_cfg"
@@ -225,6 +231,23 @@ run_seed_arg() {
 
 	PATH="$tmp/bin:$PATH" $shell "$seed" "$model_arg" >/dev/null 2>&1
 	rc=$?
+}
+
+# The seeder passes the port count as the second argument.
+run_seed_args() {
+	shell=$1
+	model_arg=$2
+	count_arg=$3
+	shift 3
+	seed_fixture "$@"
+
+	PATH="$tmp/bin:$PATH" $shell "$seed" "$model_arg" "$count_arg" \
+		>/dev/null 2>&1
+	rc=$?
+}
+
+num_ports_sets() {
+	grep -c '^set voip\.hal\.num_ports=' "$UCI_REC"
 }
 
 mt7622=/usr/lib/udsp/udsp-slic-proslic-mt7622.so
@@ -408,6 +431,74 @@ legs() {
 		"$(state_of voip.hal.slic_plugin)" "$an7581"
 	check "$shell model arg beats platformdb: engine_cpu stays unset" \
 		"$(state_of voip.hal.engine_cpu)" ""
+
+	# The port count of the seeder ($2) reaches uvoiced through
+	# voip.hal.num_ports. In the schema, 0 means unset and 8 is the maximum,
+	# so only the counts 1 to 8 are written.
+	for count in 1 2 8; do
+		run_seed_args "$shell" SDG-8733v "$count" '' 1
+		check "$shell count $count: exit 0" "$rc" 0
+		check "$shell count $count: num_ports $count" \
+			"$(state_of voip.hal.num_ports)" "$count"
+		check "$shell count $count: one num_ports set call" \
+			"$(rec_count "set voip.hal.num_ports=$count")" 1
+		check "$shell count $count: three set calls" "$(rec_sets)" 3
+		check "$shell count $count: one commit" \
+			"$(rec_count 'commit voip')" 1
+	done
+
+	for count in 0 9 10 '' two; do
+		run_seed_args "$shell" SDG-8733v "$count" '' 1
+		check "$shell count '$count': exit 0" "$rc" 0
+		check "$shell count '$count': no num_ports" \
+			"$(state_of voip.hal.num_ports)" ""
+		check "$shell count '$count': no num_ports set call" \
+			"$(num_ports_sets)" 0
+		check "$shell count '$count': sample_rate 16000" \
+			"$(state_of voip.hal.sample_rate)" 16000
+	done
+
+	run_seed_args "$shell" SDG-8733v 2 '' 0
+	check "$shell count, no /etc/config/voip: exit 1" "$rc" 1
+	check "$shell count, no /etc/config/voip: no uci call" "$(rec_lines)" 0
+
+	run_seed_args "$shell" SDG-8733v 2 '' 1 voip.hal=hal \
+		voip.hal.num_ports=1
+	check "$shell num_ports preset: exit 0" "$rc" 0
+	check "$shell num_ports preset: the user value is kept" \
+		"$(state_of voip.hal.num_ports)" 1
+	check "$shell num_ports preset: no num_ports set call" \
+		"$(num_ports_sets)" 0
+
+	# A standalone run takes the count from the platform database. With a
+	# model argument, the count comes from the second argument alone.
+	fixture_pots=2
+	run_seed "$shell" SDG-8733v 1
+	check "$shell standalone count 2: exit 0" "$rc" 0
+	check "$shell standalone count 2: num_ports 2" \
+		"$(state_of voip.hal.num_ports)" 2
+	check "$shell standalone count 2: one num_ports set call" \
+		"$(rec_count 'set voip.hal.num_ports=2')" 1
+	check "$shell standalone count 2: sample_rate 16000" \
+		"$(state_of voip.hal.sample_rate)" 16000
+
+	run_seed "$shell" 834-v6 1
+	check "$shell standalone count 2, 834-v6: the mt7622 plug-in" \
+		"$(state_of voip.hal.slic_plugin)" "$mt7622"
+	check "$shell standalone count 2, 834-v6: num_ports 2" \
+		"$(state_of voip.hal.num_ports)" 2
+
+	run_seed_arg "$shell" SDG-8733v SDG-8733v 1
+	check "$shell model arg without a count: exit 0" "$rc" 0
+	check "$shell model arg without a count: no num_ports set call" \
+		"$(num_ports_sets)" 0
+
+	fixture_pots=9
+	run_seed "$shell" SDG-8733v 1
+	check "$shell standalone count 9: exit 0" "$rc" 0
+	check "$shell standalone count 9: no num_ports set call" \
+		"$(num_ports_sets)" 0
+	fixture_pots=
 
 	run_seed "$shell" "" 1
 	check "$shell no platformdb: exit 1, the caller retries" "$rc" 1

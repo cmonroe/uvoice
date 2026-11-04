@@ -215,7 +215,7 @@ static const char fixture_fmt[] =
 	"\toption spidev '/dev/null'\n"
 	"\toption gpio_reset 'slic_reset'\n"
 	"\toption gpio_interrupt 'none'\n"
-	"\toption populated_ports '2'\n"
+	"\toption num_ports '2'\n"
 	"\toption channels '2'\n"
 	"\toption prefill_periods '3'\n"
 	"\toption engine_cpu '-1'\n"
@@ -469,7 +469,7 @@ static bool job_wait(struct probe *p, uint32_t token, unsigned int ms,
 /* slic_opts selects which nullable plug-in ops the fake exposes, which is how
  * a case reaches the capability gating: a cleared bit is a SLIC that does not
  * carry that op at all (slic.h). channels is what the part reports at attach,
- * which the fixture's populated_ports then bounds. */
+ * which the fixture's num_ports then bounds. */
 static bool probe_open_opts(struct probe *p, uint32_t slic_opts,
 			    unsigned int channels)
 {

@@ -169,7 +169,7 @@ static const struct cfg_option_desc cfg_hal_options[] = {
 	CFG_DESC("spidev", CFG_STRING, "/dev/spidev0.0", 0, 0, NULL, APPLY_RESTART_ALL, SUP_SUPPORTED, NULL),
 	CFG_DESC("gpio_reset", CFG_STRING, "slic_reset", 0, 0, NULL, APPLY_RESTART_ALL, SUP_SUPPORTED, NULL),
 	CFG_DESC("gpio_interrupt", CFG_STRING, "slic_interrupt", 0, 0, NULL, APPLY_RESTART_ALL, SUP_SUPPORTED, NULL),
-	CFG_DESC("populated_ports", CFG_INT, "0", 0, 8, NULL, APPLY_RESTART_ALL, SUP_SUPPORTED, NULL),
+	CFG_DESC("num_ports", CFG_INT, "0", 0, 8, NULL, APPLY_RESTART_ALL, SUP_SUPPORTED, NULL),
 	CFG_DESC("channels", CFG_INT, "2", 1, 2, NULL, APPLY_RESTART_ALL, SUP_SUPPORTED, NULL),
 	/* Every period is 10 ms of standing playback latency; 3 matches the
 	 * udsp default (udsp.h prefill_periods). */

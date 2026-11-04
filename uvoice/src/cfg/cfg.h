@@ -186,8 +186,8 @@ struct cfg_hal {
 	char spidev[CFG_HAL_DEV_MAX];
 	char gpio_reset[CFG_HAL_GPIO_MAX];
 	char gpio_interrupt[CFG_HAL_GPIO_MAX];
-	unsigned int populated_ports_cfg;
-	unsigned int populated_ports;
+	unsigned int num_ports_cfg;
+	unsigned int num_ports;
 	unsigned int channels;
 	unsigned int prefill_periods;
 	int engine_cpu;

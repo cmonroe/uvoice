@@ -497,7 +497,7 @@ void hal_udsp_config_fill(struct udsp_config *dst, const struct cfg *cfg)
 	str_copy(dst->gpio_interrupt, sizeof(dst->gpio_interrupt),
 		 hal->gpio_interrupt);
 
-	dst->populated_ports = (uint8_t)hal->populated_ports;
+	dst->populated_ports = (uint8_t)hal->num_ports;
 	dst->channels = (uint8_t)hal->channels;
 	dst->prefill_periods = (uint8_t)hal->prefill_periods;
 	dst->pcm_offset_bits = (uint8_t)hal->pcm_offset_bits;

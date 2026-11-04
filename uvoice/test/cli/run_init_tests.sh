@@ -74,8 +74,8 @@ mount -t overlay overlay \
 mkdir -p /usr/srg/scripts || bail 'cannot create the device paths'
 
 # The stack helper the script sources: the answer that makes start_service()
-# run. The platform database stays absent, so the port count takes its
-# default and the DPCM route takes its generic arm.
+# run. The platform database stays absent, so the DPCM route takes its
+# generic arm.
 cat > /usr/srg/scripts/voice-stack.sh <<'LIB'
 voice_stack_get() { echo uvoice; }
 LIB
@@ -240,7 +240,7 @@ run_init() {
 
 	PATH="$tmp/bin:$PATH" $shell -c '
 		procd_open_instance() { logger -t procd -- open_instance; }
-		procd_set_param() { :; }
+		procd_set_param() { logger -t procd -- set_param "$@"; }
 		procd_close_instance() { logger -t procd -- close_instance; }
 		. "$init"
 		restart() { logger -t rc -- restart; }
@@ -322,6 +322,10 @@ legs() {
 		"$(node_read "$wq_node")" 7
 	check "$shell start_service: the instance opened" \
 		"$(log_count 'open_instance')" 1
+	check "$shell start_service: the command reaches procd" \
+		"$(log_count 'set_param command /usr/sbin/uvoiced -S')" 1
+	check "$shell start_service: no environment reaches procd" \
+		"$(log_count 'set_param env')" 0
 	check "$shell start_service: the start was logged" \
 		"$(log_count 'uvoiced started')" 1
 

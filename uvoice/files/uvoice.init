@@ -297,15 +297,8 @@ udsp_workqueue_move() {
 }
 
 start_service() {
-	local pots
-
 	stack_owned || return 0
 	css_firmware_present || return 0
-	if [ -r "$PLATFORMDB" ]; then
-		pots="$( . "$PLATFORMDB" >/dev/null 2>&1; echo "${PDB_NUM_POTS:-1}" )"
-	else
-		pots=1
-	fi
 
 	if udsp_stack_present; then
 		udsp_dpcm_route
@@ -321,7 +314,6 @@ start_service() {
 	procd_set_param stdout 1
 	procd_set_param stderr 1
 	procd_set_param limits core="unlimited"
-	procd_set_param env PDB_NUM_POTS="$pots"
 	procd_close_instance
 
 	log_info "uvoiced started"

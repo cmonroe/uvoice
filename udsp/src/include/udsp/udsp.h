@@ -237,8 +237,8 @@ enum udsp_rt_policy {
 };
 
 /* Probed once, valid until close. lines = min(SLIC channels, populated ports);
- * the backend passes the populated count from the platform DB in the config,
- * because REG0 reports the SLIC part, not the board. */
+ * the backend passes the board's port count in the config, because REG0
+ * reports the SLIC part, not the board. */
 struct udsp_cap {
 	char backend[16];
 	char version[32];		/* libudsp + slic plug-in build */
@@ -320,7 +320,7 @@ struct udsp_config {
 	char spidev[64];		/* e.g. "/dev/spidev0.0" */
 	char gpio_reset[32];		/* slic_reset sysfs name */
 	char gpio_interrupt[32];	/* slic_interrupt sysfs name, empty = poll */
-	uint8_t populated_ports;	/* PDB_NUM_POTS, the population authority */
+	uint8_t populated_ports;	/* FXS ports the board populates */
 	uint8_t channels;		/* TDM channels to open (1 or 2) */
 	uint8_t prefill_periods;	/* default 3 */
 	int engine_cpu;			/* -1 = no pinning */

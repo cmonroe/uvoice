@@ -1070,9 +1070,8 @@ static const struct cfg_field hal_fields[] = {
 	FIELD(STR, "spidev", spidev),
 	FIELD(STR, "gpio_reset", gpio_reset),
 	FIELD(STR_NONE, "gpio_interrupt", gpio_interrupt),
-	FIELD_ROW(UINT, "populated_ports", "populated_ports_cfg",
-		  populated_ports_cfg),
-	FIELD_DUMP(UINT, "populated_ports", populated_ports),
+	FIELD_ROW(UINT, "num_ports", "num_ports_cfg", num_ports_cfg),
+	FIELD_DUMP(UINT, "num_ports", num_ports),
 	FIELD(UINT, "channels", channels),
 	FIELD(UINT, "prefill_periods", prefill_periods),
 	FIELD(INT, "engine_cpu", engine_cpu),
@@ -1211,25 +1210,15 @@ static void mgcp_parse(struct cfg_mgcp *mgcp, struct uci_context *ctx,
 	fields_parse(mgcp_fields, ctx, s, cfg_mgcp_options, false, mgcp);
 }
 
-static void hal_populated_ports_resolve(struct cfg_hal *hal)
+static void hal_num_ports_resolve(struct cfg_hal *hal)
 {
-	const char *val;
-	unsigned int ports;
-
-	if (hal->populated_ports_cfg) {
-		hal->populated_ports = hal->populated_ports_cfg;
+	if (hal->num_ports_cfg) {
+		hal->num_ports = hal->num_ports_cfg;
 		return;
 	}
 
-	val = getenv("PDB_NUM_POTS");
-	if (uint_parse(val, &ports) && ports >= 1 && ports <= 8) {
-		hal->populated_ports = ports;
-		return;
-	}
-
-	ULOG_WARN("voip hal populated_ports: PDB_NUM_POTS is unset or invalid, "
-		  "using fallback 1\n");
-	hal->populated_ports = 1;
+	ULOG_WARN("voip.hal.num_ports unset or 0, using 1\n");
+	hal->num_ports = 1;
 }
 
 /* The dump nests these under "timers", keyed by the timer name alone. */
@@ -1646,7 +1635,6 @@ static void cfg_defaults(struct cfg *cfg)
 {
 	fields_parse(base_fields, NULL, NULL, cfg_base_options, false, cfg);
 	fields_parse(hal_fields, NULL, NULL, cfg_hal_options, false, &cfg->hal);
-	cfg->hal.populated_ports = 1;
 	fields_parse(debug_fields, NULL, NULL, cfg_debug_options, false,
 		     &cfg->debug);
 	mgcp_parse(&cfg->mgcp, NULL, NULL);
@@ -1693,7 +1681,7 @@ struct cfg *cfg_load(void)
 	      cfg->enabled, cfg->channels, cfg->local_interface);
 
 resolve:
-	hal_populated_ports_resolve(&cfg->hal);
+	hal_num_ports_resolve(&cfg->hal);
 
 	return cfg;
 }
