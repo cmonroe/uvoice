@@ -31,7 +31,7 @@ tls_url=${1-}
 tls_username=${2-}
 tls_password=${3-}
 tls_verify=${4-0}
-event_post=${UVOICE_EVENT_POST:-/usr/srg/scripts/event-post.sh}
+event_post=${UVOICE_EVENT_POST:-/usr/libexec/uvoice/event-post}
 
 status_write()
 {

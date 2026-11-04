@@ -146,7 +146,6 @@ define Package/uvoice/install
 	$(INSTALL_DATA) ./files/uvoice.sh $(1)/usr/srg/scripts/uvoice.sh
 
 	$(INSTALL_DIR) $(1)/usr/share/uvoice
-	$(if $(CONFIG_UVOICE_HAL_CSS),echo uvoice > $(1)/usr/share/uvoice/stack)
 	$(if $(CONFIG_UVOICE_HAL_CSS),echo css > $(1)/usr/share/uvoice/hal)
 	$(INSTALL_BIN) ./files/uvoice-cli.uc $(1)/usr/share/uvoice/uvoice-cli.uc
 	$(INSTALL_BIN) ./files/calltrace-wire.sh $(1)/usr/share/uvoice/calltrace-wire.sh

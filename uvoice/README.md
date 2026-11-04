@@ -155,11 +155,23 @@ for the init script. Both run under `unshare -rm`.
 In a buildroot, the libudsp package stages its headers and library, so the
 build needs no path variable.
 
-The init script needs the `voice-scripts` package of a SmartOS image. It
-asks `voice-stack.sh` of that package which voice stack a platform runs. It
-starts `uvoiced` only for the uvoice stack. Without `voice-scripts`, it
-starts nothing. Reason: `uvoiced` owns the voice hardware, and two voice
-stacks cannot share it.
+The init script starts `uvoiced` only when the platform selects the uvoice
+stack. Reason: `uvoiced` owns the voice hardware, and two voice stacks cannot
+share it. An optional hook, `/usr/share/uvoice/platform.sh`, gives a
+platform's stack name and board serial. Package scripts source it when it is
+readable. It can define two functions:
+
+- `uvoice_stack_get` prints one word: `uvoice`, `none`, `unknown` or another
+  stack name. Every word but `uvoice` keeps the init script inert. Without a
+  hook, it prints `uvoice`.
+- `uvoice_serial_get` prints a board serial for call trace archives, or
+  nothing. Without a hook, it prints nothing. A nonzero exit status marks
+  the platform collector of an archive failed.
+
+Registration and certificate events go to `/usr/libexec/uvoice/event-post`,
+which a platform package installs. The poster takes `-p <prio> -t <topic>
+<json>`, and each topic holds the literal token `nodeMAC`. Without a poster,
+no event goes out.
 
 ## ubus API schema
 
@@ -195,8 +207,10 @@ wall time. Main variables:
   `UVOICE_STUB_SLIC_DUMP`: behavior hooks of the stub backend.
 - `UVOICE_STUB_RING_CAP_MS`: caps the stub ring timer, so that a suite can
   watch a long ring end inside a pumped window.
-- `UVOICE_EVENT_POST`: event script that the daemon runs in place of
-  `/usr/srg/scripts/event-post.sh`.
+- `UVOICE_EVENT_POST`: event poster that the daemon runs in place of
+  `/usr/libexec/uvoice/event-post`.
+- `UVOICE_PLATFORM_HOOK`, `UVOICE_DT_COMPATIBLE`: platform hook and device
+  tree compatible file that the shell scripts read, for the shell suites.
 - `FAKE_REPLIES`, `VOIP_XML_DIR`: canned ubus replies and klish scheme
   directory of the CLI suite.
 - `UVOICE_TLS_FIXTURES`: directory of the TLS fixtures.

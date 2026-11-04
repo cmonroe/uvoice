@@ -3307,11 +3307,11 @@ static void test_replaces_admission(void)
  * hop that becomes the Proxy.
  *
  * What this does not cover. The callback bodies are pinned by inspection only.
- * The e2e run does not cover them either: event-post.sh is absent on the build
- * host, so the soft gate is off for the whole e2e registration and no post is
- * ever built there. Reaching the bodies from a test needs a built struct
- * account, which is private to account.c and only exists behind a live socket
- * registration; an exported hook would reach them.
+ * The e2e run does not cover them either: /usr/libexec/uvoice/event-post is
+ * absent on the build host, so the soft gate is off for the whole e2e
+ * registration and no post is ever built there. Reaching the bodies from a
+ * test needs a built struct account, which is private to account.c and only
+ * exists behind a live socket registration; an exported hook would reach them.
  */
 static const char *evt_arg(unsigned int rec, unsigned int idx)
 {

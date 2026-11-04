@@ -77,6 +77,7 @@ cleanup() {
 	[ -n "$ubusd_pid" ] && kill "$ubusd_pid" 2>/dev/null
 	[ -n "$bare_ubusd_pid" ] && kill "$bare_ubusd_pid" 2>/dev/null
 	cd /
+	umount -l /tmp/sysinfo 2>/dev/null
 	umount -l /tmp/uvoice 2>/dev/null
 	umount -l /tmp/.uci 2>/dev/null
 	umount -l /etc/init.d 2>/dev/null
@@ -2302,6 +2303,83 @@ calltrace_fixture_tests() {
 }
 calltrace_fixture_tests
 
+# ct_platform_fixture dir: a finishing trace directory for the finisher.
+ct_platform_fixture() {
+	mkdir -p "$1"
+	printf '{"stage":"finishing","times":{"armed_at":%s}}\n' "$(date +%s)" \
+		> "$1/manifest.json"
+	printf '{}\n' > "$1/config.json"
+	printf '{}\n' > "$1/snapshots.jsonl"
+	: > "$1/rings.pcapng"
+}
+
+# The board identity of an archive: the model from /tmp/sysinfo, which the
+# suite binds inside its mount namespace, and the serial from the platform
+# hook, which UVOICE_PLATFORM_HOOK names.
+calltrace_platform_tests() {
+	ct_skip=''
+	command -v tar >/dev/null 2>&1 || ct_skip='no tar command'
+	command -v jq >/dev/null 2>&1 || ct_skip='no jq command'
+	if [ -n "$ct_skip" ]; then
+		for ct_name in 'platform exit' 'platform model' \
+			'platform name' 'platform serial' 'board model' \
+			'board serial' 'no model file exit' \
+			'no model file model' 'no model file no name' \
+			'no model file model not omitted'; do
+			skip "calltrace/finisher $ct_name" "$ct_skip"
+		done
+		return
+	fi
+	mkdir -p "$tmp/sysinfo"
+	printf 'example,fxs-board\n' > "$tmp/sysinfo/board_name"
+	printf 'Example FXS board\n' > "$tmp/sysinfo/model"
+	ct_sysinfo_made=0
+	if [ ! -d /tmp/sysinfo ]; then
+		mkdir /tmp/sysinfo || bail 'cannot create /tmp/sysinfo'
+		ct_sysinfo_made=1
+	fi
+	mount --bind "$tmp/sysinfo" /tmp/sysinfo ||
+		bail 'cannot bind /tmp/sysinfo'
+	printf '%s\n' "uvoice_serial_get() { printf '%s' S0123456789; }" \
+		> "$tmp/ct-hook-serial.sh"
+	ct_dir=$tmp/finish-platform
+	ct_platform_fixture "$ct_dir"
+	UVOICE_PLATFORM_HOOK=$tmp/ct-hook-serial.sh \
+		"$uvoice_dir/files/calltrace-finish.sh" "$ct_dir" \
+		"$ct_dir.tar.gz" all "$$" > "$tmp/platform.out" 2>&1
+	check_eq 'calltrace/finisher platform exit' 0 "$?"
+	# A board_name alone: the model stands, and no name line follows it.
+	rm "$tmp/sysinfo/model"
+	ct_platform_fixture "$tmp/finish-nomodel"
+	"$uvoice_dir/files/calltrace-finish.sh" "$tmp/finish-nomodel" \
+		"$tmp/finish-nomodel.tar.gz" all "$$" > "$tmp/nomodel.out" 2>&1
+	check_eq 'calltrace/finisher no model file exit' 0 "$?"
+	umount /tmp/sysinfo || bail 'cannot release /tmp/sysinfo'
+	[ "$ct_sysinfo_made" = 1 ] && rmdir /tmp/sysinfo
+	ct_platform=$(tar -xzOf "$ct_dir.tar.gz" \
+		finish-platform/system/platform)
+	check_has 'calltrace/finisher platform model' \
+		'model=example,fxs-board' "$ct_platform"
+	check_has 'calltrace/finisher platform name' 'name=Example FXS board' \
+		"$ct_platform"
+	check_has 'calltrace/finisher platform serial' 'serial=S0123456789' \
+		"$ct_platform"
+	ct_manifest=$(tar -xzOf "$ct_dir.tar.gz" finish-platform/manifest.json)
+	check_eq 'calltrace/finisher board model' example,fxs-board \
+		"$(printf '%s' "$ct_manifest" | jq -r .board.model)"
+	check_eq 'calltrace/finisher board serial' S0123456789 \
+		"$(printf '%s' "$ct_manifest" | jq -r .board.serial)"
+	ct_platform=$(tar -xzOf "$tmp/finish-nomodel.tar.gz" \
+		finish-nomodel/system/platform)
+	check_has 'calltrace/finisher no model file model' \
+		'model=example,fxs-board' "$ct_platform"
+	check_lacks 'calltrace/finisher no model file no name' 'name=' \
+		"$ct_platform"
+	check_lacks 'calltrace/finisher no model file model not omitted' \
+		'no board model' "$ct_platform"
+}
+calltrace_platform_tests
+
 calltrace_failure_tests() {
 	ct_skip=''
 	for ct_tool in tar jq awk; do
@@ -2358,18 +2436,17 @@ RULES
 EOF
 	chmod +x "$tmp/ct-tools/uptime" "$tmp/ct-tools/dmesg" \
 		"$tmp/ct-tools/logread" "$tmp/ct-tools/nft"
-	cat > /usr/srg/scripts/platformdb <<'EOF'
-#!/bin/sh
-exit 7
-EOF
+	printf '%s\n' 'uvoice_serial_get() { return 7; }' \
+		> "$tmp/ct-hook-fail.sh"
 	ct_dir=$tmp/finish-failure
 	printf '%s\n' '{"stage":"finishing", "times":
 		{"armed_at":1700000000,"ended_at":1700000010}}' \
 		> "$ct_dir/manifest.json"
-	TZ=UTC0 PATH=$tmp/ct-tools:$PATH "$uvoice_dir/files/calltrace-finish.sh" \
+	TZ=UTC0 PATH=$tmp/ct-tools:$PATH \
+		UVOICE_PLATFORM_HOOK=$tmp/ct-hook-fail.sh \
+		"$uvoice_dir/files/calltrace-finish.sh" \
 		"$ct_dir" "$ct_dir.tar.gz" all "$$" > "$tmp/failure.out" 2>&1
 	check_eq 'calltrace/finisher collector failures preserve archive' 0 "$?"
-	rm /usr/srg/scripts/platformdb
 	ct_manifest=$(tar -xzOf "$ct_dir.tar.gz" finish-failure/manifest.json)
 	check_eq 'calltrace/finisher command exit 125' 'failed 125' \
 		"$(printf '%s' "$ct_manifest" | jq -r .collectors.uptime)"

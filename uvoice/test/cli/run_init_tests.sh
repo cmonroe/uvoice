@@ -10,7 +10,9 @@
 #
 # run_init_tests.sh: the engine-CPU isolation of the shipped init script
 # (uvoice.init) against a fake /proc, a fake workqueue node and a recording
-# uci, and its reload trigger (reload_service) against a scripted ubus.
+# uci, its reload trigger (reload_service) against a scripted ubus, its stack
+# gate against the platform hook, and its DPCM route against a fake device
+# tree compatible.
 #
 # The init script reads /proc/cpuinfo and /proc/interrupts, writes
 # /proc/irq/<n>/smp_affinity and /sys/devices/virtual/workqueue/cpumask, and
@@ -18,10 +20,11 @@
 # so the suite re-enters itself under "unshare -rm". It bind-mounts fakes over
 # /proc/cpuinfo, /proc/interrupts and /proc/irq, and mounts a tmpfs over
 # /sys/devices/virtual/workqueue. It puts an overlay over /usr for the
-# voice-stack helper the script sources. The shipped script then runs with its
-# own strings. The script ships as "#!/bin/sh /etc/rc.common" and is sourced
-# here, with the procd verbs stubbed, so start_service() runs the same wiring
-# it runs on a target.
+# platform hook /usr/share/uvoice/platform.sh, the path the script reads. The
+# compatible fixture is a file of the suite that UVOICE_DT_COMPATIBLE names.
+# The shipped script then runs with its own strings. The script ships as
+# "#!/bin/sh /etc/rc.common" and is sourced here, with the procd verbs
+# stubbed, so start_service() runs the same wiring it runs on a target.
 #
 # Every leg runs under every interpreter the host offers among dash and
 # busybox sh, the run_seed_tests.sh shape.
@@ -65,20 +68,22 @@ cleanup() {
 }
 trap 'cleanup' EXIT
 
-mkdir -p "$tmp/usr-up/srg/scripts" "$tmp/usr-work" "$tmp/bin" "$tmp/rec" \
-	"$tmp/proc" "$tmp/irq/42" "$tmp/irq/43"
+# /usr/share belongs to a uid the user namespace does not map, so the merged
+# view refuses a new directory under it. The upper layer takes share/uvoice
+# instead.
+mkdir -p "$tmp/usr-up/share/uvoice" "$tmp/usr-work" "$tmp/bin" "$tmp/rec" \
+	"$tmp/proc" "$tmp/irq/42" "$tmp/irq/43" "$tmp/dt"
 
 mount -t overlay overlay \
 	-o "lowerdir=/usr,upperdir=$tmp/usr-up,workdir=$tmp/usr-work" /usr ||
 	bail 'cannot overlay /usr, the kernel refuses an unprivileged overlay mount'
-mkdir -p /usr/srg/scripts || bail 'cannot create the device paths'
+hook=/usr/share/uvoice/platform.sh
+[ -e "$hook" ] && bail "$hook exists below the overlay"
 
-# The stack helper the script sources: the answer that makes start_service()
-# run. The platform database stays absent, so the DPCM route takes its
-# generic arm.
-cat > /usr/srg/scripts/voice-stack.sh <<'LIB'
-voice_stack_get() { echo uvoice; }
-LIB
+# The compatible file stays absent unless a leg writes one, so the DPCM route
+# takes its default arm.
+UVOICE_DT_COMPATIBLE=$tmp/dt/compatible
+export UVOICE_DT_COMPATIBLE
 
 : > "$tmp/proc/cpuinfo"
 : > "$tmp/proc/interrupts"
@@ -92,12 +97,13 @@ mount -t tmpfs tmpfs "$wq_dir" || bail "cannot cover $wq_dir with a tmpfs"
 
 #
 # The shims. uci answers get from a state file; logger and amixer record their
-# argument vectors and succeed, so a log line the script emits is an assertion
-# and a mixer switch on the generic arm costs nothing.
+# argument vectors and succeed, so a log line or a mixer switch that the
+# script emits is an assertion.
 #
 UCI_STATE=$tmp/rec/state
 LOG_REC=$tmp/rec/logger.argv
-export UCI_STATE LOG_REC
+AMIXER_REC=$tmp/rec/amixer.argv
+export UCI_STATE LOG_REC AMIXER_REC
 
 cat > "$tmp/bin/uci" <<'SHIM'
 #!/bin/sh
@@ -118,6 +124,7 @@ printf '%s\n' "$*" >> "$LOG_REC"
 SHIM
 cat > "$tmp/bin/amixer" <<'SHIM'
 #!/bin/sh
+printf '%s\n' "$*" >> "$AMIXER_REC"
 exit 0
 SHIM
 # ubus answers from a script of scenario files. UBUS_RUNNING holds one answer
@@ -200,6 +207,41 @@ ubus_count() {
 	grep -c -F -- "$1" "$UBUS_REC"
 }
 
+# hook_set word: the platform hook answers word; NONE removes the hook file.
+hook_set() {
+	rm -f "$hook"
+	[ "$1" = NONE ] && return 0
+	printf 'uvoice_stack_get() { echo %s; }\n' "$1" > "$hook"
+}
+
+# dt_set entry...: the compatible fixture holds each entry with its NUL, as a
+# device tree does; no entry removes the file.
+dt_set() {
+	rm -f "$UVOICE_DT_COMPATIBLE"
+	[ "$#" -gt 0 ] || return 0
+	for entry in "$@"; do
+		printf '%s\0' "$entry"
+	done > "$UVOICE_DT_COMPATIBLE"
+}
+
+# run_route shell: the DPCM route alone, with fresh mixer and log records.
+run_route() {
+	: > "$AMIXER_REC"
+	: > "$LOG_REC"
+	run_init "$1" udsp_dpcm_route
+}
+
+mt7622_switches=$(printf '%s\n' \
+	'-q -c 0 cset name=O00 I00 Switch on' \
+	'-q -c 0 cset name=O01 I01 Switch on' \
+	'-q -c 0 cset name=O15 I12 Switch on' \
+	'-q -c 0 cset name=O16 I13 Switch on')
+mt798x_switches=$(printf '%s\n' \
+	'-q sset O018 I150_Switch on' \
+	'-q sset O019 I151_Switch on' \
+	'-q sset O124 I032_Switch on' \
+	'-q sset O125 I033_Switch on')
+
 # init_fixture cpus engine_cpu wq_preset: cpus processors, the engine_cpu
 # option as given (an empty value leaves it absent), the PCM irq 42 and an
 # ethernet irq 43 both at the full mask, and the workqueue node at wq_preset
@@ -243,6 +285,7 @@ run_init() {
 		procd_set_param() { logger -t procd -- set_param "$@"; }
 		procd_close_instance() { logger -t procd -- close_instance; }
 		. "$init"
+		start() { logger -t rc -- start; }
 		restart() { logger -t rc -- restart; }
 		sleep() { :; }
 		udsp_stack_present() { return 0; }
@@ -310,9 +353,10 @@ legs() {
 	check "$shell an absent option takes the schema default 3" \
 		"$(node_read "$wq_node")" 7
 
-	# The wiring: start_service() itself, with the stack gate answering
-	# uvoice and the platform gate stubbed open, writes both nodes and
-	# reaches procd.
+	# The wiring: start_service() itself, with no hook file, so the stack
+	# gate answers uvoice, and the platform gate stubbed open, writes both
+	# nodes and reaches procd.
+	hook_set NONE
 	init_fixture 4 3 f
 	run_init "$shell" start_service
 	check "$shell start_service: exit 0" "$rc" 0
@@ -328,6 +372,79 @@ legs() {
 		"$(log_count 'set_param env')" 0
 	check "$shell start_service: the start was logged" \
 		"$(log_count 'uvoiced started')" 1
+	check "$shell no hook: nothing is inert" "$(log_count 'uvoice inert')" 0
+
+	init_fixture 4 3 f
+	run_init "$shell" boot
+	check "$shell no hook: boot starts the service" \
+		"$(log_count 'rc -- start')" 1
+
+	# Every word but uvoice keeps the script inert: start_service, the
+	# reload trigger and boot.
+	for word in d2 unknown; do
+		hook_set "$word"
+		init_fixture 4 3 f
+		run_init "$shell" start_service
+		check "$shell hook $word: start_service exit 0" "$rc" 0
+		check "$shell hook $word: start_service logs the inert stack" \
+			"$(log_count "voice stack '$word', uvoice inert")" 1
+		check "$shell hook $word: no instance opened" \
+			"$(log_count 'open_instance')" 0
+		check "$shell hook $word: the pcm irq stays" \
+			"$(node_read "$tmp/irq/42/smp_affinity")" f
+		reload_fixture true 0 0
+		run_init "$shell" reload_service
+		check "$shell hook $word: reload_service calls no ubus" \
+			"$(ubus_count '')" 0
+		check "$shell hook $word: reload_service logs the inert stack" \
+			"$(log_count "voice stack '$word', uvoice inert")" 1
+		: > "$LOG_REC"
+		run_init "$shell" boot
+		check "$shell hook $word: boot logs the inert stack" \
+			"$(log_count "voice stack '$word', uvoice inert")" 1
+		check "$shell hook $word: boot does not start" \
+			"$(log_count 'rc -- start')" 0
+	done
+
+	hook_set uvoice
+	init_fixture 4 3 f
+	run_init "$shell" boot
+	check "$shell hook uvoice: boot starts the service" \
+		"$(log_count 'rc -- start')" 1
+	hook_set NONE
+
+	# The DPCM route keys on the SoC entry of the compatible list.
+	dt_set example,mt7622-board mediatek,mt7622
+	run_route "$shell"
+	check "$shell mt7622 compatible: the four cset switches on card 0" \
+		"$(cat "$AMIXER_REC")" "$mt7622_switches"
+	check "$shell mt7622 compatible: nothing is logged" "$(log_count '')" 0
+
+	dt_set mediatek,mt7622
+	run_route "$shell"
+	check "$shell mt7622 as the first entry: the cset switches" \
+		"$(cat "$AMIXER_REC")" "$mt7622_switches"
+
+	printf 'example,mt7622-board\0mediatek,mt7622' > "$UVOICE_DT_COMPATIBLE"
+	run_route "$shell"
+	check "$shell mt7622 last entry without its NUL: the cset switches" \
+		"$(cat "$AMIXER_REC")" "$mt7622_switches"
+
+	dt_set example,an7581-board airoha,an7581 airoha,en7581
+	run_route "$shell"
+	check "$shell an7581 compatible: no mixer call" \
+		"$(cat "$AMIXER_REC")" ""
+	check "$shell an7581 compatible: nothing is logged" "$(log_count '')" 0
+
+	dt_set example,mt7988a-board mediatek,mt7988a
+	run_route "$shell"
+	check "$shell mt7988a compatible: the four sset switches" \
+		"$(cat "$AMIXER_REC")" "$mt798x_switches"
+
+	dt_set
+	run_route "$shell"
+	check "$shell no compatible file: the four sset switches" \
+		"$(cat "$AMIXER_REC")" "$mt798x_switches"
 
 	# reload_service, the procd trigger of every voip commit.
 	reload_fixture true 0 0

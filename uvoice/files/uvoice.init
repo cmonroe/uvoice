@@ -11,12 +11,15 @@
 # uvoice procd init
 #
 # The daemon owns the voice hardware, and two voice stacks cannot share it, so
-# this script must stay inert unless the platform selects the uvoice stack. The gate
-# runs in boot() and in start_service() because a manual "service uvoice start"
-# must be gated too.
+# this script must stay inert unless the platform selects the uvoice stack. The
+# gate runs in boot(), start_service() and reload_service(), because a manual
+# start and a config commit must be gated too.
 #
-# The stack answer is voice_stack_get from voice-scripts voice-stack.sh, which
-# reads PDB_VOICE_STACK from platformdb. Lab A/B switches by editing the PDB.
+# The stack answer is uvoice_stack_get, one word: uvoice, none, unknown or the
+# name of another stack. Every word but uvoice keeps this script inert. The
+# default answer is uvoice. The optional platform hook
+# /usr/share/uvoice/platform.sh gives the stack name and the board serial of
+# its platform.
 #################################################################################
 
 START=96
@@ -25,11 +28,10 @@ USE_PROCD=1
 
 PROG=/usr/sbin/uvoiced
 STACK_NAME=uvoice
-STACK_LIB=/usr/srg/scripts/voice-stack.sh
-STACK_FILE=/usr/share/uvoice/stack
 HAL_FILE=/usr/share/uvoice/hal
 CSS_FIRMWARE=/lib/firmware/css-loader
-PLATFORMDB=/usr/srg/scripts/platformdb
+UVOICE_PLATFORM_HOOK="${UVOICE_PLATFORM_HOOK:-/usr/share/uvoice/platform.sh}"
+UVOICE_DT_COMPATIBLE="${UVOICE_DT_COMPATIBLE:-/proc/device-tree/compatible}"
 
 action_arg=$action
 mypid=$$
@@ -43,16 +45,9 @@ log_crit() {
 	echo "$@" >&2
 }
 
-# The stub and CI image shapes carry neither voice-scripts nor a platform
-# database, so a missing helper means the stack answer is none and this
-# script stays inert.
-if [ -r "$STACK_LIB" ]; then
-	. "$STACK_LIB"
-elif [ -r "$STACK_FILE" ]; then
-	voice_stack_get() { cat "$STACK_FILE"; }
-else
-	voice_stack_get() { echo none; }
-fi
+uvoice_stack_get() { echo uvoice; }
+# shellcheck source=/dev/null
+[ -r "$UVOICE_PLATFORM_HOOK" ] && . "$UVOICE_PLATFORM_HOOK"
 
 css_firmware_present() {
 	[ "$(cat "$HAL_FILE" 2>/dev/null)" = css ] || return 0
@@ -65,7 +60,7 @@ css_firmware_present() {
 stack_owned() {
 	local stack
 
-	stack="$(voice_stack_get)"
+	stack="$(uvoice_stack_get)"
 	if [ "$stack" != "$STACK_NAME" ]; then
 		log_info "voice stack '$stack', uvoice inert"
 		return 1
@@ -115,13 +110,21 @@ udsp_stack_present() {
 # the front end open fails EINVAL and the engine never ticks. A missing
 # control is logged and not fatal: a board may route the same path under
 # other names, and refusing to start uvoiced over a mixer name would take the
-# line down for a fault the daemon reports itself.
-udsp_dpcm_route() {
-	local model sw
+# line down for a fault the daemon reports itself. Each AFE driver names its
+# switches, so the SoC of the device tree selects the names. tr keeps the
+# entries apart, because a command substitution drops the NUL separators. A
+# space at each end of the word lets the first and the last entry match.
+soc_compatible_get() {
+	[ -r "$UVOICE_DT_COMPATIBLE" ] || return 0
+	tr '\0' ' ' < "$UVOICE_DT_COMPATIBLE"
+}
 
-	model="$( . "$PLATFORMDB" >/dev/null 2>&1; echo "$PDB_DEVICE_MODEL" )"
-	case "$model" in
-	834-v6|854-v6)
+udsp_dpcm_route() {
+	local sw
+
+	case " $(soc_compatible_get) " in
+	*' mediatek,mt7622 '*)
+		# The mt2701 AFE driver serves MT7622.
 		amixer -q -c 0 cset name='O00 I00 Switch' on >/dev/null 2>&1 || \
 			log_info "amixer 'O00 I00 Switch' not set, the audio front end may refuse to open"
 		amixer -q -c 0 cset name='O01 I01 Switch' on >/dev/null 2>&1 || \
@@ -131,13 +134,13 @@ udsp_dpcm_route() {
 		amixer -q -c 0 cset name='O16 I13 Switch' on >/dev/null 2>&1 || \
 			log_info "amixer 'O16 I13 Switch' not set, the audio front end may refuse to open"
 		;;
-	SDG-P72v-Plus*|SDG-P73v-Ultra*)
+	*' airoha,an7581 '*)
 		# The an7581-si3218x card has no DPCM switches: the EN7581 PCM
 		# engine feeds the SLIC highway directly, so there is nothing to
-		# route and the MT798x names below would only log misses. The
-		# prefix covers the ETH-WAN alias boards (engnums 1600/1601).
+		# route and the MT798x names below would only log misses.
 		;;
 	*)
+		# The mt7986 AFE driver names a switch "O018 I150_Switch".
 		for sw in 'O018 I150_Switch' 'O019 I151_Switch' \
 			  'O124 I032_Switch' 'O125 I033_Switch'; do
 			amixer -q sset "$sw" on >/dev/null 2>&1 || \

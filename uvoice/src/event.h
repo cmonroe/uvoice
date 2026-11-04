@@ -17,20 +17,24 @@
  * N is one based, and the event schema documents N = 1 or 2. This layer takes
  * the daemon's 0 based line index and adds the one.
  *
- * The nodeMAC token is literal. event-post-now.sh substitutes it with MFG_MAC
- * ("topic=${topic/nodeMAC/$MFG_MAC}"), so the daemon never learns the node MAC
- * and never passes -m.
+ * The nodeMAC token is literal. The poster puts the node MAC in its place, so
+ * the daemon never learns the node MAC.
  *
- * How it publishes. It runs /usr/srg/scripts/event-post.sh with an argv array
+ * How it publishes. It runs /usr/libexec/uvoice/event-post with an argv array
  * through the shared spawn (spawn_run.h), and reaps the child through
  * uloop_process, the way net/peer.c drives nft. No shell: an argv
  * array needs no shell quoting and cannot be re-parsed.
  *
- * Soft gate. The script belongs to the eventmgr package, which uvoice does not
- * depend on, and it is absent on the build host. event_init() checks the path
- * at start, and a post checks it when no check ran before. An absent or
- * non-executable script turns the whole layer off with one trace. There is no
- * uci option: the gate is the switch.
+ * The poster. A platform package installs the poster at that path, and uvoice
+ * ships none. The argv contract is the poster's: -p <prio> -t <topic> <json>,
+ * with the literal nodeMAC token in the topic.
+ *
+ * Soft gate. uvoice does not depend on a poster, and the build host has none.
+ * event_init() checks the path at start, and a post checks it when no check
+ * ran before. An absent or non-executable poster turns the whole layer off
+ * with one trace. The check follows a symlink, so a link to an executable
+ * arms the gate and a dangling link turns it off. There is no uci option: the
+ * gate is the switch.
  *
  * State, not events. A failed registration retries every backoff tick, so the
  * failure edge would otherwise post an event per attempt. This layer keeps a
@@ -116,10 +120,8 @@ void event_tls_cert_stop(enum event_tls_stop_mode mode);
 
 /*
  * Final teardown at process exit. Reaps a post still in flight on every line
- * and forgets a queued state. The waitpid has no bound, as in net_peer_done():
- * event-post.sh returns as soon as it has backgrounded its worker, and
- * its own 2 s gate lock bounds the wait in practice, but nothing in this
- * daemon caps it. uloop must still be valid.
+ * and forgets a queued state. The waitpid has no bound, as in net_peer_done(),
+ * so a poster that does not return holds the exit. uloop must still be valid.
  */
 void event_done(void);
 

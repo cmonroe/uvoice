@@ -27,10 +27,9 @@
  * flight. The TLS helper leads its own process group. A listener released
  * right after a spawn binds again at once.
  *
- * The fixed strings come from the voip section of the event schema of the
- * eventmgr package. A topic reads "voip/nodeMAC/line-%d/%s", with line+1
- * over the 0 based line index, because the subscribers of the topics read
- * that form.
+ * The fixed strings are voip topics of the event schema that a poster
+ * forwards. A topic reads "voip/nodeMAC/line-%d/%s", with line+1 over the 0
+ * based line index, because subscribers of the topics read that form.
  */
 #include <arpa/inet.h>
 #include <errno.h>
@@ -56,7 +55,7 @@
 #define TOPIC_UP_2	"voip/nodeMAC/line-2/reg/successful"
 #define TOPIC_DOWN_2	"voip/nodeMAC/line-2/reg/failed"
 
-#define SCRIPT_DEFAULT	"/usr/srg/scripts/event-post.sh"
+#define SCRIPT_DEFAULT	"/usr/libexec/uvoice/event-post"
 #define TLS_HELPER_DEFAULT	"/usr/sbin/uvoice_tls_cert.sh"
 #define TLS_KEYLOG	"/tmp/uvoice/ssl.keylog"
 
@@ -331,6 +330,7 @@ static bool script_make(char *path, size_t plen, bool executable)
 static void test_gate(void)
 {
 	char path[64];
+	char link_path[72];
 
 	CASE("gate: an absent script refuses every post and records none");
 	event_test_mode(true);
@@ -407,7 +407,37 @@ static void test_gate(void)
 	unlink(path);
 	unsetenv("UVOICE_EVENT_POST");
 
-	CASE("gate: the default path is the eventmgr script");
+	/* A platform package installs the poster as a symlink. */
+	CASE("gate: a symlink to an executable arms the gate and is argv[0]");
+	event_test_mode(true);
+	CHECK(script_make(path, sizeof(path), true));
+	snprintf(link_path, sizeof(link_path), "%s.link", path);
+	CHECK(symlink(path, link_path) == 0);
+	setenv("UVOICE_EVENT_POST", link_path, 1);
+	event_init();
+	CHECK(event_available());
+	cycle_up(0, "198.51.100.10");
+	CHECK_UINT(event_test_posts(), 1);
+	CHECK(!strcmp(arg(0, 0), link_path));
+	unlink(link_path);
+	unlink(path);
+
+	CASE("gate: a dangling symlink turns the layer off");
+	event_test_mode(true);
+	CHECK(script_make(path, sizeof(path), true));
+	snprintf(link_path, sizeof(link_path), "%s.link", path);
+	CHECK(symlink(path, link_path) == 0);
+	unlink(path);
+	setenv("UVOICE_EVENT_POST", link_path, 1);
+	event_init();
+	CHECK(!event_available());
+	post_up(0, "198.51.100.10");
+	CHECK_UINT(event_test_posts(), 0);
+	CHECK_UINT(event_test_refused(), 1);
+	unlink(link_path);
+	unsetenv("UVOICE_EVENT_POST");
+
+	CASE("gate: the default path is /usr/libexec/uvoice/event-post");
 	event_test_mode(true);
 	cycle_up(0, "198.51.100.10");
 	CHECK(!strcmp(arg(0, 0), SCRIPT_DEFAULT));

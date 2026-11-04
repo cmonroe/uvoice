@@ -14,6 +14,13 @@ umask 077
 # The generator of SUMMARY.txt. The archive keeps a copy of it under tools/,
 # so a host builds the same report again from the same files.
 summary_script=/usr/share/uvoice/calltrace-summary.uc
+UVOICE_PLATFORM_HOOK="${UVOICE_PLATFORM_HOOK:-/usr/share/uvoice/platform.sh}"
+
+# uvoice_serial_get prints the board serial or nothing. A platform that knows
+# the serial installs the hook, which defines the function again.
+uvoice_serial_get() { :; }
+# shellcheck source=/dev/null
+[ -r "$UVOICE_PLATFORM_HOOK" ] && . "$UVOICE_PLATFORM_HOOK"
 
 collector_omit() {
 	printf 'OMITTED: %s\n' "$*"
@@ -152,7 +159,7 @@ log_collect() {
 			start=$(jq -er '.times.armed_at - 30' "$dir/manifest.json")
 			end=$(jq -er '.times.ended_at // now | floor | . + 30' \
 				"$dir/manifest.json")
-			# SmartOS help uses a date and local time for --since.
+			# A logread with --since takes a date and local time.
 			start=$(date -d "@$start" '+%Y-%m-%d %H:%M:%S') &&
 				end=$(date -d "@$end" '+%Y-%m-%d %H:%M:%S') &&
 				logread -S "$start" -U "$end" --iso8601 -t && return 0
@@ -163,41 +170,32 @@ log_collect() {
 	logread -l 20000
 }
 
+# The preinit step of OpenWrt writes board_name from the first compatible
+# entry of the device tree, and model from its model property.
 platform_model_collect() (
-	[ -r /usr/srg/scripts/platformdb ] || {
-		collector_omit 'no platformdb model'
+	board=''
+	if [ -r /tmp/sysinfo/board_name ]; then
+		board=$(cat /tmp/sysinfo/board_name) || return
+	fi
+	[ -n "$board" ] || {
+		collector_omit 'no board model'
 		return
 	}
-	# A platform database can exit, so it must not own the worker shell.
-	# shellcheck source=/dev/null
-	. /usr/srg/scripts/platformdb >/dev/null 2>&1 || return
-	[ -n "${PDB_DEVICE_MODEL:-}" ] || {
-		collector_omit 'platformdb has no model'
-		return
-	}
-	printf '%s' "$PDB_DEVICE_MODEL" > "$dir/.board-model" || return
-	printf 'model=%s\n' "$PDB_DEVICE_MODEL"
+	printf '%s' "$board" > "$dir/.board-model" || return
+	printf 'model=%s\n' "$board"
+	[ -r /tmp/sysinfo/model ] || return 0
+	board_title=$(cat /tmp/sysinfo/model) || return
+	printf 'name=%s\n' "$board_title"
 )
 
 platform_serial_collect() (
-	[ -r /etc/mfginfo.sh ] || {
-		collector_omit 'no manufacturing serial'
+	serial=$(uvoice_serial_get) || return
+	[ -n "$serial" ] || {
+		collector_omit 'no board serial'
 		return
 	}
-	# shellcheck source=/dev/null
-	. /etc/mfginfo.sh || return
-	if [ -n "${MFG_MODEL:-}" ]; then
-		printf 'MFG_MODEL=%s\n' "$MFG_MODEL"
-	fi
-	if [ -n "${MFG_HWREV:-}" ]; then
-		printf 'MFG_HWREV=%s\n' "$MFG_HWREV"
-	fi
-	[ -n "${MFG_SERIAL:-}" ] || {
-		collector_omit 'manufacturing data has no serial'
-		return
-	}
-	printf '%s' "$MFG_SERIAL" > "$dir/.board-serial" || return
-	printf 'serial=%s\n' "$MFG_SERIAL"
+	printf '%s' "$serial" > "$dir/.board-serial" || return
+	printf 'serial=%s\n' "$serial"
 )
 
 # An absent identity field must not hide a failed read of another field.

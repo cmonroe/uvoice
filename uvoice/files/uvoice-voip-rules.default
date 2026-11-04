@@ -13,22 +13,16 @@
 # restrict_source as written: uvoice accepts the option for the other stack
 # and acts on none of its values.
 
-STACK_LIB=/usr/srg/scripts/voice-stack.sh
-STACK_FILE=/usr/share/uvoice/stack
+UVOICE_PLATFORM_HOOK="${UVOICE_PLATFORM_HOOK:-/usr/share/uvoice/platform.sh}"
 
 # The other voice stack owns the Allow_VoIP_* rules, so the step acts only
-# when the platform selects uvoice. uvoice.init uses the same voice_stack_get
+# when the platform selects uvoice. uvoice.init uses the same uvoice_stack_get
 # answer.
-if [ -r "$STACK_LIB" ]; then
-	# shellcheck source=/dev/null
-	. "$STACK_LIB"
-elif [ -r "$STACK_FILE" ]; then
-	voice_stack_get() { cat "$STACK_FILE"; }
-else
-	voice_stack_get() { echo none; }
-fi
+uvoice_stack_get() { echo uvoice; }
+# shellcheck source=/dev/null
+[ -r "$UVOICE_PLATFORM_HOOK" ] && . "$UVOICE_PLATFORM_HOOK"
 # A nonzero exit keeps the step, so a board that moves to uvoice later runs it.
-[ "$(voice_stack_get)" = uvoice ] || exit 1
+[ "$(uvoice_stack_get)" = uvoice ] || exit 1
 
 firewall_changed=0
 

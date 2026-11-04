@@ -25,7 +25,7 @@
 #include "spawn_run.h"
 #include "trace.h"
 
-#define EVENT_SCRIPT	"/usr/srg/scripts/event-post.sh"
+#define EVENT_SCRIPT	"/usr/libexec/uvoice/event-post"
 #define EVENT_TLS_HELPER	"/usr/sbin/uvoice_tls_cert.sh"
 #define EVENT_TLS_RETRY_MS	30000
 #define EVENT_PATH_MAX	128
@@ -559,9 +559,9 @@ static void event_fire(struct event_line *l, enum event_reg st, const char *prox
 }
 
 /*
- * The exit status is deliberately not read. event-post.sh throttles, queues
- * and backgrounds on its own, and a non-zero status would say nothing this
- * layer could act on; treating it as a failure and re-posting would loop.
+ * The exit status is deliberately not read. A non-zero status would say
+ * nothing this layer could act on; treating it as a failure and re-posting
+ * would loop.
  */
 static void event_reap(struct event_line *l)
 {
