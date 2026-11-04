@@ -82,6 +82,7 @@ cleanup() {
 	[ "$ct_sysinfo_made" = 1 ] && rmdir /tmp/sysinfo 2>/dev/null
 	umount -l /tmp/uvoice 2>/dev/null
 	umount -l /tmp/.uci 2>/dev/null
+	[ "$uci_hostmask_made" = 1 ] && rmdir /tmp/.uci 2>/dev/null
 	umount -l /etc/init.d 2>/dev/null
 	umount -l /usr 2>/dev/null
 	rm -rf "$tmp"
@@ -106,6 +107,8 @@ mount --bind "$tmp/initd" /etc/init.d || bail 'cannot bind mount /etc/init.d'
 # when -t names another one (measured: a stale host /tmp/.uci/voip surfaces in
 # every "uci changes voip" the wrapper makes), so an empty directory covers it
 # inside this mount namespace.
+uci_hostmask_made=0
+[ -d /tmp/.uci ] || uci_hostmask_made=1
 mkdir -p /tmp/.uci "$tmp/uci-hostmask"
 mount --bind "$tmp/uci-hostmask" /tmp/.uci || bail 'cannot bind mount /tmp/.uci'
 
