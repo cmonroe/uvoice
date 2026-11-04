@@ -22,6 +22,9 @@
 # its platform.
 #################################################################################
 
+# rc.common sources this file: it reads START, STOP and USE_PROCD, it sets
+# action, and busybox ash has local.
+# shellcheck disable=SC2034,SC2154,SC3043
 START=96
 STOP=10
 USE_PROCD=1
@@ -37,12 +40,12 @@ action_arg=$action
 mypid=$$
 
 log_info() {
-	logger -p info -t uvoice -- "(${mypid}:${action_arg}): $@"
+	logger -p info -t uvoice -- "(${mypid}:${action_arg}): $*"
 }
 
 log_crit() {
-	logger -p crit -t uvoice -- "(${mypid}:${action_arg}): $@"
-	echo "$@" >&2
+	logger -p crit -t uvoice -- "(${mypid}:${action_arg}): $*"
+	echo "$*" >&2
 }
 
 uvoice_stack_get() { echo uvoice; }
@@ -205,6 +208,7 @@ udsp_engine_cpu_get() {
 	# equal lengths compare as text.
 	limit='2147483647'
 	[ "$sign" = '-' ] && limit='2147483648'
+	# shellcheck disable=SC2071,SC3012
 	if [ "${#digits}" -gt "${#limit}" ]; then
 		digits=''
 	elif [ "${#digits}" = "${#limit}" ] && [ "$digits" \> "$limit" ]; then
@@ -267,6 +271,7 @@ udsp_pcm_irq_move() {
 
 	# Both mt7986-afe-pcm.c and mt2701-afe-pcm.c request "asys-isr". The
 	# AN7581 "PCM1" action name matches /pcm/.
+	# shellcheck disable=SC2013
 	for irq in $(awk 'tolower($0) ~ /pcm|afe|asys/ { sub(":", "", $1); print $1 }' \
 		     /proc/interrupts); do
 		echo "$mask" > "/proc/irq/$irq/smp_affinity" 2>/dev/null || \
