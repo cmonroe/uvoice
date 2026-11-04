@@ -11,7 +11,8 @@
 # uvoice.sh - Shell helpers for the uvoice ubus API (voice, voice.trace,
 # voice.stub)
 #
-# Usage: source uvoice.sh
+# Usage: uvoice.load   (a login shell takes it from /etc/profile.d/uvoice.sh)
+#        . /usr/share/uvoice/uvoice.sh   (any other shell)
 #        uvoice.help
 #
 # Lines and slots are 0-based, matching the ubus surface. The klish-facing

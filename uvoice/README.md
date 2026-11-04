@@ -141,6 +141,8 @@ also holds two more suites, which run under `unshare -rm`:
 
 - `uvoiced`, `voice-cli` and `uvoice_tls_cert.sh` in `/usr/sbin`;
 - init script `/etc/init.d/uvoice`;
+- `/etc/profile.d/uvoice.sh`, which defines `uvoice.load`; that word loads
+  the shell helpers of `uvoice.sh` into a login shell;
 - `uvoice.sh`, the formatter `uvoice-cli.uc`, the call trace tools and the
   defaults library `voip-defaults.sh` in `/usr/share/uvoice`;
 - on a css image, the marker file `/usr/share/uvoice/hal`, which holds `css`;

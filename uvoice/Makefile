@@ -141,6 +141,9 @@ define Package/uvoice/install
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/uvoice.init $(1)/etc/init.d/uvoice
 
+	$(INSTALL_DIR) $(1)/etc/profile.d
+	$(INSTALL_DATA) ./files/uvoice.profile $(1)/etc/profile.d/uvoice.sh
+
 	$(INSTALL_DIR) $(1)/usr/share/uvoice
 	$(if $(CONFIG_UVOICE_HAL_CSS),echo css > $(1)/usr/share/uvoice/hal)
 	$(INSTALL_DATA) ./files/uvoice.sh $(1)/usr/share/uvoice/uvoice.sh
