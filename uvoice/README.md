@@ -129,9 +129,12 @@ UVOICED=$PWD/uvoice/build/uvoiced UVOICE_PREFIX=<libuci prefix> \
 ```
 
 Output is TAP with a plan line, and a skipped check still counts. `test/cli`
-also holds
-`run_seed_tests.sh` for the board defaults helper, and `run_init_tests.sh`
-for the init script. Both run under `unshare -rm`.
+also holds three more suites, which run under `unshare -rm`:
+
+- `run_seed_tests.sh` for the board helper `files/uvoice-defaults.sh`;
+- `run_defaults_tests.sh` for the defaults library `files/voip-defaults.sh`
+  and the uci-defaults step `files/uvoice.defaults`;
+- `run_init_tests.sh` for the init script `files/uvoice.init`.
 
 ## Build in OpenWrt
 
@@ -172,6 +175,48 @@ Registration and certificate events go to `/usr/libexec/uvoice/event-post`,
 which a platform package installs. The poster takes `-p <prio> -t <topic>
 <json>`, and each topic holds the literal token `nodeMAC`. Without a poster,
 no event goes out.
+
+**Default config.** The uci-defaults step `/etc/uci-defaults/90-uvoice`
+writes `/etc/config/voip` for the boards in its table. It runs at first boot,
+and when `opkg` installs the package on a running unit. The table holds
+`snom,d735`: two lines and `voip.base.ui` `desk`. The step writes these
+sections:
+
+- base section;
+- one channel section for each line;
+- six codec sections for each line: G.711 u-law and A-law, G.729a, G.726,
+  G.722 and Opus.
+
+Each write is unset-only, so a value in `/etc/config/voip` stays. The step
+runs at the first boot of every image. So a default that a user deleted
+comes back, and a value that a user changed stays.
+
+A board outside its table gets no `/etc/config/voip`. If the platform hook
+answers `unknown`, the step exits 1, and the next boot runs it again. Any
+other answer but `uvoice` ends the step with no write. The library
+`/usr/share/uvoice/voip-defaults.sh` holds the writers, so a platform script
+can write these defaults too.
+
+## Configure a line
+
+The default config leaves the voice service and each line disabled, and it
+holds no account. To register line 1, set these options, then reload the
+service:
+
+```
+uci set voip.base.enabled=1
+uci set voip.channel1.enabled=1
+uci set voip.channel1.sip_username=<user>
+uci set voip.channel1.sip_auth_username=<authentication user>
+uci set voip.channel1.sip_secret=<password>
+uci set voip.channel1.sip_proxy=<proxy>
+uci set voip.channel1.sip_registrar=<registrar>
+uci set voip.channel1.sip_domain=<domain>
+uci commit voip
+/etc/init.d/uvoice reload
+```
+
+Line 2 uses the same options in `channel2`.
 
 ## ubus API schema
 

@@ -1,0 +1,61 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# uvoice - native voice stack for OpenWrt
+# Copyright (C) 2026 Adtran Inc.
+# Author: Chad Monroe <chad.monroe@adtran.com>
+#
+# Licensed under GPL-2.0-only with the linking exception stated in LICENSE.
+#
+# uci-defaults step that writes the default voice config for the boards it
+# knows: the base section, the channel sections and their codec sections.
+# Every write is unset-only. A board outside the table gets no
+# /etc/config/voip, so a board without voice keeps no voice config.
+#
+# The defaults leave the service and every line disabled, with no account:
+# "Configure a line" in README.md lists the options that register a line.
+
+# shellcheck source=/dev/null
+. /lib/functions.sh
+# shellcheck source=/dev/null
+. /usr/share/uvoice/voip-defaults.sh
+
+UVOICE_PLATFORM_HOOK="${UVOICE_PLATFORM_HOOK:-/usr/share/uvoice/platform.sh}"
+
+uvoice_stack_get() { echo uvoice; }
+# shellcheck source=/dev/null
+[ -r "$UVOICE_PLATFORM_HOOK" ] && . "$UVOICE_PLATFORM_HOOK"
+
+# unknown is no answer: the nonzero exit keeps the step for the next boot.
+case "$(uvoice_stack_get)" in
+uvoice)
+	;;
+unknown)
+	exit 1
+	;;
+*)
+	exit 0
+	;;
+esac
+
+case "$(board_name)" in
+snom,d735)
+	channels=2
+	ui=desk
+	;;
+*)
+	exit 0
+	;;
+esac
+
+voip_defaults_load || exit 1
+base_defaults_write "$channels" || exit 1
+option_default_write base ui "$ui" || exit 1
+n=1
+while [ "$n" -le "$channels" ]; do
+	codec_defaults_write "$n" || exit 1
+	channel_defaults_write "$n" || exit 1
+	n=$((n + 1))
+done
+voip_defaults_commit || exit 1
+exit 0

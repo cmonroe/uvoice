@@ -78,6 +78,7 @@ cleanup() {
 	[ -n "$bare_ubusd_pid" ] && kill "$bare_ubusd_pid" 2>/dev/null
 	cd /
 	umount -l /tmp/sysinfo 2>/dev/null
+	[ "$ct_sysinfo_made" = 1 ] && rmdir /tmp/sysinfo 2>/dev/null
 	umount -l /tmp/uvoice 2>/dev/null
 	umount -l /tmp/.uci 2>/dev/null
 	umount -l /etc/init.d 2>/dev/null
@@ -85,6 +86,8 @@ cleanup() {
 	rm -rf "$tmp"
 }
 trap 'cleanup' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
 
 mkdir -p "$tmp/usr-up/share" "$tmp/usr-work" "$tmp/initd" \
 	"$tmp/bin" "$tmp/cfg" "$tmp/uci-delta" "$tmp/rec"
@@ -2356,6 +2359,7 @@ calltrace_platform_tests() {
 	check_eq 'calltrace/finisher no model file exit' 0 "$?"
 	umount /tmp/sysinfo || bail 'cannot release /tmp/sysinfo'
 	[ "$ct_sysinfo_made" = 1 ] && rmdir /tmp/sysinfo
+	ct_sysinfo_made=0
 	ct_platform=$(tar -xzOf "$ct_dir.tar.gz" \
 		finish-platform/system/platform)
 	check_has 'calltrace/finisher platform model' \

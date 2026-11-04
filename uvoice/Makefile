@@ -152,6 +152,8 @@ define Package/uvoice/install
 	$(INSTALL_BIN) ./files/calltrace-finish.sh $(1)/usr/share/uvoice/calltrace-finish.sh
 	$(INSTALL_DATA) ./files/calltrace-README.txt $(1)/usr/share/uvoice/calltrace-README.txt
 	$(INSTALL_DATA) ./files/calltrace-summary.uc $(1)/usr/share/uvoice/calltrace-summary.uc
+	$(INSTALL_DATA) ./files/voip-defaults.sh \
+		$(1)/usr/share/uvoice/voip-defaults.sh
 
 	$(INSTALL_DIR) $(1)/usr/srg/scripts/techlog
 	$(INSTALL_BIN) ./files/techlog-uvoice.sh $(1)/usr/srg/scripts/techlog/techlog-uvoice.sh
@@ -162,6 +164,7 @@ define Package/uvoice/install
 	$(INSTALL_DATA) ./files/nftables.d/chain-pre/input/20-uvoice.nft $(1)/usr/share/nftables.d/chain-pre/input/20-uvoice.nft
 
 	$(INSTALL_DIR) $(1)/etc/uci-defaults
+	$(INSTALL_BIN) ./files/uvoice.defaults $(1)/etc/uci-defaults/90-uvoice
 	$(INSTALL_BIN) ./files/uvoice-voip-rules.default $(1)/etc/uci-defaults/95-uvoice-voip-rules
 endef
 
