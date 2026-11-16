@@ -208,6 +208,22 @@ static void usage_cases(void)
 		CHECK(tl_has(&r, "--mwi applies to vmwi alone"));
 	}
 
+	CASE("--mwi-count without --mwi on exits 2");
+	{
+		const char *const args[] = { "vmwi", "--mwi", "off",
+					     "--mwi-count", "4",
+					     "--tdm-backend", "file", NULL };
+		const char *const args2[] = { "vmwi", "--mwi", "on",
+					      "--mwi-count", "256",
+					      "--tdm-backend", "file", NULL };
+
+		CHECK(tl_run(args, &r));
+		CHECK_UINT(r.exit_code, 2);
+		CHECK(tl_has(&r, "--mwi-count requires --mwi on"));
+		CHECK(tl_run(args2, &r));
+		CHECK_UINT(r.exit_code, 2);
+	}
+
 	CASE("an out of range option names its range");
 	{
 		const char *const args[] = { "idle", "--cid-wait-ms", "5001", NULL };
@@ -305,6 +321,21 @@ static void capture_cases(void)
 	{
 		const char *const args[] = { "vmwi", "--mwi", "on",
 					     "--tdm-backend", "file", "--region", "USA",
+					     "--settle-ms", "200", "--out", out,
+					     NULL };
+
+		CHECK(tl_run(args, &r));
+		CHECK_UINT(r.exit_code, 0);
+		CHECK(tl_has(&r, "CID_SENT line=0 kind=TYPE1 status=0"));
+	}
+
+	CASE("vmwi on with a count completes the count record of GBR");
+	{
+		const char *const args[] = { "vmwi", "--mwi", "on",
+					     "--mwi-count", "4",
+					     "--cid-format", "etsi-lr-dtas",
+					     "--tdm-backend", "file",
+					     "--region", "GBR",
 					     "--settle-ms", "200", "--out", out,
 					     NULL };
 

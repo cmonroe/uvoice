@@ -239,11 +239,14 @@ static void fsk_enter(struct line_cidseq *c, uint32_t now_ms,
 {
 	uint8_t buf[UDSP_CID_MSG_MAX];
 	bool type2 = c->kind == (uint8_t)UDSP_CID_TYPE2;
+	enum udsp_mwi_message body = (enum udsp_mwi_message)c->cfg.mwi_message;
 	struct line_cmd *cmd;
 	size_t len;
 
 	if (c->mwi != LINE_CID_MWI_NONE)
-		len = udsp_cid_vmwi_build(c->mwi == LINE_CID_MWI_ON, c->cid.datetime,
+		len = udsp_cid_vmwi_build(c->mwi == LINE_CID_MWI_ON,
+					  c->cid.mwi_count, body,
+					  c->cid.datetime,
 					  (enum udsp_cid_format)c->format, buf,
 					  sizeof(buf));
 	else

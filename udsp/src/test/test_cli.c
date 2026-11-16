@@ -395,6 +395,24 @@ static void tc_parse_cases(void)
 		CHECK(!tc_verb_args_valid(&args));
 	}
 
+	CASE("validation takes a message count with --mwi on alone");
+	{
+		char *on_argv[] = { "cid", "--region", "USA", "--mwi", "on",
+				    "--mwi-count", "4" };
+		char *off_argv[] = { "cid", "--region", "USA", "--mwi", "off",
+				     "--mwi-count", "4" };
+		char *high_argv[] = { "cid", "--mwi", "on", "--mwi-count",
+				      "256" };
+
+		CHECK_UINT(tc_args_parse(7, on_argv, &args), TOOL_PARSE_OK);
+		CHECK(tc_verb_args_valid(&args));
+		CHECK_UINT(args.base.mwi_count, 4);
+		CHECK_UINT(tc_args_parse(7, off_argv, &args), TOOL_PARSE_OK);
+		CHECK(!tc_verb_args_valid(&args));
+		CHECK_UINT(tc_args_parse(5, high_argv, &args),
+			   TOOL_PARSE_ERROR);
+	}
+
 	CASE("parse rejects type2 with a DTMF caller-id format");
 	{
 		char *argv[] = { "cid", "--type2", "--cid-format", "dtmf" };
@@ -875,7 +893,8 @@ static void tc_full_cli_cases(void)
 				    "level = -13\ncadence = 100 100 300 100 100 10000\n"
 				    "repeat = 2\n"));
 		CHECK(tc_output_has(&result, "format = bellcore-fsk\n"
-				    "mwi_format = bellcore-fsk\nwait_ms = 500\n"));
+				    "mwi_format = bellcore-fsk\n"
+				    "mwi_message = visual\nwait_ms = 500\n"));
 		CHECK(tc_output_has(&result, "pulse_interdigit_ms = 300\n"
 				    "flash_service = drop\n"));
 		CHECK(tc_output_has(&result, "[hook]\npulse_enable = on\n"

@@ -91,6 +91,7 @@ enum tool_opt {
 	TOOL_OPT_CID_AT_RING,
 	TOOL_OPT_CID_WAIT_MS,
 	TOOL_OPT_MWI,
+	TOOL_OPT_MWI_COUNT,
 	TOOL_OPT_DURATION,
 	TOOL_OPT_LOCAL,
 };
@@ -123,6 +124,7 @@ enum tool_opt {
 	{ "cid-at-ring", required_argument, NULL, TOOL_OPT_CID_AT_RING }, \
 	{ "cid-wait-ms", required_argument, NULL, TOOL_OPT_CID_WAIT_MS }, \
 	{ "mwi", required_argument, NULL, TOOL_OPT_MWI }, \
+	{ "mwi-count", required_argument, NULL, TOOL_OPT_MWI_COUNT }, \
 	{ "duration", required_argument, NULL, TOOL_OPT_DURATION }, \
 	{ "help", no_argument, NULL, 'h' },
 
@@ -136,6 +138,7 @@ struct tool_args {
 	uint8_t cid_at_ring;
 	uint16_t cid_wait_ms;
 	int mwi;			/* -1 not given, 0 off, 1 on */
+	uint8_t mwi_count;
 	char cid_name[UDSP_CID_STR_MAX];
 	char cid_number[UDSP_CID_STR_MAX];
 };
@@ -329,6 +332,11 @@ static inline bool tool_opt_apply(struct tool_args *t, const struct option *o,
 		}
 		fprintf(stderr, TOOL_PROG ": --mwi: on or off\n");
 		return false;
+	case TOOL_OPT_MWI_COUNT:
+		if (!tool_opt_number(o, val, 0, UINT8_MAX, &n))
+			return false;
+		t->mwi_count = (uint8_t)n;
+		return true;
 	}
 
 	return false;
@@ -436,6 +444,7 @@ static inline void tool_cid_fill(const struct tool_args *t,
 	cid->format = t->cid_format;
 	if (t->mwi >= 0) {
 		cid->mwi = t->mwi != 0;
+		cid->mwi_count = t->mwi_count;
 		return;
 	}
 	tool_str_set(cid->name, sizeof(cid->name), t->cid_name);

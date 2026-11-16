@@ -60,12 +60,20 @@ size_t udsp_cid_msg_build(const struct udsp_cid *cid, enum udsp_cid_format fmt,
 			  bool type2, uint8_t *out, size_t cap);
 
 /* Render a VMWI message: on/off is explicit because struct udsp_cid carries
- * no off state. MDMF-family formats render type 0x82 with the 0x0B visual
- * indicator (0xFF on, 0x00 off) plus the date when datetime is non-empty; the
- * Bellcore format renders the SDMF type 0x06 body; DTMF formats return 0.
- * datetime as in udsp_cid. */
-size_t udsp_cid_vmwi_build(bool on, const char *datetime,
-			   enum udsp_cid_format fmt, uint8_t *out, size_t cap);
+ * no off state. The Bellcore format renders the SDMF type 0x06 body and DTMF
+ * formats return 0, whatever body says. For the other FSK formats, body
+ * selects the message:
+ *   UDSP_MWI_MSG_VISUAL  type 0x82 with the date, then the 0x0B visual
+ *                        indicator (0xFF on, 0x00 off);
+ *   UDSP_MWI_MSG_COUNT   the SIN 227 Annex A form, type 0x80: call type 0x11
+ *                        "message waiting", then the 0x13 message count,
+ *                        then the date. Off sends count 0, and on with
+ *                        count 0 sends 1, the SIN 227 value for an
+ *                        unspecified number.
+ * The date is present when datetime is non-empty; datetime as in udsp_cid. */
+size_t udsp_cid_vmwi_build(bool on, uint8_t count, enum udsp_mwi_message body,
+			   const char *datetime, enum udsp_cid_format fmt,
+			   uint8_t *out, size_t cap);
 
 /* Render the DTMF-format CID digit string (start/stop markers per fmt) for
  * playout through the DTMF generator. Returns digits written or 0 when fmt

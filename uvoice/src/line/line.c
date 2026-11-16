@@ -2717,6 +2717,23 @@ static bool mwi_at_rest(const struct line *l)
 	return !line_flags_of(l) && !l->oos && !l->ringing;
 }
 
+/*
+ * The count a display shows. A switch can say "yes" without a new message
+ * count, and 1 is the value SIN 227 A.2.8 gives an unspecified number, so the
+ * indication stays visible. The record carries one byte.
+ */
+static uint8_t mwi_count_of(const struct line *l)
+{
+	if (!l->mwi.on)
+		return 0;
+	if (!l->mwi.new_msgs)
+		return 1;
+	if (l->mwi.new_msgs > UINT8_MAX)
+		return UINT8_MAX;
+
+	return (uint8_t)l->mwi.new_msgs;
+}
+
 static void mwi_fsk_send(struct line *l)
 {
 	struct hal_cid cid;
@@ -2748,9 +2765,11 @@ static void mwi_fsk_send(struct line *l)
 	memset(&cid, 0, sizeof(cid));
 	cid.format = l->mwi_format;
 	cid.mwi = l->mwi.on ? HAL_MWI_ON : HAL_MWI_OFF;
+	cid.mwi_count = mwi_count_of(l);
 
-	TRACE(TRACE_FSM, "line %u visual message waiting %s, format %u", l->index,
-	      l->mwi.on ? "on" : "off", cid.format);
+	TRACE(TRACE_FSM,
+	      "line %u visual message waiting %s, count %u, format %u",
+	      l->index, l->mwi.on ? "on" : "off", cid.mwi_count, cid.format);
 	hal_backend_ops.line_cid_send(uv.hal, l->index, HAL_CID_TYPE1, &cid);
 }
 

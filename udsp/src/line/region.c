@@ -146,6 +146,10 @@ static const char *const flash_service_names[] = { "off", "split", "drop" };
 _Static_assert(ARRAY_SIZE(flash_service_names) == (size_t)UDSP_FLASH_SERVICE_COUNT,
 	       "flash_service_names must match enum udsp_flash_service");
 
+static const char *const mwi_message_names[] = { "visual", "count" };
+_Static_assert(ARRAY_SIZE(mwi_message_names) == (size_t)UDSP_MWI_MSG_MAX,
+	       "mwi_message_names must match enum udsp_mwi_message");
+
 static const struct section_def section_defs[] = {
 	{ "region", SEC_REGION }, { "cid", SEC_CID }, { "hook", SEC_HOOK },
 };
@@ -169,8 +173,9 @@ static const struct key_def hook_key_defs[] = {
 	  offsetof(struct udsp_region_hook, pulse_interdigit_ms) },
 };
 
-/* format is bit 0 but takes a name, and the optional mwi_format takes the
- * same names, so cid_key_apply keeps both out of the table. The four optional
+/* format is bit 0 but takes a name, the optional mwi_format takes the same
+ * names and the optional mwi_message takes names of its own, so cid_key_apply
+ * keeps all three out of the table. The four optional
  * timings carry bit -1, three alert timings and the ring gap: they set no
  * completeness bit, and an absent key leaves a zero that the completion block
  * fills. */
@@ -205,6 +210,13 @@ const char *line_region_flash_service_name(enum udsp_flash_service service)
 	if ((unsigned)service >= UDSP_FLASH_SERVICE_COUNT)
 		return "none";
 	return flash_service_names[service];
+}
+
+const char *line_region_mwi_message_name(enum udsp_mwi_message message)
+{
+	if ((unsigned)message >= UDSP_MWI_MSG_MAX)
+		return "none";
+	return mwi_message_names[message];
 }
 
 static uint32_t region_tone_cycle_ms(const struct udsp_region_tone *t)
@@ -729,6 +741,12 @@ static int cid_key_apply(struct parse_ctx *p, const char *key, const char *value
 		p->cid_mwi_seen = true;
 		if (cid_format_name_take(value, &p->region.cid.mwi_format))
 			return parse_fail(p, "unknown cid format", value);
+		return 0;
+	}
+	if (!strcmp(key, "mwi_message")) {
+		if (name_take(mwi_message_names, ARRAY_SIZE(mwi_message_names),
+			      value, &p->region.cid.mwi_message))
+			return parse_fail(p, "unknown mwi message", value);
 		return 0;
 	}
 	rc = keys_apply(p, key, value, cid_key_defs, ARRAY_SIZE(cid_key_defs),

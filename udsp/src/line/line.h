@@ -200,7 +200,8 @@ struct udsp_region_ring {
  * fills an omitted key with its LINE_*_MS default before it returns a region,
  * and the sequencer applies the same default to a zero in a region built in
  * code. mwi_format is optional too, but the parser folds an omitted key to
- * format, so a parsed region always carries a valid value. */
+ * format, so a parsed region always carries a valid value. mwi_message is
+ * optional, and an omitted key reads as the visual body. */
 struct udsp_region_cid {
 	uint8_t format;			/* enum udsp_cid_format */
 	uint8_t mwi_format;		/* enum udsp_cid_format */
@@ -212,6 +213,7 @@ struct udsp_region_cid {
 	uint16_t rpas_ms;
 	uint16_t lr_pause_ms;
 	uint16_t ring_gap_ms;
+	uint8_t mwi_message;		/* enum udsp_mwi_message */
 };
 
 struct udsp_region_hook {
@@ -257,6 +259,7 @@ int line_region_load(const char *path, struct udsp_region *out,
 		     struct line_region_error *err);
 const char *line_region_tone_name(enum udsp_tone tone);
 const char *line_region_flash_service_name(enum udsp_flash_service service);
+const char *line_region_mwi_message_name(enum udsp_mwi_message message);
 /*
  * The first-presentation length of a simple call-waiting cadence: the sum of
  * the make and break pairs less the trailing break. This is the point after
@@ -604,7 +607,8 @@ enum line_cid_step {
  * udsp_cid_msg_build. LINE_CID_MWI_ON and LINE_CID_MWI_OFF render a visual
  * message-waiting indicator through udsp_cid_vmwi_build, which needs the
  * explicit state because struct udsp_cid carries no off. A VMWI burst always
- * uses the type 1 transport of the region's format.
+ * uses the type 1 transport of the region's format, and the region's
+ * mwi_message selects its body.
  */
 enum line_cid_mwi {
 	LINE_CID_MWI_NONE = 0,

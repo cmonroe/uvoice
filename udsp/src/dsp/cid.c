@@ -24,6 +24,11 @@
 #define CID_PARAM_NAME 0x07U
 #define CID_PARAM_NAME_ABSENT 0x08U
 #define CID_PARAM_VISUAL 0x0bU
+/* SIN 227 Annex A assigns the call type and message status markers (Table 1)
+ * and the "message waiting call" value (Table 3). */
+#define CID_PARAM_CALL_TYPE 0x11U
+#define CID_PARAM_MSG_STATUS 0x13U
+#define CID_CALL_TYPE_MSG_WAITING 0x81U
 /* EN 300 659-1 C-terminated grammar, also documented by spandsp adsi.h. */
 #define CID_DTMF_START 'A'
 #define CID_DTMF_ABSENCE 'B'
@@ -139,9 +144,44 @@ size_t udsp_cid_msg_build(const struct udsp_cid *cid,
 	return message_finish(message, length, out, capacity);
 }
 
-size_t udsp_cid_vmwi_build(bool on, const char *datetime,
-			   enum udsp_cid_format format, uint8_t *out,
-			   size_t capacity)
+/*
+ * SIN 227 A.2 puts the call type first. Each record carries the message
+ * waiting call type, also for a count of 0: a display phone reads the status
+ * as a message waiting record only with it, so a record without it does not
+ * clear the indication. A.2 leaves the order of the other parameters free:
+ * the status goes before the date.
+ */
+static size_t vmwi_count_build(uint8_t count, const char *datetime,
+			       size_t datetime_length, uint8_t *out,
+			       size_t capacity)
+{
+	static const uint8_t call_type = CID_CALL_TYPE_MSG_WAITING;
+	uint8_t message[UDSP_CID_MSG_MAX];
+	size_t length = 2;
+
+	message[0] = CID_MSG_CALL_SETUP;
+	if (!parameter_add(message, &length, CID_PARAM_CALL_TYPE, &call_type,
+			   1))
+		return 0;
+	if (!parameter_add(message, &length, CID_PARAM_MSG_STATUS, &count, 1))
+		return 0;
+	if (datetime_length == 8U &&
+	    !parameter_add(message, &length, CID_PARAM_DATETIME, datetime,
+			   datetime_length))
+		return 0;
+	return message_finish(message, length, out, capacity);
+}
+
+static uint8_t vmwi_count_get(bool on, uint8_t count)
+{
+	if (!on)
+		return 0;
+	return count ? count : 1;
+}
+
+size_t udsp_cid_vmwi_build(bool on, uint8_t count, enum udsp_mwi_message body,
+			   const char *datetime, enum udsp_cid_format format,
+			   uint8_t *out, size_t capacity)
 {
 	uint8_t message[UDSP_CID_MSG_MAX];
 	uint8_t indicator = on ? 0xffU : 0x00U;
@@ -155,6 +195,9 @@ size_t udsp_cid_vmwi_build(bool on, const char *datetime,
 	if (!format_fsk_is(format))
 		return 0;
 	datetime_length = datetime ? value_length_get(datetime) : 0;
+	if (body == UDSP_MWI_MSG_COUNT)
+		return vmwi_count_build(vmwi_count_get(on, count), datetime,
+					datetime_length, out, capacity);
 	message[0] = CID_MSG_VMWI_MDMF;
 	if (datetime_length == 8U &&
 	    !parameter_add(message, &length, CID_PARAM_DATETIME, datetime,

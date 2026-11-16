@@ -1750,6 +1750,7 @@ static void test_cid_translation(void)
 	snprintf(src.datetime, sizeof(src.datetime), "01021530");
 	snprintf(src.blockinfo, sizeof(src.blockinfo), "P");
 
+	src.mwi_count = 4;
 	src.mwi = HAL_MWI_ON;
 	hal_udsp_cid_fill(&on, &src);
 	src.mwi = HAL_MWI_OFF;
@@ -1767,6 +1768,7 @@ static void test_cid_translation(void)
 	CHECK(!strcmp(on.name, "A CALLER"));
 	CHECK(!strcmp(on.datetime, "01021530"));
 	CHECK(!strcmp(on.blockinfo, "P"));
+	CHECK_UINT(on.mwi_count, 4);
 
 	CASE("the indicator flag is the only difference between the two records");
 	on.mwi = off.mwi;

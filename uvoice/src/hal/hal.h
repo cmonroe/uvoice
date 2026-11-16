@@ -545,6 +545,7 @@ struct hal_cid {
 	char name[HAL_CID_STR_MAX];
 	char datetime[HAL_CID_STR_MAX];	/* MMDDHHMM, empty means "let the DSP fill" */
 	char blockinfo[HAL_CID_STR_MAX];	/* single free-text absence reason */
+	uint8_t mwi_count;		/* messages of a HAL_MWI_ON record */
 };
 
 struct hal_cadence {

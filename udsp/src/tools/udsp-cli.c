@@ -205,7 +205,8 @@ static const struct cli_verb cli_verbs[] = {
 		.run = cid_run,
 		.valid = cid_args_valid,
 		.allowed = CLI_OPTS_LINE | CLI_OPTS_CID |
-			   TOOL_BIT(CLI_OPT_TYPE2) | TOOL_BIT(TOOL_OPT_MWI),
+			   TOOL_BIT(CLI_OPT_TYPE2) | TOOL_BIT(TOOL_OPT_MWI) |
+			   TOOL_BIT(TOOL_OPT_MWI_COUNT),
 		.required = TOOL_BIT(TOOL_OPT_REGION),
 	},
 	{
@@ -225,7 +226,8 @@ static const struct cli_verb cli_verbs[] = {
 		.allowed = CLI_OPTS_LINE | CLI_OPTS_CID |
 			   TOOL_BIT(CLI_OPT_TONE) | TOOL_BIT(CLI_OPT_DIGITS) |
 			   TOOL_BIT(TOOL_OPT_DURATION) |
-			   TOOL_BIT(CLI_OPT_TYPE2) | TOOL_BIT(TOOL_OPT_MWI),
+			   TOOL_BIT(CLI_OPT_TYPE2) | TOOL_BIT(TOOL_OPT_MWI) |
+			   TOOL_BIT(TOOL_OPT_MWI_COUNT),
 	},
 	{
 		.name = "looptest",
@@ -330,6 +332,8 @@ static void usage(FILE *out)
 		"  --cid-wait-ms <0-%d>      caller id delay in the break (default 500)\n"
 		"  --type2                     send type 2 caller identity\n"
 		"  --mwi <on|off>              send a VMWI caller identity record\n"
+		"  --mwi-count <0-255>         message count of --mwi on, for\n"
+		"                              a region with a count body\n"
 		"  --debug                     print the slic plug-in's debug lines\n"
 		"  -h, --help                  this text\n"
 		"\nevents arms DTMF and pulse detection on every available line.\n"
@@ -553,6 +557,10 @@ static bool cid_args_valid(const struct cli_args *a)
 	}
 	if (mwi && (a->type2 || identity)) {
 		usage_fail("--mwi cannot be combined with identity or --type2", NULL);
+		return false;
+	}
+	if (tool_given(&a->base, TOOL_OPT_MWI_COUNT) && a->base.mwi <= 0) {
+		usage_fail("--mwi-count requires --mwi on", NULL);
 		return false;
 	}
 
@@ -1196,9 +1204,10 @@ static void region_profile_print(const struct udsp_region *r)
 		printf("\n[cw c%u]\n", i + 1);
 		region_tone_body_print(&r->cw[i]);
 	}
-	printf("\n[cid]\nformat = %s\nmwi_format = %s\n",
+	printf("\n[cid]\nformat = %s\nmwi_format = %s\nmwi_message = %s\n",
 	       tool_cid_format_name(cid->format),
-	       tool_cid_format_name(cid->mwi_format));
+	       tool_cid_format_name(cid->mwi_format),
+	       line_region_mwi_message_name(cid->mwi_message));
 	printf("wait_ms = %u\nack_timeout_ms = %u\n", cid->wait_ms,
 	       cid->ack_timeout_ms);
 	printf("seizure_bits = %u\nmark_bits = %u\n", cid->seizure_bits,

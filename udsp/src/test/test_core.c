@@ -1212,6 +1212,26 @@ static bool tc_region_sit_write(const char *iso3, const char *body)
 	return tc_region_dir_write("/tmp/udsp_sit_XXXXXX", name, text);
 }
 
+/* The shipped USA file with the V.23 transport and the count body, written
+ * as CNT.conf. etsi-fsk sends no alert, so the burst is the first sound on the
+ * line. The caller drops the file with tc_region_dir_drop. */
+static bool tc_region_count_write(void)
+{
+	char text[REGION_EDIT_TEXT_MAX];
+
+	const struct region_edit edit[] = {
+		{ "[cid]", "format = bellcore-fsk",
+		  "format = etsi-fsk\nmwi_message = count" },
+		{ NULL, "iso3 = USA", "iso3 = CNT" },
+	};
+
+	if (!region_text_edit(UDSP_REGION_DIR "/USA.conf", text, sizeof(text),
+			      edit, 2))
+		return false;
+
+	return tc_region_dir_write("/tmp/udsp_cnt_XXXXXX", "CNT.conf", text);
+}
+
 static void tc_down(struct eh *t)
 {
 	tc_stop(t);
@@ -1482,8 +1502,9 @@ static void tc_rec_decimate(void)
 }
 
 /* Decodes the 8N1 data bytes that follow the seizure and mark phases. */
-static unsigned tc_fsk_decode(unsigned base, unsigned seizure, unsigned mark,
-			      uint8_t *out, unsigned max)
+static unsigned tc_fsk_decode_tones(unsigned base, unsigned seizure,
+				    unsigned mark, double mark_hz,
+				    double space_hz, uint8_t *out, unsigned max)
 {
 	unsigned n = 0;
 
@@ -1493,15 +1514,22 @@ static unsigned tc_fsk_decode(unsigned base, unsigned seizure, unsigned mark,
 
 		if (base + tc_bit_edge(off + 10u) >= eh_rec_have())
 			break;
-		if (tc_bit(base, off, 1200.0, 2200.0))
+		if (tc_bit(base, off, mark_hz, space_hz))
 			break;
 		for (unsigned b = 0; b < 8; b++)
-			byte |= (uint8_t)(tc_bit(base, off + b + 1u, 1200.0,
-						 2200.0) << b);
+			byte |= (uint8_t)(tc_bit(base, off + b + 1u, mark_hz,
+						 space_hz) << b);
 		out[n++] = byte;
 	}
 
 	return n;
+}
+
+static unsigned tc_fsk_decode(unsigned base, unsigned seizure, unsigned mark,
+			      uint8_t *out, unsigned max)
+{
+	return tc_fsk_decode_tones(base, seizure, mark, 1200.0, 2200.0, out,
+				   max);
 }
 
 /* --- the crash-handler child --------------------------------------------- */
@@ -3940,7 +3968,8 @@ static void case_vmwi(void)
 		memset(&cid, 0, sizeof(cid));
 		cid.format = UDSP_CIDF_BELLCORE_FSK;
 		cid.mwi = true;
-		want_len = udsp_cid_vmwi_build(true, "", UDSP_CIDF_BELLCORE_FSK,
+		want_len = udsp_cid_vmwi_build(true, 0, UDSP_MWI_MSG_VISUAL, "",
+					       UDSP_CIDF_BELLCORE_FSK,
 					       want, sizeof(want));
 		CHECK(want_len > 0);
 		eh_rec_mark();
@@ -3966,7 +3995,8 @@ static void case_vmwi(void)
 		}
 		memset(&cid, 0, sizeof(cid));
 		cid.format = UDSP_CIDF_BELLCORE_FSK;
-		want_len = udsp_cid_vmwi_build(false, "", UDSP_CIDF_BELLCORE_FSK,
+		want_len = udsp_cid_vmwi_build(false, 0, UDSP_MWI_MSG_VISUAL,
+					       "", UDSP_CIDF_BELLCORE_FSK,
 					       want, sizeof(want));
 		CHECK(want_len > 0);
 		eh_rec_mark();
@@ -3980,6 +4010,44 @@ static void case_vmwi(void)
 		if (decoded == want_len)
 			CHECK(memcmp(got, want, want_len) == 0);
 		tc_down(&t);
+	}
+
+	CASE("a region with the count body sends the count of the record");
+	{
+		/* The literal count vector of test_cid. */
+		static const uint8_t count_want[] = {
+			0x80, 0x10, 0x11, 0x01, 0x81, 0x13, 0x01, 0x04, 0x01,
+			0x08, '1', '0', '2', '7', '1', '2', '0', '1', 0x2e,
+		};
+		unsigned base, loud, decoded;
+
+		if (!tc_region_count_write()) {
+			CHECK(false);
+			return;
+		}
+		if (!tc_up(&t, "CNT")) {
+			CHECK(false);
+			tc_region_dir_drop("CNT.conf");
+			return;
+		}
+		memset(&cid, 0, sizeof(cid));
+		cid.format = UDSP_CIDF_ETSI_FSK;
+		cid.mwi = true;
+		cid.mwi_count = 4;
+		snprintf(cid.datetime, sizeof(cid.datetime), "10271201");
+		eh_rec_mark();
+		CHECK(udsp_cid_send(t.s, 0, UDSP_CID_TYPE1, &cid) == UDSP_OK);
+		eh_wait_ms(&t, 2000);
+
+		loud = tc_first_loud(0, 1000);
+		base = (loud / UDSP_FRAME_SAMPLES) * UDSP_FRAME_SAMPLES;
+		decoded = tc_fsk_decode_tones(base, 300, 180, 1300.0, 2100.0,
+					      got, sizeof(got));
+		CHECK_UINT(decoded, sizeof(count_want));
+		if (decoded == sizeof(count_want))
+			CHECK(memcmp(got, count_want, sizeof(count_want)) == 0);
+		tc_down(&t);
+		tc_region_dir_drop("CNT.conf");
 	}
 
 	CASE("udsp_mwi drives the lamp op alone");

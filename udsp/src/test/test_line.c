@@ -66,9 +66,12 @@ static size_t stub_vmwi_len;
 static unsigned stub_vmwi_calls;
 static bool stub_vmwi_on;
 static int stub_vmwi_fmt;
+static unsigned stub_vmwi_count;
+static int stub_vmwi_body;
 static uint8_t stub_vmwi_bytes[UDSP_CID_MSG_MAX];
 
-size_t udsp_cid_vmwi_build(bool on, const char *datetime, enum udsp_cid_format fmt,
+size_t udsp_cid_vmwi_build(bool on, uint8_t count, enum udsp_mwi_message body,
+			   const char *datetime, enum udsp_cid_format fmt,
 			   uint8_t *out, size_t cap)
 {
 	size_t i;
@@ -76,6 +79,8 @@ size_t udsp_cid_vmwi_build(bool on, const char *datetime, enum udsp_cid_format f
 	stub_vmwi_calls++;
 	stub_vmwi_on = on;
 	stub_vmwi_fmt = (int)fmt;
+	stub_vmwi_count = count;
+	stub_vmwi_body = (int)body;
 	if (!stub_vmwi_len || stub_vmwi_len > cap)
 		return 0;
 	for (i = 0; i < stub_vmwi_len; i++)
@@ -2142,6 +2147,8 @@ static void vmwi_case(struct udsp_region *region, enum udsp_cid_format fmt,
 	CHECK_UINT(stub_msg_calls, 0);
 	CHECK(stub_vmwi_on == (mwi == LINE_CID_MWI_ON));
 	CHECK_UINT(stub_vmwi_fmt, fmt);
+	CHECK_UINT(stub_vmwi_count, 0);
+	CHECK_UINT(stub_vmwi_body, UDSP_MWI_MSG_VISUAL);
 	CHECK_UINT(rec_stamp(cmd_find(0, LINE_CMD_LINEFEED)), 100);
 	CHECK_UINT(journal[cmd_find(0, LINE_CMD_LINEFEED)].u.cmd.u.linefeed.state,
 		   UDSP_LF_FWD_OHT);
@@ -2159,10 +2166,41 @@ static void vmwi_case(struct udsp_region *region, enum udsp_cid_format fmt,
 	CHECK_UINT(cmd_total(LINE_CMD_LINEFEED), 2);
 }
 
+static void vmwi_count_case(void)
+{
+	struct udsp_region region;
+	struct udsp_cid cid;
+	struct line_sim s;
+
+	region_test_fill(&region);
+	region.cid.mwi_message = UDSP_MWI_MSG_COUNT;
+	memset(&cid, 0, sizeof(cid));
+	cid.format = UDSP_CIDF_ETSI_LR_DTAS;
+	cid.mwi = true;
+	cid.mwi_count = 4;
+	stub_vmwi_len = 19;
+	stub_vmwi_calls = 0;
+	sim_init(&s, 10, false);
+	sim_to(&s, false, 90);
+	journal_reset();
+	CHECK_UINT(line_cidseq_arm(&s.cid, UDSP_CID_TYPE1, &cid, &region,
+				   UDSP_LF_FWD_ACTIVE, false, LINE_CID_MWI_ON,
+				   0), 0);
+	sim_to(&s, false, 2000);
+	CASE("the burst takes the record's count and the region's body");
+	CHECK_UINT(stub_vmwi_calls, 1);
+	CHECK(stub_vmwi_on);
+	CHECK_UINT(stub_vmwi_count, 4);
+	CHECK_UINT(stub_vmwi_body, UDSP_MWI_MSG_COUNT);
+	CHECK_UINT(stub_vmwi_fmt, UDSP_CIDF_ETSI_LR_DTAS);
+	CHECK(cmd_find(0, LINE_CMD_FSK) >= 0);
+}
+
 static void cid_vmwi_test(void)
 {
 	struct udsp_region region;
 
+	vmwi_count_case();
 	region_test_fill(&region);
 	vmwi_case(&region, UDSP_CIDF_BELLCORE_FSK, LINE_CID_MWI_ON,
 		  "vmwi on rides the bellcore transport", UDSP_FSK_BELL202);

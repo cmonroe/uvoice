@@ -334,6 +334,7 @@ static void gbr_golden_test(void)
 	CHECK_UINT(line_region_load(path, &r, &err), 0);
 	CHECK_UINT(r.cid.format, UDSP_CIDF_ETSI_LR_DTAS);
 	CHECK_UINT(r.cid.mwi_format, UDSP_CIDF_ETSI_LR_DTAS);
+	CHECK_UINT(r.cid.mwi_message, UDSP_MWI_MSG_COUNT);
 	CHECK_UINT(r.cid.lr_pause_ms, 250);
 	CHECK_UINT(r.cid.dtas_ms, 100);
 	CHECK_UINT(r.cid.ring_gap_ms, 250);
@@ -917,6 +918,45 @@ static void mwi_format_test(void)
 	error_case("an unknown mwi_format value is an error", "unknown cid format");
 }
 
+static void mwi_message_test(void)
+{
+	struct line_region_error err;
+	struct udsp_region r;
+
+	memset(&r, 0, sizeof(r));
+	work_reset();
+	CASE("an omitted mwi_message reads as the visual body");
+	CHECK_UINT(work_parse(&r, &err), 0);
+	CHECK_UINT(r.cid.mwi_message, UDSP_MWI_MSG_VISUAL);
+
+	work_reset();
+	CHECK(work_replace("[cid]\nformat",
+			   "[cid]\nmwi_message = count\nformat"));
+	CASE("mwi_message count selects the count body");
+	CHECK_UINT(work_parse(&r, &err), 0);
+	CHECK_UINT(r.cid.mwi_message, UDSP_MWI_MSG_COUNT);
+
+	work_reset();
+	CHECK(work_replace("[cid]\nformat",
+			   "[cid]\nmwi_message = visual\nformat"));
+	CASE("mwi_message visual names the default body");
+	CHECK_UINT(work_parse(&r, &err), 0);
+	CHECK_UINT(r.cid.mwi_message, UDSP_MWI_MSG_VISUAL);
+
+	work_reset();
+	CHECK(work_replace("[cid]\nformat",
+			   "[cid]\nmwi_message = bogus\nformat"));
+	error_case("an unknown mwi_message value is an error",
+		   "unknown mwi message");
+
+	CASE("the body names read back, and a value past the table reads none");
+	CHECK(!strcmp(line_region_mwi_message_name(UDSP_MWI_MSG_VISUAL),
+		      "visual"));
+	CHECK(!strcmp(line_region_mwi_message_name(UDSP_MWI_MSG_COUNT),
+		      "count"));
+	CHECK(!strcmp(line_region_mwi_message_name(UDSP_MWI_MSG_MAX), "none"));
+}
+
 static void flash_service_test(void)
 {
 	struct line_region_error err;
@@ -1282,6 +1322,7 @@ int main(int argc, char **argv)
 	cw_error_test();
 	then_key_test();
 	mwi_format_test();
+	mwi_message_test();
 	flash_service_test();
 	no_partial_apply_test();
 	width_boundary_test();

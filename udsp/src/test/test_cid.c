@@ -267,6 +267,26 @@ static void cid_vectors_test(void)
 		0x82, 0x0d, 0x01, 0x08, '0', '8', '2', '4', '1', '2', '0', '0',
 		0x0b, 0x01, 0x00, 0xcb,
 	};
+	/* Four messages on October 27 at 12:01, as a line analyzer decodes the
+	 * record of a deployed UK unit.
+	 * Sum: 0x80 + 0x10 + call type 0x93 + status 0x18 + date 0x197
+	 * = 0x2d2. */
+	static const uint8_t vmwi_count_four_expected[] = {
+		0x80, 0x10, 0x11, 0x01, 0x81, 0x13, 0x01, 0x04,
+		0x01, 0x08, '1', '0', '2', '7', '1', '2', '0', '1', 0x2e,
+	};
+	/* No messages on November 16 at 12:35, as a line analyzer decodes the
+	 * record of a deployed UK unit.
+	 * Sum: 0x80 + 0x10 + call type 0x93 + status 0x14 + date 0x19d
+	 * = 0x2d4. */
+	static const uint8_t vmwi_count_off_expected[] = {
+		0x80, 0x10, 0x11, 0x01, 0x81, 0x13, 0x01, 0x00,
+		0x01, 0x08, '1', '1', '1', '6', '1', '2', '3', '5', 0x2c,
+	};
+	/* Sum: 0x80 + 0x06 + call type 0x93 + status 0x14 = 0x12d. */
+	static const uint8_t vmwi_count_bare_expected[] = {
+		0x80, 0x06, 0x11, 0x01, 0x81, 0x13, 0x01, 0x00, 0xd3,
+	};
 	/* Sum: 0x80 + 0x13 + date 0x19a + reason 0x55 + name 0x14b = 0x3cd. */
 	static const uint8_t private_expected[] = {
 		0x80, 0x13, 0x01, 0x08, '0', '8', '2', '4', '1', '2', '0', '0',
@@ -281,7 +301,8 @@ static void cid_vectors_test(void)
 	CHECK(fsk_payload_matches(mdmf_expected, sizeof(mdmf_expected)));
 
 	CASE("CID literal SDMF VMWI on vector");
-	length = udsp_cid_vmwi_build(true, "", UDSP_CIDF_BELLCORE_FSK,
+	length = udsp_cid_vmwi_build(true, 0, UDSP_MWI_MSG_VISUAL, "",
+				     UDSP_CIDF_BELLCORE_FSK,
 				     output, sizeof(output));
 	CHECK_UINT(length, sizeof(vmwi_on_sdmf_expected));
 	CHECK(memcmp(output, vmwi_on_sdmf_expected,
@@ -290,14 +311,16 @@ static void cid_vectors_test(void)
 				  sizeof(vmwi_on_sdmf_expected)));
 
 	CASE("CID literal SDMF VMWI off vector");
-	length = udsp_cid_vmwi_build(false, "", UDSP_CIDF_BELLCORE_FSK,
+	length = udsp_cid_vmwi_build(false, 0, UDSP_MWI_MSG_VISUAL, "",
+				     UDSP_CIDF_BELLCORE_FSK,
 				     output, sizeof(output));
 	CHECK_UINT(length, sizeof(vmwi_off_sdmf_expected));
 	CHECK(memcmp(output, vmwi_off_sdmf_expected,
 		     sizeof(vmwi_off_sdmf_expected)) == 0);
 
 	CASE("CID literal MDMF VMWI on vector");
-	length = udsp_cid_vmwi_build(true, "08241200", UDSP_CIDF_ETSI_FSK,
+	length = udsp_cid_vmwi_build(true, 0, UDSP_MWI_MSG_VISUAL, "08241200",
+				     UDSP_CIDF_ETSI_FSK,
 				     output, sizeof(output));
 	CHECK_UINT(length, sizeof(vmwi_on_mdmf_expected));
 	CHECK(memcmp(output, vmwi_on_mdmf_expected,
@@ -306,11 +329,65 @@ static void cid_vectors_test(void)
 				  sizeof(vmwi_on_mdmf_expected)));
 
 	CASE("CID literal MDMF VMWI off vector");
-	length = udsp_cid_vmwi_build(false, "08241200", UDSP_CIDF_ETSI_FSK,
+	length = udsp_cid_vmwi_build(false, 0, UDSP_MWI_MSG_VISUAL, "08241200",
+				     UDSP_CIDF_ETSI_FSK,
 				     output, sizeof(output));
 	CHECK_UINT(length, sizeof(vmwi_off_mdmf_expected));
 	CHECK(memcmp(output, vmwi_off_mdmf_expected,
 		     sizeof(vmwi_off_mdmf_expected)) == 0);
+
+	CASE("CID literal count VMWI vector of four messages");
+	length = udsp_cid_vmwi_build(true, 4, UDSP_MWI_MSG_COUNT, "10271201",
+				     UDSP_CIDF_ETSI_LR_DTAS, output,
+				     sizeof(output));
+	CHECK_UINT(length, sizeof(vmwi_count_four_expected));
+	CHECK(memcmp(output, vmwi_count_four_expected,
+		     sizeof(vmwi_count_four_expected)) == 0);
+	CHECK(fsk_payload_matches(vmwi_count_four_expected,
+				  sizeof(vmwi_count_four_expected)));
+
+	CASE("CID literal count VMWI off vector keeps the call type");
+	length = udsp_cid_vmwi_build(false, 4, UDSP_MWI_MSG_COUNT, "11161235",
+				     UDSP_CIDF_ETSI_LR_DTAS, output,
+				     sizeof(output));
+	CHECK_UINT(length, sizeof(vmwi_count_off_expected));
+	CHECK(memcmp(output, vmwi_count_off_expected,
+		     sizeof(vmwi_count_off_expected)) == 0);
+	CHECK(fsk_payload_matches(vmwi_count_off_expected,
+				  sizeof(vmwi_count_off_expected)));
+
+	CASE("CID count VMWI on without a count reports one message");
+	length = udsp_cid_vmwi_build(true, 0, UDSP_MWI_MSG_COUNT, "10271201",
+				     UDSP_CIDF_ETSI_LR_DTAS, output,
+				     sizeof(output));
+	CHECK_UINT(length, sizeof(vmwi_count_four_expected));
+	CHECK_UINT(output[2], 0x11);
+	CHECK_UINT(output[4], 0x81);
+	CHECK_UINT(output[5], 0x13);
+	CHECK_UINT(output[7], 1);
+
+	CASE("CID count VMWI carries the highest count");
+	length = udsp_cid_vmwi_build(true, 255, UDSP_MWI_MSG_COUNT, "10271201",
+				     UDSP_CIDF_ETSI_LR_DTAS, output,
+				     sizeof(output));
+	CHECK_UINT(length, sizeof(vmwi_count_four_expected));
+	CHECK_UINT(output[7], 255);
+
+	CASE("CID count VMWI without a date carries call type and status");
+	length = udsp_cid_vmwi_build(false, 0, UDSP_MWI_MSG_COUNT, "",
+				     UDSP_CIDF_ETSI_DTAS, output,
+				     sizeof(output));
+	CHECK_UINT(length, sizeof(vmwi_count_bare_expected));
+	CHECK(memcmp(output, vmwi_count_bare_expected,
+		     sizeof(vmwi_count_bare_expected)) == 0);
+
+	CASE("CID count VMWI leaves the bellcore record as it is");
+	length = udsp_cid_vmwi_build(true, 4, UDSP_MWI_MSG_COUNT, "",
+				     UDSP_CIDF_BELLCORE_FSK, output,
+				     sizeof(output));
+	CHECK_UINT(length, sizeof(vmwi_on_sdmf_expected));
+	CHECK(memcmp(output, vmwi_on_sdmf_expected,
+		     sizeof(vmwi_on_sdmf_expected)) == 0);
 
 	CASE("CID literal private number vector");
 	cid = fixed_cid_get();
@@ -382,8 +459,12 @@ static void cid_variants_test(void)
 	CHECK_UINT(variant[14], 'S');
 
 	CASE("CID VMWI rejects DTMF format");
-	CHECK_UINT(udsp_cid_vmwi_build(true, "", UDSP_CIDF_DTMF,
-				       variant, sizeof(variant)), 0);
+	CHECK_UINT(udsp_cid_vmwi_build(true, 0, UDSP_MWI_MSG_VISUAL, "",
+				       UDSP_CIDF_DTMF, variant,
+				       sizeof(variant)), 0);
+	CHECK_UINT(udsp_cid_vmwi_build(true, 4, UDSP_MWI_MSG_COUNT, "",
+				       UDSP_CIDF_DTMF, variant,
+				       sizeof(variant)), 0);
 
 	CASE("CID NTT unsupported without authoritative frame constants");
 	CHECK_UINT(udsp_cid_msg_build(&cid, UDSP_CIDF_NTT, false,

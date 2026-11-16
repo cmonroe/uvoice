@@ -18175,6 +18175,7 @@ static void t_mwi(void)
 	cid = hop_last(H_CID);
 	CHECK_UINT(cid->val, HAL_CID_TYPE1);
 	CHECK_UINT(cid->cid.mwi, HAL_MWI_ON);
+	CHECK_UINT(cid->cid.mwi_count, 2);
 	CHECK_UINT(cid->cid.format, HAL_CID_BELLCORE_FSK);
 
 	CASE("the record announces no caller, so it carries no absence reason");
@@ -18194,14 +18195,29 @@ static void t_mwi(void)
 	mwi_notify(0, true, 3, 1);
 	CHECK_UINT(hop_count(H_CID), 1);
 	CHECK_UINT(hop_last(H_CID)->cid.mwi, HAL_MWI_ON);
+	CHECK_UINT(hop_last(H_CID)->cid.mwi_count, 3);
 	CHECK(view_get(0, &v));
 	CHECK_UINT(v.mwi_new, 3);
+
+	CASE("a count above one byte is sent as 255");
+	hops_reset();
+	mwi_notify(0, true, 300, 1);
+	CHECK_UINT(hop_count(H_CID), 1);
+	CHECK_UINT(hop_last(H_CID)->cid.mwi_count, 255);
+
+	CASE("an indication without a new message count sends one message");
+	hops_reset();
+	mwi_notify(0, true, 0, 0);
+	CHECK_UINT(hop_count(H_CID), 1);
+	CHECK_UINT(hop_last(H_CID)->cid.mwi, HAL_MWI_ON);
+	CHECK_UINT(hop_last(H_CID)->cid.mwi_count, 1);
 
 	CASE("clearing the indication sends the off record and keeps the counts");
 	hops_reset();
 	mwi_notify(0, false, 0, 0);
 	CHECK_UINT(hop_count(H_CID), 1);
 	CHECK_UINT(hop_last(H_CID)->cid.mwi, HAL_MWI_OFF);
+	CHECK_UINT(hop_last(H_CID)->cid.mwi_count, 0);
 	CHECK(view_get(0, &v));
 	CHECK(!v.mwi);
 	CHECK_UINT(v.mwi_new, 0);

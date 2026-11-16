@@ -398,13 +398,30 @@ enum udsp_flash_service {
 
 struct udsp_cadence { uint16_t on_ms; uint16_t off_ms; };
 
+/*
+ * The body of a VMWI record: the [cid] mwi_message key of the region grammar
+ * (visual, count). Visual is the EN 300 659 message waiting record with the
+ * on or off indicator. Count is the SIN 227 Annex A record, a call setup
+ * message that carries the number of waiting messages.
+ */
+enum udsp_mwi_message {
+	UDSP_MWI_MSG_VISUAL = 0,
+	UDSP_MWI_MSG_COUNT,
+	/* The bound of the name table, never a body. */
+	UDSP_MWI_MSG_MAX,
+};
+
 /* VMWI: mwi true is the visual message-waiting on burst; a record with mwi
  * false and number, name and blockinfo all empty is the off burst (uvoice
  * mwi_fsk_send builds exactly that record, and its cid_fill always writes
  * blockinfo for a real caller, so no caller identity matches); anything else
  * is a caller identity. udsp_mwi() is the lamp op alone (SYNC-SLIC;
  * UDSP_UNSUPPORTED without the plug-in lamp op): the FSK VMWI path is cid_send,
- * exactly as the uvoice core drives it. */
+ * exactly as the uvoice core drives it.
+ *
+ * mwi_count is the number of waiting messages of an on burst. Only a region
+ * with mwi_message = count sends it. There, 0 with mwi true is sent as 1,
+ * which SIN 227 A.2.8 defines as one message or an unspecified number. */
 struct udsp_cid {
 	uint8_t format;			/* enum udsp_cid_format */
 	bool mwi;			/* FSK VMWI when set */
@@ -415,6 +432,7 @@ struct udsp_cid {
 	/* GR-30 absence reason rendered into whichever identity field is empty
 	 * (line.c cid_fill: "O" unavailable, "P" withheld). */
 	char blockinfo[UDSP_CID_STR_MAX];
+	uint8_t mwi_count;
 };
 
 struct udsp_ring {

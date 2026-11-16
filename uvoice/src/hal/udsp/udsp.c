@@ -1547,6 +1547,8 @@ static enum hal_status udsp_line_hook_timing_set(struct hal *h, unsigned int lin
  * off burst is what libudsp reads out of an all-empty identity: uvoice
  * mwi_fsk_send() builds exactly that record, and its cid_fill() always writes
  * blockinfo for a real caller, so no caller identity can be mistaken for one.
+ * mwi_count passes through too: libudsp sends it where the region asks for
+ * the count body.
  */
 void hal_udsp_cid_fill(struct udsp_cid *dst, const struct hal_cid *src)
 {
@@ -1559,6 +1561,7 @@ void hal_udsp_cid_fill(struct udsp_cid *dst, const struct hal_cid *src)
 	memcpy(dst->name, src->name, sizeof(dst->name));
 	memcpy(dst->datetime, src->datetime, sizeof(dst->datetime));
 	memcpy(dst->blockinfo, src->blockinfo, sizeof(dst->blockinfo));
+	dst->mwi_count = src->mwi_count;
 }
 
 void hal_udsp_ring_fill(struct udsp_ring *dst, const struct hal_ring *src)

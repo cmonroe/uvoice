@@ -171,6 +171,8 @@ static void usage(FILE *out)
 		"  --cid-wait-ms <0-%u>      delay from the break to the burst\n"
 		"                              (default %u)\n"
 		"  --mwi <on|off>              the vmwi record to send\n"
+		"  --mwi-count <0-255>         message count of --mwi on, for\n"
+		"                              a region with a count body\n"
 		"  --duration <ms>             ring, tone or idle length\n"
 		"                              (defaults %u, %u, %u)\n"
 		"  --settle-ms <0-%u>       wait after bring-up before the action\n"
@@ -336,6 +338,8 @@ static int args_parse(int argc, char **argv, struct lc_args *a)
 		return usage_fail("vmwi requires --mwi on or off", NULL);
 	if (!verb_is(a, "vmwi") && a->base.mwi >= 0)
 		return usage_fail("--mwi applies to vmwi alone", NULL);
+	if (tool_given(&a->base, TOOL_OPT_MWI_COUNT) && a->base.mwi <= 0)
+		return usage_fail("--mwi-count requires --mwi on", NULL);
 	if ((verb_is(a, "tone") || verb_is(a, "idle") || verb_is(a, "vmwi")) &&
 	    identity)
 		return usage_fail("caller identity does not apply to verb", a->verb);
