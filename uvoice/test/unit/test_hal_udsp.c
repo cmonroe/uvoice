@@ -4867,7 +4867,10 @@ static bool jbtrace_seen(const char *needle)
 		return false;
 
 	fflush(stderr);
-	while ((n = pread(fileno(jbtrace_file), buf + have,
+	/* The window keeps one needle length between reads, so a needle that
+	 * fills the buffer leaves no room for a read and ends the search. */
+	while (have < sizeof(buf) - 1 &&
+	       (n = pread(fileno(jbtrace_file), buf + have,
 			  sizeof(buf) - 1 - have, off)) > 0) {
 		off += n;
 		have += (size_t)n;
