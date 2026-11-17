@@ -2775,8 +2775,9 @@ static void mwi_fsk_send(struct line *l)
 
 /*
  * A record the line cannot present now is held, never dropped: the switch
- * does not send the summary again, and a repeated one is not a transition. A
- * stored summary is presented once the indicator is enabled, at the next rest.
+ * may not send the summary again. The held record is one flag, so summaries
+ * that arrive while it is held leave one record of the last state. A stored
+ * summary is presented once the indicator is enabled, at the next rest.
  * Before lines_init() the channel view is not loaded, so the vmwi gate cannot
  * be read yet.
  */
@@ -2816,44 +2817,31 @@ static void mwi_replay(struct line *l)
 }
 
 /*
- * A transition is what the subscriber is presented with: the indication
- * itself moving, or a count moving while it stays on. A NOTIFY that repeats
- * what the line already holds is stored and presented to nobody, which is
- * what keeps a switch that re-sends its summary every refresh from ringing an
- * FSK burst at the phone each time.
- */
-static bool mwi_moved(const struct line *l, bool on, uint32_t new_msgs, uint32_t old_msgs)
-{
-	if (l->mwi.on != on)
-		return true;
-
-	return on && (l->mwi.new_msgs != new_msgs || l->mwi.old_msgs != old_msgs);
-}
-
-/*
  * The store and the visual presentation, the core half of a NOTIFY. The
  * machine of the protocol learns nothing here: the protocol applies the
  * audible choice itself (proto/proto.h mwi_set).
+ *
+ * Every summary is presented, also one that repeats what the line holds. A
+ * display that missed a record, or that was plugged in after it, has no
+ * other way to learn the state, and the line cannot know what the display
+ * shows.
  */
 void line_mwi_set(unsigned int line, bool on, uint32_t new_msgs,
 		  uint32_t old_msgs)
 {
 	struct line *l = line_get(line);
-	bool moved;
 
 	if (!l)
 		return;
 
-	moved = mwi_moved(l, on, new_msgs, old_msgs);
 	l->mwi.on = on;
 	l->mwi.new_msgs = new_msgs;
 	l->mwi.old_msgs = old_msgs;
 
-	TRACE(TRACE_FSM, "line %u message waiting %d new %u old %u%s", line, on, new_msgs,
-	      old_msgs, moved ? "" : ", unchanged");
+	TRACE(TRACE_FSM, "line %u message waiting %d new %u old %u", line, on,
+	      new_msgs, old_msgs);
 
-	if (moved)
-		mwi_present(l);
+	mwi_present(l);
 }
 
 bool line_mwi_get(unsigned int line, uint32_t *new_msgs, uint32_t *old_msgs)

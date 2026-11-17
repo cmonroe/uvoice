@@ -18183,14 +18183,16 @@ static void t_mwi(void)
 	CHECK(strcmp(cid->cid.name, "") == 0);
 	CHECK(strcmp(cid->cid.blockinfo, "") == 0);
 
-	CASE("a notify that repeats what the line holds presents nothing again");
+	CASE("a notify that repeats the stored state sends the record again");
 	hops_reset();
 	mwi_notify(0, true, 2, 1);
-	CHECK_UINT(hop_count(H_CID), 0);
+	CHECK_UINT(hop_count(H_CID), 1);
+	CHECK_UINT(hop_last(H_CID)->cid.mwi, HAL_MWI_ON);
+	CHECK_UINT(hop_last(H_CID)->cid.mwi_count, 2);
 	CHECK(view_get(0, &v));
 	CHECK(v.mwi);
 
-	CASE("a count that moves while the indication stays on is a transition");
+	CASE("a count that moves while the indication stays on sends a record");
 	hops_reset();
 	mwi_notify(0, true, 3, 1);
 	CHECK_UINT(hop_count(H_CID), 1);
@@ -18222,10 +18224,12 @@ static void t_mwi(void)
 	CHECK(!v.mwi);
 	CHECK_UINT(v.mwi_new, 0);
 
-	CASE("a repeated clear is not presented again");
+	CASE("a repeated clear sends the off record again");
 	hops_reset();
 	mwi_notify(0, false, 0, 0);
-	CHECK_UINT(hop_count(H_CID), 0);
+	CHECK_UINT(hop_count(H_CID), 1);
+	CHECK_UINT(hop_last(H_CID)->cid.mwi, HAL_MWI_OFF);
+	CHECK_UINT(hop_last(H_CID)->cid.mwi_count, 0);
 
 	/* the stutter, gated on amwi and carried by the machine's narrow
 	 * entry */
@@ -18524,7 +18528,7 @@ static void t_mwi(void)
 	fixture_start();
 	region_ready();
 	/* the store survives the restart by design, so the state this case
-	 * starts from is set explicitly and the notify below is a transition */
+	 * starts from is set explicitly */
 	mwi_notify(0, false, 0, 0);
 	inject_hook(0, HAL_HOOK_SEIZE, 0);
 	uloop_pump(DIAL_TONE_PUMP_MS);
