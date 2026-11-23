@@ -16,12 +16,24 @@ exported.
   far end's fingerprint is verified against the one the signalling carried.
 - No signalling, no SDP, no XML. The caller moves the credentials, the
   fingerprints and the candidate lines.
+- A DSCP mark from the caller for RTP and one for RTCP. DTLS uses the RTP
+  mark.
 
 ## Threads
 
-libjuice runs its own thread. Every callback of `struct uvt_cfg` runs on it.
-`uvt_tick()` drives the DTLS retransmission timer and belongs in the caller's
-own loop.
+libjuice runs its own thread, and the callbacks of `struct uvt_cfg` run on it.
+`uvt_create()`, `uvt_remote_set()` and `uvt_tick()` can also run a callback
+on the caller's thread before they return.
+
+- A callback can call every function of the API except `uvt_destroy()`.
+- A callback must not wait for a lock that another thread holds across a call
+  to the API. Most calls can wait for the libjuice thread, and that thread
+  waits for the callback.
+- Each stream sends its datagrams through one output queue, in queue order.
+  The queue drops RTP and RTCP when it is full, and the send returns
+  `-ENOBUFS`.
+- `uvt_tick()` drives the DTLS retransmission timer and belongs in the
+  caller's own loop.
 
 ## API
 

@@ -21,6 +21,10 @@
 
 #include "uvtransport/uvtransport.h"
 
+#ifdef UVT_TEST_HOOKS
+#include <stdatomic.h>
+#endif
+
 #define UVT_CANDIDATE_RING	16U
 #define UVT_DTLS_MTU		1200L
 #define UVT_SRTP_PROFILES	"SRTP_AES128_CM_SHA1_80:SRTP_AES128_CM_SHA1_32"
@@ -32,6 +36,16 @@
 #define UVT_DESC_MAX		1024U
 #define UVT_DRAIN_MAX		64U
 #define UVT_BUF_MAX		(UVT_PACKET_MAX + UVSRTP_MAX_SRTCP_TRAILER)
+/*
+ * Media can take every slot of the output queue except UVT_QUEUE_RESERVE,
+ * so a DTLS flight or a close_notify still finds room.
+ */
+#define UVT_QUEUE_LEN		16U
+#define UVT_QUEUE_RESERVE	8U
+/* Bound of the DTLS input BIO, so a far end cannot grow it without limit. */
+#define UVT_RBIO_MAX		(8U * UVT_PACKET_MAX)
+#define UVT_ICE_CHARS		"ABCDEFGHIJKLMNOPQRSTUVWXYZ" \
+				"abcdefghijklmnopqrstuvwxyz0123456789+/"
 
 enum uvt_recv_verdict {
 	UVT_RECV_NONE = 0,
@@ -40,6 +54,12 @@ enum uvt_recv_verdict {
 	UVT_RECV_UP,
 	UVT_RECV_FAIL,
 	UVT_RECV_CLOSED,
+};
+
+enum uvt_remote {
+	UVT_REMOTE_NONE = 0,
+	UVT_REMOTE_INSTALLING,
+	UVT_REMOTE_SET,
 };
 
 struct uvt_global {
@@ -52,8 +72,15 @@ struct uvt_global {
 	bool ready;
 };
 
+struct uvt_datagram {
+	_Alignas(uint32_t) uint8_t data[UVT_BUF_MAX];
+	size_t len;
+	uint8_t dscp;
+};
+
 struct uvt_stream {
 	pthread_mutex_t lock;
+	pthread_cond_t drained;
 	struct uvt_cfg cfg;
 	juice_agent_t *agent;
 	juice_turn_server_t turn[UVT_TURN_MAX];
@@ -62,19 +89,229 @@ struct uvt_stream {
 	struct uvsrtp *srtp;
 	enum uvt_setup setup;
 	enum uvt_ice_state ice;
+	enum uvt_remote remote;
 	uint8_t remote_fp[UVT_FINGERPRINT_LEN];
 	bool remote_fp_set;
 	bool gathered;
-	bool remote_set;
 	bool dtls_up;
 	bool dtls_failed;
 	bool dtls_closed;
+	bool draining;
+	bool destroying;
+	unsigned int users;
 	char cand[UVT_CANDIDATE_RING][UVT_CANDIDATE_MAX];
 	unsigned int cand_head;
 	unsigned int cand_count;
+	struct uvt_datagram queue[UVT_QUEUE_LEN];
+	unsigned int queue_head;
+	unsigned int queue_count;
+	unsigned long media_dropped;
 };
 
 static struct uvt_global global = { .lock = PTHREAD_MUTEX_INITIALIZER };
+
+#ifdef UVT_TEST_HOOKS
+static _Thread_local unsigned int lock_depth;
+static atomic_uint hook_lock_faults;
+static void (*hook_entry)(struct uvt_stream *stream, const char *call);
+static bool (*hook_send)(struct uvt_stream *stream, const uint8_t *data,
+			 size_t len, int ds);
+static DTLS_timer_cb hook_dtls_timer;
+#endif
+
+static void stream_lock(struct uvt_stream *stream)
+{
+	pthread_mutex_lock(&stream->lock);
+#ifdef UVT_TEST_HOOKS
+	lock_depth++;
+#endif
+}
+
+static void stream_unlock(struct uvt_stream *stream)
+{
+#ifdef UVT_TEST_HOOKS
+	lock_depth--;
+#endif
+	pthread_mutex_unlock(&stream->lock);
+}
+
+/*
+ * A call that uses the stream after it releases the stream lock holds a user
+ * count, so uvt_destroy() cannot free the stream under it. No callback waits
+ * for the count, so a user that waits for the libjuice registry mutex gets it.
+ *
+ * Context: the stream lock is held.
+ * Return: false when uvt_destroy() runs.
+ */
+static bool user_take(struct uvt_stream *stream)
+{
+	if (stream->destroying)
+		return false;
+	stream->users++;
+
+	return true;
+}
+
+static void user_drop(struct uvt_stream *stream)
+{
+	stream_lock(stream);
+	if (!--stream->users)
+		pthread_cond_broadcast(&stream->drained);
+	stream_unlock(stream);
+}
+
+/*
+ * Take a user count with no stream lock held after it.
+ *
+ * Return: false when uvt_destroy() runs.
+ */
+static bool user_enter(struct uvt_stream *stream)
+{
+	bool ok;
+
+	stream_lock(stream);
+	ok = user_take(stream);
+	stream_unlock(stream);
+
+	return ok;
+}
+
+static void hook_point(struct uvt_stream *stream, const char *point)
+{
+#ifdef UVT_TEST_HOOKS
+	if (hook_entry)
+		hook_entry(stream, point);
+#endif
+}
+
+/*
+ * Every libjuice call goes through one of the ice_*() functions. A libjuice
+ * call can wait for the libjuice registry mutex. libjuice holds that mutex
+ * while it runs the callbacks, and the callbacks take the stream lock. So no
+ * thread enters libjuice with a stream lock held.
+ */
+static void ice_enter(struct uvt_stream *stream, const char *call)
+{
+#ifdef UVT_TEST_HOOKS
+	if (lock_depth)
+		atomic_fetch_add(&hook_lock_faults, 1U);
+#endif
+	hook_point(stream, call);
+}
+
+static juice_agent_t *ice_create(struct uvt_stream *stream,
+				 const juice_config_t *config)
+{
+	ice_enter(stream, __func__);
+
+	return juice_create(config);
+}
+
+static void ice_destroy(struct uvt_stream *stream)
+{
+	ice_enter(stream, __func__);
+	juice_destroy(stream->agent);
+}
+
+static int ice_gather(struct uvt_stream *stream)
+{
+	ice_enter(stream, __func__);
+
+	return juice_gather_candidates(stream->agent);
+}
+
+static int ice_local_get(struct uvt_stream *stream, char *buf, size_t len)
+{
+	ice_enter(stream, __func__);
+
+	return juice_get_local_description(stream->agent, buf, len);
+}
+
+static int ice_remote_set(struct uvt_stream *stream, const char *sdp)
+{
+	ice_enter(stream, __func__);
+
+	return juice_set_remote_description(stream->agent, sdp);
+}
+
+static int ice_candidate_add(struct uvt_stream *stream, const char *sdp)
+{
+	ice_enter(stream, __func__);
+
+	return juice_add_remote_candidate(stream->agent, sdp);
+}
+
+static int ice_remote_done(struct uvt_stream *stream)
+{
+	ice_enter(stream, __func__);
+
+	return juice_set_remote_gathering_done(stream->agent);
+}
+
+static int ice_send(struct uvt_stream *stream,
+		    const struct uvt_datagram *dgram)
+{
+	/* libjuice takes the TOS byte, with the DSCP in its upper six bits. */
+	int ds = (dgram->dscp << 2) & 0xFC;
+
+	ice_enter(stream, __func__);
+#ifdef UVT_TEST_HOOKS
+	if (hook_send && hook_send(stream, dgram->data, dgram->len, ds))
+		return JUICE_ERR_FAILED;
+#endif
+
+	return juice_send_diffserv(stream->agent, (const char *)dgram->data,
+				   dgram->len, ds);
+}
+
+/*
+ * Return: the free slot at the tail of the output queue, or NULL when no more
+ * than @reserve slots are free.
+ */
+static struct uvt_datagram *queue_tail(struct uvt_stream *stream,
+				       unsigned int reserve)
+{
+	unsigned int tail;
+
+	if (stream->queue_count + reserve >= UVT_QUEUE_LEN)
+		return NULL;
+	tail = (stream->queue_head + stream->queue_count) % UVT_QUEUE_LEN;
+
+	return &stream->queue[tail];
+}
+
+/*
+ * One thread at a time sends the output queue, so datagrams leave in queue
+ * order. A thread that finds a sender at work leaves its datagrams to that
+ * sender and does not wait. A failed send is a lost datagram: DTLS sends a
+ * lost record again on its timer.
+ */
+static void queue_drain(struct uvt_stream *stream)
+{
+	struct uvt_datagram *dgram;
+
+	stream_lock(stream);
+	if (stream->draining) {
+		stream_unlock(stream);
+		return;
+	}
+	stream->draining = true;
+	while (stream->queue_count) {
+		/*
+		 * The head slot stays counted while it is sent, so no producer
+		 * writes it.
+		 */
+		dgram = &stream->queue[stream->queue_head];
+		stream_unlock(stream);
+		ice_send(stream, dgram);
+		stream_lock(stream);
+		stream->queue_head = (stream->queue_head + 1) % UVT_QUEUE_LEN;
+		stream->queue_count--;
+	}
+	stream->draining = false;
+	pthread_cond_broadcast(&stream->drained);
+	stream_unlock(stream);
+}
 
 /**
  * event_emit() - report one transport event to the owner
@@ -89,21 +326,30 @@ static void event_emit(struct uvt_stream *stream, enum uvt_event event, int arg)
 }
 
 /**
- * bio_write() - send one DTLS record through the ICE agent
+ * bio_write() - queue one DTLS record for the ICE agent
  * @bio: the write BIO of the stream
  * @buf: the record
  * @len: its length
  *
- * Return: @len, or -1 when the agent refused the datagram.
+ * Context: the stream lock is held. queue_drain() sends the record after the
+ * caller releases the lock.
+ * Return: @len. A record that finds no room counts as lost, and the DTLS timer
+ * sends it again.
  */
 static int bio_write(BIO *bio, const char *buf, int len)
 {
 	struct uvt_stream *stream = BIO_get_data(bio);
+	struct uvt_datagram *dgram;
 
 	if (len <= 0)
 		return 0;
-	if (juice_send(stream->agent, buf, (size_t)len) < 0)
-		return -1;
+	dgram = queue_tail(stream, 0);
+	if (!dgram || (size_t)len > sizeof(dgram->data))
+		return len;
+	memcpy(dgram->data, buf, (size_t)len);
+	dgram->len = (size_t)len;
+	dgram->dscp = stream->cfg.rtp_dscp;
+	stream->queue_count++;
 
 	return len;
 }
@@ -130,7 +376,7 @@ static long bio_ctrl(BIO *bio, int cmd, long num, void *ptr)
 }
 
 /**
- * bio_create() - mark a new write BIO as initialised
+ * bio_create() - mark a new write BIO as initialized
  * @bio: the BIO
  *
  * Return: 1.
@@ -172,7 +418,7 @@ static bool cert_fingerprint_ok(const struct uvt_stream *stream, X509 *cert)
  * @ok: the verdict of the chain check
  * @ctx: the store context
  *
- * The signalled fingerprint replaces the chain check: the leaf certificate
+ * The signaled fingerprint replaces the chain check: the leaf certificate
  * must match it, so a mismatch aborts the handshake with a fatal alert and
  * fails both ends. dtls_finish() checks the fingerprint once more.
  *
@@ -268,7 +514,7 @@ static int ctx_make(void)
 }
 
 /**
- * bio_meth_make() - build the write BIO method that sends through libjuice
+ * bio_meth_make() - build the write BIO method that queues for libjuice
  *
  * Return: 0, or -ENOMEM.
  */
@@ -329,7 +575,7 @@ int uvt_fingerprint_get(uint8_t out[UVT_FINGERPRINT_LEN])
 }
 
 /**
- * peer_fingerprint_ok() - compare the peer certificate with the signalled one
+ * peer_fingerprint_ok() - compare the peer certificate with the signaled one
  * @stream: the stream, after its handshake
  *
  * Return: true when the SHA-256 fingerprints match.
@@ -432,7 +678,7 @@ static int dtls_finish(struct uvt_stream *stream)
 
 /**
  * dtls_drive() - run the handshake as far as the records at hand allow
- * @stream: the stream
+ * @stream: the stream, with a handshake that neither completed nor failed
  *
  * Context: the stream lock is held.
  * Return: 1 when the handshake completed, 0 while it waits, -1 on failure.
@@ -440,11 +686,6 @@ static int dtls_finish(struct uvt_stream *stream)
 static int dtls_drive(struct uvt_stream *stream)
 {
 	int ret, err;
-
-	if (stream->dtls_up)
-		return 1;
-	if (stream->dtls_failed)
-		return -1;
 
 	ret = SSL_do_handshake(stream->ssl);
 	if (ret == 1)
@@ -487,6 +728,10 @@ static int dtls_start(struct uvt_stream *stream)
 	SSL_set_app_data(stream->ssl, stream);
 	SSL_set_bio(stream->ssl, stream->rbio, wbio);
 	SSL_set_mtu(stream->ssl, UVT_DTLS_MTU);
+#ifdef UVT_TEST_HOOKS
+	if (hook_dtls_timer)
+		DTLS_set_timer_cb(stream->ssl, hook_dtls_timer);
+#endif
 	if (stream->setup == UVT_SETUP_ACTIVE)
 		SSL_set_connect_state(stream->ssl);
 	else
@@ -499,15 +744,17 @@ static int dtls_start(struct uvt_stream *stream)
  * dtls_due() - whether the handshake can start now
  * @stream: the stream
  *
- * Return: true once ICE connected, the far end is known and no object exists.
+ * Return: true once ICE connected and the far end is set, while no DTLS object
+ * exists and none failed.
  */
 static bool dtls_due(const struct uvt_stream *stream)
 {
 	bool connected = stream->ice == UVT_ICE_CONNECTED ||
 			 stream->ice == UVT_ICE_COMPLETED;
 
-	return connected && !stream->ssl && stream->setup != UVT_SETUP_ACTPASS &&
-	       stream->remote_set;
+	return connected && !stream->ssl && !stream->dtls_failed &&
+	       stream->setup != UVT_SETUP_ACTPASS &&
+	       stream->remote == UVT_REMOTE_SET;
 }
 
 /**
@@ -515,25 +762,27 @@ static bool dtls_due(const struct uvt_stream *stream)
  * @stream: the stream
  *
  * Context: the stream lock is held.
- * Return: UVT_RECV_CLOSED when the far end closed the session, else NONE.
+ * Return: UVT_RECV_CLOSED when the far end closed the session, UVT_RECV_FAIL
+ * when a fatal error ended it, else NONE.
  */
 static enum uvt_recv_verdict dtls_drain(struct uvt_stream *stream)
 {
 	char tmp[UVT_DRAIN_MAX];
-	int ret;
-
-	if (stream->dtls_closed)
-		return UVT_RECV_NONE;
+	int ret, err;
 
 	for (;;) {
 		ret = SSL_read(stream->ssl, tmp, sizeof(tmp));
 		if (ret > 0)
 			continue;
-		if (SSL_get_error(stream->ssl, ret) == SSL_ERROR_ZERO_RETURN) {
+		err = SSL_get_error(stream->ssl, ret);
+		if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
+			return UVT_RECV_NONE;
+		if (err == SSL_ERROR_ZERO_RETURN) {
 			stream->dtls_closed = true;
 			return UVT_RECV_CLOSED;
 		}
-		return UVT_RECV_NONE;
+		stream->dtls_failed = true;
+		return UVT_RECV_FAIL;
 	}
 }
 
@@ -543,6 +792,9 @@ static enum uvt_recv_verdict dtls_drain(struct uvt_stream *stream)
  * @data: the datagram
  * @size: its length
  *
+ * A session that ended reads no more input, so its datagrams are dropped
+ * before they reach the BIO.
+ *
  * Context: the stream lock is held.
  * Return: the verdict the owner is told about.
  */
@@ -551,9 +803,11 @@ static enum uvt_recv_verdict dtls_input(struct uvt_stream *stream,
 {
 	int verdict;
 
-	if (!stream->ssl)
+	if (!stream->ssl || stream->dtls_failed || stream->dtls_closed)
 		return UVT_RECV_NONE;
-	BIO_write(stream->rbio, data, (int)size);
+	if (BIO_ctrl_pending(stream->rbio) + size > UVT_RBIO_MAX ||
+	    BIO_write(stream->rbio, data, (int)size) != (int)size)
+		return UVT_RECV_NONE;
 	if (stream->dtls_up)
 		return dtls_drain(stream);
 
@@ -617,21 +871,30 @@ static void on_recv(juice_agent_t *agent, const char *data, size_t size,
 	_Alignas(uint32_t) uint8_t buf[UVT_BUF_MAX];
 	enum uvt_recv_verdict verdict = UVT_RECV_NONE;
 	uint8_t first;
+	bool dtls;
 	size_t out = 0;
 
 	if (!size || size > UVT_PACKET_MAX)
 		return;
 	first = (uint8_t)data[0];
+	dtls = first >= 20 && first <= 63;
 
-	pthread_mutex_lock(&stream->lock);
-	if (first >= 20 && first <= 63) {
+	stream_lock(stream);
+	if (stream->destroying) {
+		stream_unlock(stream);
+		return;
+	}
+	if (dtls) {
 		verdict = dtls_input(stream, data, size);
 	} else if (first >= 128 && first <= 191 && stream->dtls_up &&
-		   !stream->dtls_closed) {
+		   !stream->dtls_closed && !stream->dtls_failed) {
 		memcpy(buf, data, size);
 		verdict = media_input(stream, buf, size, &out);
 	}
-	pthread_mutex_unlock(&stream->lock);
+	stream_unlock(stream);
+
+	if (dtls)
+		queue_drain(stream);
 
 	switch (verdict) {
 	case UVT_RECV_RTP:
@@ -662,19 +925,24 @@ static void on_recv(juice_agent_t *agent, const char *data, size_t size,
  * @state: the new state
  * @user: the stream
  *
- * Context: the libjuice thread.
+ * Context: the libjuice thread, or the caller of a gathering.
  */
 static void on_state(juice_agent_t *agent, juice_state_t state, void *user)
 {
 	struct uvt_stream *stream = user;
 	int dtls = 0;
 
-	pthread_mutex_lock(&stream->lock);
+	stream_lock(stream);
+	if (stream->destroying) {
+		stream_unlock(stream);
+		return;
+	}
 	stream->ice = (enum uvt_ice_state)state;
 	if (dtls_due(stream))
 		dtls = dtls_start(stream);
-	pthread_mutex_unlock(&stream->lock);
+	stream_unlock(stream);
 
+	queue_drain(stream);
 	event_emit(stream, UVT_EV_ICE_STATE, (int)state);
 	if (dtls < 0)
 		event_emit(stream, UVT_EV_DTLS_FAIL, 0);
@@ -686,14 +954,18 @@ static void on_state(juice_agent_t *agent, juice_state_t state, void *user)
  * @sdp: the a=candidate line
  * @user: the stream
  *
- * Context: the libjuice thread.
+ * Context: the libjuice thread, or the caller of a gathering.
  */
 static void on_candidate(juice_agent_t *agent, const char *sdp, void *user)
 {
 	struct uvt_stream *stream = user;
 	unsigned int pending;
 
-	pthread_mutex_lock(&stream->lock);
+	stream_lock(stream);
+	if (stream->destroying) {
+		stream_unlock(stream);
+		return;
+	}
 	if (stream->cand_count < UVT_CANDIDATE_RING) {
 		unsigned int slot = (stream->cand_head + stream->cand_count) %
 				    UVT_CANDIDATE_RING;
@@ -702,7 +974,7 @@ static void on_candidate(juice_agent_t *agent, const char *sdp, void *user)
 		stream->cand_count++;
 	}
 	pending = stream->cand_count;
-	pthread_mutex_unlock(&stream->lock);
+	stream_unlock(stream);
 
 	event_emit(stream, UVT_EV_CANDIDATE, (int)pending);
 }
@@ -712,11 +984,19 @@ static void on_candidate(juice_agent_t *agent, const char *sdp, void *user)
  * @agent: the ICE agent
  * @user: the stream
  *
- * Context: the libjuice thread.
+ * Context: the libjuice thread, or the caller of a gathering.
  */
 static void on_gathering_done(juice_agent_t *agent, void *user)
 {
-	event_emit(user, UVT_EV_GATHERING_DONE, 0);
+	struct uvt_stream *stream = user;
+	bool destroying;
+
+	stream_lock(stream);
+	destroying = stream->destroying;
+	stream_unlock(stream);
+
+	if (!destroying)
+		event_emit(stream, UVT_EV_GATHERING_DONE, 0);
 }
 
 /**
@@ -755,7 +1035,6 @@ static void juice_cfg_fill(struct uvt_stream *stream, juice_config_t *config)
 
 struct uvt_stream *uvt_create(const struct uvt_cfg *cfg)
 {
-	pthread_mutexattr_t attr;
 	juice_config_t config;
 	struct uvt_stream *stream;
 
@@ -766,43 +1045,48 @@ struct uvt_stream *uvt_create(const struct uvt_cfg *cfg)
 	if (!stream)
 		return NULL;
 
-	pthread_mutexattr_init(&attr);
-	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-	pthread_mutex_init(&stream->lock, &attr);
-	pthread_mutexattr_destroy(&attr);
-
+	pthread_mutex_init(&stream->lock, NULL);
+	pthread_cond_init(&stream->drained, NULL);
 	stream->cfg = *cfg;
 	stream->setup = cfg->setup;
 	stream->ice = UVT_ICE_DISCONNECTED;
 	juice_cfg_fill(stream, &config);
 
-	stream->agent = juice_create(&config);
+	stream->agent = ice_create(stream, &config);
 	if (!stream->agent) {
+		pthread_cond_destroy(&stream->drained);
 		pthread_mutex_destroy(&stream->lock);
 		free(stream);
 		return NULL;
 	}
 
-	if (cfg->role == UVT_ROLE_CONTROLLING &&
-	    juice_gather_candidates(stream->agent) == 0)
+	if (cfg->role == UVT_ROLE_CONTROLLING && ice_gather(stream) == 0)
 		stream->gathered = true;
 
 	return stream;
 }
 
 /**
- * credential_ok() - bound one ICE credential
+ * credential_ok() - check one ICE credential (RFC 8839 section 5.4)
  * @str: the credential
  * @min: the shortest length allowed
  * @max: the longest length allowed
  *
- * Return: true when the length is inside the bounds.
+ * libjuice reads the credentials as lines of a description, so a character
+ * outside ice-char, such as CR or LF, can add a line to it.
+ *
+ * Return: true when the length is inside the bounds and every character is an
+ * ice-char: ALPHA, DIGIT, "+" or "/".
  */
 static bool credential_ok(const char *str, size_t min, size_t max)
 {
-	size_t len = str ? strlen(str) : 0;
+	size_t len;
 
-	return len >= min && len <= max;
+	if (!str)
+		return false;
+	len = strspn(str, UVT_ICE_CHARS);
+
+	return !str[len] && len >= min && len <= max;
 }
 
 int uvt_remote_set(struct uvt_stream *stream, const char *ufrag,
@@ -819,18 +1103,35 @@ int uvt_remote_set(struct uvt_stream *stream, const char *ufrag,
 	    !credential_ok(pwd, 22, UVT_PWD_MAX - 1))
 		return -EINVAL;
 
-	pthread_mutex_lock(&stream->lock);
-	if (stream->remote_set) {
-		pthread_mutex_unlock(&stream->lock);
+	/*
+	 * INSTALLING refuses a second caller while libjuice installs the
+	 * description with no lock held. The handshake waits for SET, so it
+	 * starts with the remote fingerprint in place.
+	 */
+	stream_lock(stream);
+	if (stream->remote != UVT_REMOTE_NONE) {
+		stream_unlock(stream);
 		return -EALREADY;
 	}
+	if (!user_take(stream)) {
+		stream_unlock(stream);
+		return -EPIPE;
+	}
+	stream->remote = UVT_REMOTE_INSTALLING;
+	stream_unlock(stream);
+
 	snprintf(desc, sizeof(desc), "a=ice-ufrag:%s\r\na=ice-pwd:%s\r\n", ufrag,
 		 pwd);
-	if (juice_set_remote_description(stream->agent, desc) < 0) {
-		pthread_mutex_unlock(&stream->lock);
+	if (ice_remote_set(stream, desc) < 0) {
+		stream_lock(stream);
+		stream->remote = UVT_REMOTE_NONE;
+		stream_unlock(stream);
+		user_drop(stream);
 		return -EINVAL;
 	}
-	stream->remote_set = true;
+
+	stream_lock(stream);
+	stream->remote = UVT_REMOTE_SET;
 	memcpy(stream->remote_fp, fingerprint, UVT_FINGERPRINT_LEN);
 	stream->remote_fp_set = true;
 	if (stream->setup == UVT_SETUP_ACTPASS)
@@ -839,30 +1140,42 @@ int uvt_remote_set(struct uvt_stream *stream, const char *ufrag,
 	if (dtls_due(stream))
 		dtls = dtls_start(stream);
 	gather = !stream->gathered;
-	if (gather)
-		stream->gathered = true;
-	pthread_mutex_unlock(&stream->lock);
+	stream->gathered = true;
+	stream_unlock(stream);
 
+	queue_drain(stream);
 	if (gather)
-		juice_gather_candidates(stream->agent);
+		ice_gather(stream);
 	if (dtls < 0)
 		event_emit(stream, UVT_EV_DTLS_FAIL, 0);
+	user_drop(stream);
 
 	return 0;
 }
 
 int uvt_candidate_add(struct uvt_stream *stream, const char *sdp)
 {
+	int ret;
+
 	if (!stream || !sdp)
 		return -EINVAL;
+	if (!user_enter(stream))
+		return -EPIPE;
 
-	return juice_add_remote_candidate(stream->agent, sdp) < 0 ? -EINVAL : 0;
+	/* libjuice ignores a type it does not pair, such as prflx. */
+	ret = ice_candidate_add(stream, sdp);
+	user_drop(stream);
+
+	return ret < 0 && ret != JUICE_ERR_IGNORED ? -EINVAL : 0;
 }
 
 void uvt_remote_done(struct uvt_stream *stream)
 {
-	if (stream)
-		juice_set_remote_gathering_done(stream->agent);
+	if (!stream || !user_enter(stream))
+		return;
+
+	ice_remote_done(stream);
+	user_drop(stream);
 }
 
 /**
@@ -895,10 +1208,16 @@ static bool desc_value(const char *desc, const char *key, char *out,
 int uvt_local_get(struct uvt_stream *stream, char *ufrag, char *pwd)
 {
 	char desc[UVT_DESC_MAX];
+	int ret;
 
 	if (!stream || !ufrag || !pwd)
 		return -EINVAL;
-	if (juice_get_local_description(stream->agent, desc, sizeof(desc)) < 0)
+	if (!user_enter(stream))
+		return -EPIPE;
+
+	ret = ice_local_get(stream, desc, sizeof(desc));
+	user_drop(stream);
+	if (ret < 0)
 		return -EIO;
 	if (!desc_value(desc, "a=ice-ufrag:", ufrag, UVT_UFRAG_MAX) ||
 	    !desc_value(desc, "a=ice-pwd:", pwd, UVT_PWD_MAX))
@@ -912,56 +1231,77 @@ int uvt_candidate_next(struct uvt_stream *stream, char *out, size_t len)
 	if (!stream || !out || !len)
 		return 0;
 
-	pthread_mutex_lock(&stream->lock);
+	stream_lock(stream);
 	if (!stream->cand_count) {
-		pthread_mutex_unlock(&stream->lock);
+		stream_unlock(stream);
 		return 0;
 	}
 	snprintf(out, len, "%s", stream->cand[stream->cand_head]);
 	stream->cand_head = (stream->cand_head + 1) % UVT_CANDIDATE_RING;
 	stream->cand_count--;
-	pthread_mutex_unlock(&stream->lock);
+	stream_unlock(stream);
 
 	return 1;
 }
 
 /**
- * media_send() - protect one packet and send it through the agent
+ * media_send() - protect one packet and queue it for the agent
  * @stream: the stream
  * @buf: the plain packet
  * @len: its length
  * @rtcp: whether the packet is RTCP
  *
- * Return: 0, -EAGAIN before DTLS is up, or another negative errno.
+ * The packet is protected in its queue slot under the stream lock, so the
+ * SRTP index order is the wire order.
+ *
+ * Return: 0, -EAGAIN before DTLS is up, -EPIPE after the session ended,
+ * -ENOBUFS when the queue holds no room for media, or another negative errno.
  */
 static int media_send(struct uvt_stream *stream, const uint8_t *buf, size_t len,
 		      bool rtcp)
 {
-	_Alignas(uint32_t) uint8_t pkt[UVT_BUF_MAX];
+	struct uvt_datagram *dgram;
 	size_t out = 0;
 	int ret;
 
 	if (!stream || !buf || !len || len > UVT_PACKET_MAX)
 		return -EINVAL;
 
-	pthread_mutex_lock(&stream->lock);
+	stream_lock(stream);
 	if (!stream->dtls_up) {
-		pthread_mutex_unlock(&stream->lock);
+		stream_unlock(stream);
 		return -EAGAIN;
 	}
-	if (stream->dtls_closed) {
-		pthread_mutex_unlock(&stream->lock);
+	if (stream->dtls_closed || stream->dtls_failed || stream->destroying) {
+		stream_unlock(stream);
 		return -EPIPE;
 	}
-	memcpy(pkt, buf, len);
-	ret = rtcp ? uvsrtp_protect_rtcp(stream->srtp, pkt, len, sizeof(pkt),
-					 &out) :
-		     uvsrtp_protect(stream->srtp, pkt, len, sizeof(pkt), &out);
-	if (!ret && juice_send(stream->agent, (const char *)pkt, out) < 0)
-		ret = -EIO;
-	pthread_mutex_unlock(&stream->lock);
+	dgram = queue_tail(stream, UVT_QUEUE_RESERVE);
+	if (!dgram) {
+		stream->media_dropped++;
+		stream_unlock(stream);
+		return -ENOBUFS;
+	}
+	memcpy(dgram->data, buf, len);
+	ret = rtcp ? uvsrtp_protect_rtcp(stream->srtp, dgram->data, len,
+					 sizeof(dgram->data), &out) :
+		     uvsrtp_protect(stream->srtp, dgram->data, len,
+				    sizeof(dgram->data), &out);
+	if (ret) {
+		stream_unlock(stream);
+		return ret;
+	}
+	dgram->len = out;
+	dgram->dscp = rtcp ? stream->cfg.rtcp_dscp : stream->cfg.rtp_dscp;
+	stream->queue_count++;
+	user_take(stream);
+	stream_unlock(stream);
 
-	return ret;
+	hook_point(stream, "media_queued");
+	queue_drain(stream);
+	user_drop(stream);
+
+	return 0;
 }
 
 int uvt_send_rtp(struct uvt_stream *stream, const uint8_t *buf, size_t len)
@@ -978,21 +1318,32 @@ void uvt_tick(struct uvt_stream *stream)
 {
 	struct timeval left;
 	bool fail = false;
+	int ret = 0;
 
 	if (!stream)
 		return;
 
-	pthread_mutex_lock(&stream->lock);
+	stream_lock(stream);
+	if (!user_take(stream)) {
+		stream_unlock(stream);
+		return;
+	}
 	if (stream->ssl && !stream->dtls_up && !stream->dtls_failed &&
 	    DTLSv1_get_timeout(stream->ssl, &left) && !left.tv_sec &&
-	    !left.tv_usec && DTLSv1_handle_timeout(stream->ssl) < 0) {
-		stream->dtls_failed = true;
-		fail = true;
+	    !left.tv_usec) {
+		ret = DTLSv1_handle_timeout(stream->ssl);
+		if (ret < 0) {
+			stream->dtls_failed = true;
+			fail = true;
+		}
 	}
-	pthread_mutex_unlock(&stream->lock);
+	stream_unlock(stream);
 
+	if (ret)
+		queue_drain(stream);
 	if (fail)
 		event_emit(stream, UVT_EV_DTLS_FAIL, 0);
+	user_drop(stream);
 }
 
 enum uvt_ice_state uvt_ice_state(struct uvt_stream *stream)
@@ -1001,9 +1352,9 @@ enum uvt_ice_state uvt_ice_state(struct uvt_stream *stream)
 
 	if (!stream)
 		return UVT_ICE_FAILED;
-	pthread_mutex_lock(&stream->lock);
+	stream_lock(stream);
 	state = stream->ice;
-	pthread_mutex_unlock(&stream->lock);
+	stream_unlock(stream);
 
 	return state;
 }
@@ -1014,30 +1365,37 @@ bool uvt_up(struct uvt_stream *stream)
 
 	if (!stream)
 		return false;
-	pthread_mutex_lock(&stream->lock);
+	stream_lock(stream);
 	up = stream->dtls_up && !stream->dtls_failed && !stream->dtls_closed;
-	pthread_mutex_unlock(&stream->lock);
+	stream_unlock(stream);
 
 	return up;
 }
 
 int uvt_close(struct uvt_stream *stream)
 {
-	int ret = 0;
-
 	if (!stream)
 		return -ENOTCONN;
 
-	pthread_mutex_lock(&stream->lock);
-	if (!stream->dtls_up || stream->dtls_closed) {
-		ret = -ENOTCONN;
-	} else {
-		stream->dtls_closed = true;
-		SSL_shutdown(stream->ssl);
+	stream_lock(stream);
+	if (!stream->dtls_up || stream->dtls_closed || stream->dtls_failed ||
+	    !user_take(stream)) {
+		stream_unlock(stream);
+		return -ENOTCONN;
 	}
-	pthread_mutex_unlock(&stream->lock);
+	stream->dtls_closed = true;
+	SSL_shutdown(stream->ssl);
+	stream_unlock(stream);
 
-	return ret;
+	/*
+	 * No wait for a sender on another thread: that sender sends the
+	 * close_notify. From a callback, the wait can deadlock, because that
+	 * sender can wait for the registry mutex that this thread holds.
+	 */
+	queue_drain(stream);
+	user_drop(stream);
+
+	return 0;
 }
 
 void uvt_destroy(struct uvt_stream *stream)
@@ -1045,11 +1403,25 @@ void uvt_destroy(struct uvt_stream *stream)
 	if (!stream)
 		return;
 
-	juice_destroy(stream->agent);
+	/*
+	 * The callbacks ignore a destroying stream. A callback past that check
+	 * ends before juice_destroy() returns: libjuice runs it under its
+	 * registry mutex or on a thread that juice_destroy() joins.
+	 */
+	stream_lock(stream);
+	stream->destroying = true;
+	while (stream->users || stream->draining) {
+		hook_point(stream, __func__);
+		pthread_cond_wait(&stream->drained, &stream->lock);
+	}
+	stream_unlock(stream);
+
+	ice_destroy(stream);
 	stream->agent = NULL;
 	SSL_free(stream->ssl);
 	uvsrtp_destroy(stream->srtp);
 	explicit_bzero(stream->remote_fp, sizeof(stream->remote_fp));
+	pthread_cond_destroy(&stream->drained);
 	pthread_mutex_destroy(&stream->lock);
 	free(stream);
 }

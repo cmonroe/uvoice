@@ -60,13 +60,22 @@ struct uvt_turn {
 };
 
 /*
- * Thread contract. The callbacks run on a library thread. on_rtp and on_rtcp
- * hand over the plaintext of one datagram, valid for the call only. on_event
- * reports one enum uvt_event with its argument: the pending candidate count
- * for UVT_EV_CANDIDATE, the enum uvt_ice_state for UVT_EV_ICE_STATE and 0
- * otherwise. UVT_EV_DTLS_CLOSED says the far end ended the DTLS session in
- * order with a close_notify: no media flows after it, and it is no failure.
- * A callback may call every function of this API except uvt_destroy.
+ * Thread contract. The callbacks run on a library thread. uvt_create(),
+ * uvt_remote_set() and uvt_tick() can also run them on the caller's thread
+ * before they return. on_rtp and on_rtcp hand over the plaintext of one
+ * datagram, valid for the call only. on_event reports one enum uvt_event with
+ * its argument: the pending candidate count for UVT_EV_CANDIDATE, the enum
+ * uvt_ice_state for UVT_EV_ICE_STATE and 0 otherwise. UVT_EV_DTLS_FAIL comes
+ * once per stream. UVT_EV_DTLS_CLOSED says the far end ended the DTLS session
+ * in order with a close_notify: no media flows after it, and it is no failure.
+ *
+ * A callback can call every function of this API except uvt_destroy. A
+ * callback must not wait for a lock that another thread holds across a call
+ * to this API. Most calls can wait for the library thread, and that thread
+ * waits for the callback.
+ *
+ * rtp_dscp and rtcp_dscp are the six-bit DSCP code points (RFC 2474) of the
+ * RTP and RTCP datagrams. DTLS records use rtp_dscp.
  */
 struct uvt_cfg {
 	enum uvt_role role;
@@ -82,15 +91,17 @@ struct uvt_cfg {
 	void (*on_rtcp)(void *user, const uint8_t *buf, size_t len);
 	void (*on_event)(void *user, enum uvt_event ev, int arg);
 	void *user;
+	uint8_t rtp_dscp;
+	uint8_t rtcp_dscp;
 };
 
 struct uvt_stream;
 
 /**
- * uvt_init() - initialise the process-global state
+ * uvt_init() - initialize the process-global state
  *
  * Generates the DTLS certificate of this process, builds the DTLS context and
- * initialises libuvsrtp. Idempotent.
+ * initializes libuvsrtp. Idempotent.
  *
  * Return: 0 on success, or a negative errno.
  */
@@ -110,7 +121,8 @@ int uvt_fingerprint_get(uint8_t out[UVT_FINGERPRINT_LEN]);
  *
  * A controlling stream gathers its candidates at once. A controlled stream
  * gathers once uvt_remote_set() named the far end, so the ICE role follows
- * the order of the two calls.
+ * the order of the two calls. The gathering can run callbacks on the caller's
+ * thread before the call returns.
  *
  * Return: the stream, or NULL on failure.
  */
@@ -124,7 +136,13 @@ struct uvt_stream *uvt_create(const struct uvt_cfg *cfg);
  * @fingerprint: the remote SHA-256 certificate fingerprint
  * @setup: the remote DTLS setup; actpass leaves this side active
  *
- * Return: 0, -EINVAL for a bad credential, or -EALREADY when called twice.
+ * A credential is valid with 4 to 256 (ufrag) or 22 to 256 (pwd) characters
+ * of the ice-char set of RFC 8839 section 5.4: ALPHA, DIGIT, "+" and "/". The
+ * DTLS handshake starts only after the far end is set. A controlled stream
+ * gathers here, and the gathering can run callbacks on the caller's thread.
+ *
+ * Return: 0, -EINVAL for a bad credential, or -EALREADY when another call set
+ * the far end or is setting it.
  */
 int uvt_remote_set(struct uvt_stream *s, const char *ufrag, const char *pwd,
 		   const uint8_t fingerprint[UVT_FINGERPRINT_LEN],
@@ -135,7 +153,11 @@ int uvt_remote_set(struct uvt_stream *s, const char *ufrag, const char *pwd,
  * @s: the stream
  * @sdp: an a=candidate line, with or without the a= prefix
  *
- * Return: 0, or -EINVAL for a line libjuice refused.
+ * A candidate of a type that libjuice does not pair, such as prflx, is
+ * ignored, and the stream goes on with its other candidates.
+ *
+ * Return: 0 for an added or an ignored candidate, -EINVAL for a line
+ * libjuice refused, or -EPIPE once uvt_destroy() runs.
  */
 int uvt_candidate_add(struct uvt_stream *s, const char *sdp);
 
@@ -154,7 +176,7 @@ void uvt_remote_done(struct uvt_stream *s);
  * A controlled stream calls uvt_remote_set() first: libjuice takes the side
  * that describes itself before it knows the far end for the controlling one.
  *
- * Return: 0, or a negative errno.
+ * Return: 0, -EPIPE once uvt_destroy() runs, or another negative errno.
  */
 int uvt_local_get(struct uvt_stream *s, char *ufrag, char *pwd);
 
@@ -174,8 +196,12 @@ int uvt_candidate_next(struct uvt_stream *s, char *out, size_t len);
  * @buf: the plain packet
  * @len: its length
  *
- * Return: 0, -EAGAIN before DTLS is up, -EPIPE once the DTLS session is
- * closed, or another negative errno.
+ * The packet goes into the output queue of the stream. One thread at a time
+ * sends that queue, in order. A queued packet that libjuice refuses is lost.
+ *
+ * Return: 0 for a queued packet, -EAGAIN before DTLS is up, -EPIPE once the
+ * DTLS session ended, -ENOBUFS when the queue is full, or another negative
+ * errno.
  */
 int uvt_send_rtp(struct uvt_stream *s, const uint8_t *buf, size_t len);
 
@@ -185,8 +211,11 @@ int uvt_send_rtp(struct uvt_stream *s, const uint8_t *buf, size_t len);
  * @buf: the plain packet
  * @len: its length
  *
- * Return: 0, -EAGAIN before DTLS is up, -EPIPE once the DTLS session is
- * closed, or another negative errno.
+ * The packet goes into the output queue of the stream, as for uvt_send_rtp().
+ *
+ * Return: 0 for a queued packet, -EAGAIN before DTLS is up, -EPIPE once the
+ * DTLS session ended, -ENOBUFS when the queue is full, or another negative
+ * errno.
  */
 int uvt_send_rtcp(struct uvt_stream *s, const uint8_t *buf, size_t len);
 
@@ -194,7 +223,8 @@ int uvt_send_rtcp(struct uvt_stream *s, const uint8_t *buf, size_t len);
  * uvt_tick() - run the DTLS retransmission timer
  * @s: the stream
  *
- * Call it at least every 100 ms while the handshake runs.
+ * Call it at least every 100 ms while the handshake runs. If the handshake
+ * times out, on_event gets UVT_EV_DTLS_FAIL on the caller's thread.
  */
 void uvt_tick(struct uvt_stream *s);
 
@@ -219,17 +249,21 @@ bool uvt_up(struct uvt_stream *s);
  * uvt_close() - end the DTLS session in order
  * @s: the stream
  *
- * Sends a close_notify to the far end. No media flows after it.
+ * Queues a close_notify to the far end and sends the output queue. If another
+ * thread sends the queue at that time, that thread sends the close_notify. No
+ * media flows after it.
  *
  * Return: 0, or -ENOTCONN when the session is not up.
  */
 int uvt_close(struct uvt_stream *s);
 
 /**
- * uvt_destroy() - release the stream and zeroise its keys
+ * uvt_destroy() - release the stream and zeroize its keys
  * @s: the stream, or NULL
  *
- * Never from a callback.
+ * Waits for a call of this API in progress on another thread. No callback
+ * runs after it returns. Never from a callback. The owner must not start a
+ * call once uvt_destroy() starts.
  */
 void uvt_destroy(struct uvt_stream *s);
 

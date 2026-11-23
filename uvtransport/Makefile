@@ -11,7 +11,7 @@ PKG_LICENSE:=LGPL-2.1-only
 PKG_LICENSE_FILES:=LICENSE
 PKG_MAINTAINER:=John Crispin <john@phrozen.org>
 
-PKG_BUILD_DEPENDS:=libjuice libuvsrtp libopenssl
+PKG_BUILD_DEPENDS:=libjuice uvsrtp openssl
 CMAKE_INSTALL:=1
 
 include $(INCLUDE_DIR)/package.mk
@@ -31,7 +31,7 @@ define Package/libuvtransport
   CATEGORY:=Libraries
   SUBMENU:=Telephony
   TITLE:=ICE and DTLS-SRTP media transport for one stream
-  DEPENDS:=+libjuice +libuvsrtp +libopenssl +libpthread
+  DEPENDS:=+libjuice +libuvsrtp +libopenssl +@OPENSSL_WITH_DTLS +libpthread
   ABI_VERSION:=$(PKG_VERSION)
 endef
 
@@ -39,8 +39,8 @@ define Package/libuvtransport/description
   One ICE agent (libjuice), one DTLS handshake (OpenSSL, RFC 5764) and one
   SRTP context (libuvsrtp) per media stream, behind a small API: create, the
   remote credentials, trickled candidates, send, and callbacks for the
-  received media and the transport events. OpenSSL must be built with DTLS
-  (CONFIG_OPENSSL_WITH_DTLS).
+  received media and the transport events. The package selects DTLS in
+  OpenSSL (CONFIG_OPENSSL_WITH_DTLS).
 endef
 
 define Build/InstallDev

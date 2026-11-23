@@ -45,9 +45,14 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/uvtransport.pc DESTINATION lib/pkgconf
 
 if(UVTRANSPORT_TESTS)
 	enable_testing()
+	# The suite includes uvtransport.c with its test hooks, so the installed
+	# library holds no hook.
 	add_executable(test_uvtransport test/test_uvtransport.c)
+	target_compile_definitions(test_uvtransport PRIVATE UVT_TEST_HOOKS)
 	target_include_directories(test_uvtransport PRIVATE
 				   ${CMAKE_CURRENT_SOURCE_DIR}/include)
-	target_link_libraries(test_uvtransport uvtransport Threads::Threads)
+	target_link_libraries(test_uvtransport LibJuice::LibJuice
+			      PkgConfig::UVSRTP OpenSSL::SSL OpenSSL::Crypto
+			      Threads::Threads)
 	add_test(NAME test_uvtransport COMMAND test_uvtransport)
 endif()
