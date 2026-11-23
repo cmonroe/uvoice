@@ -1344,6 +1344,141 @@ static void ring_duration_test(void)
 	CHECK(relay_balanced());
 }
 
+/* One cadence pair under a ring timing: where the first stop write and the
+ * second start write fall, relative to the first start write. */
+static void ring_cycle_case(uint32_t period_us, uint32_t end_offset_us,
+			    uint16_t on_ms, uint16_t off_ms, uint32_t stop_ms)
+{
+	struct udsp_ring ring;
+	struct line_sim s;
+
+	sim_init(&s, 10, false);
+	sim_to(&s, false, 90);
+	journal_reset();
+	line_ring_timing_set(&s.ring, period_us, end_offset_us, 10);
+	ring_cfg_fill(&ring, on_ms, off_ms);
+	ring_start_at(&s, &ring);
+	sim_to(&s, false, 100 + 2u * (on_ms + off_ms) + 50);
+	CHECK_UINT(rec_stamp(relay_nth(0, true)), 100);
+	CHECK_UINT(rec_stamp(relay_nth(0, false)), 100 + stop_ms);
+	CHECK_UINT(rec_stamp(relay_nth(1, true)), 100 + on_ms + off_ms);
+	CHECK_UINT(rec_stamp(relay_nth(1, false)),
+		   100 + on_ms + off_ms + stop_ms);
+	CHECK_UINT(rec_stamp(relay_nth(2, true)), 100 + 2u * (on_ms + off_ms));
+}
+
+static void ring_cycle_end_test(void)
+{
+	struct udsp_ring ring;
+	struct line_sim s;
+
+	CASE("ring timing: 400 ms at 25 Hz stops at 380 ms");
+	ring_cycle_case(40000, 3500, 400, 200, 380);
+	CASE("ring timing: 800 ms at 25 Hz stops at 780 ms");
+	ring_cycle_case(40000, 3500, 800, 400, 780);
+	CASE("ring timing: 2000 ms at 20 Hz stops at 1970 ms");
+	ring_cycle_case(50000, 4800, 2000, 4000, 1970);
+	CASE("ring timing: 400 ms at 20 Hz stops at 370 ms");
+	ring_cycle_case(50000, 4800, 400, 600, 370);
+	CASE("ring timing: 300 ms at 20 Hz stops at 270 ms");
+	ring_cycle_case(50000, 4800, 300, 200, 270);
+	CASE("ring timing: a tie takes the shorter line burst");
+	ring_cycle_case(40000, 3500, 410, 190, 380);
+	CASE("ring timing: a late stop shortens its break");
+	ring_cycle_case(40000, 3500, 415, 185, 420);
+	CASE("ring timing: a period of 0 keeps the cadence");
+	ring_cycle_case(0, 3500, 400, 200, 400);
+	CASE("ring timing: under a quarter period keeps the cadence");
+	ring_cycle_case(40000, 3500, 10, 190, 10);
+	CASE("ring timing: a quarter period takes one whole cycle");
+	ring_cycle_case(40000, 3500, 15, 185, 20);
+
+	sim_init(&s, 10, false);
+	sim_to(&s, false, 90);
+	journal_reset();
+	line_ring_timing_set(&s.ring, 40000, 3500, 10);
+	ring_cfg_fill(&ring, 400, 200);
+	ring.cadence[1].on_ms = 400;
+	ring.cadence[1].off_ms = 2000;
+	ring.cadence_count = 2;
+	ring_start_at(&s, &ring);
+	sim_to(&s, false, 3700);
+	CASE("ring timing: each break takes the lead of its own burst");
+	CHECK_UINT(rec_stamp(relay_nth(0, false)), 100 + 380);
+	CHECK_UINT(rec_stamp(relay_nth(1, true)), 100 + 600);
+	CHECK_UINT(rec_stamp(relay_nth(1, false)), 100 + 600 + 380);
+	CHECK_UINT(rec_stamp(relay_nth(2, true)), 100 + 3000);
+	CHECK_UINT(rec_stamp(relay_nth(2, false)), 100 + 3000 + 380);
+	CHECK_UINT(rec_stamp(relay_nth(3, true)), 100 + 3600);
+
+	sim_init(&s, 10, false);
+	sim_to(&s, false, 90);
+	journal_reset();
+	line_ring_timing_set(&s.ring, 40000, 3500, 10);
+	ring_cfg_fill(&ring, 400, 200);
+	ring.first[0].on_ms = 200;
+	ring.first[0].off_ms = 400;
+	ring.first_count = 1;
+	ring_start_at(&s, &ring);
+	sim_to(&s, false, 1400);
+	CASE("ring timing: the first cycle table takes the rule too");
+	CHECK_UINT(rec_stamp(relay_nth(0, false)), 100 + 180);
+	CHECK_UINT(rec_stamp(relay_nth(1, true)), 100 + 600);
+	CHECK_UINT(rec_stamp(relay_nth(1, false)), 100 + 600 + 380);
+	CHECK_UINT(rec_stamp(relay_nth(2, true)), 100 + 1200);
+
+	sim_init(&s, 10, false);
+	sim_to(&s, false, 90);
+	journal_reset();
+	line_ring_timing_set(&s.ring, 40000, 3500, 10);
+	ring_cfg_fill(&ring, 400, 200);
+	ring.duration_ms = 250;
+	ring_start_at(&s, &ring);
+	sim_to(&s, false, 800);
+	CASE("ring timing: the duration ends a burst on its own tick");
+	CHECK_UINT(rec_stamp(relay_nth(0, false)), 100 + 250);
+	CHECK_UINT(cmd_total(LINE_CMD_RING_RELAY), 2);
+
+	sim_init(&s, 10, false);
+	sim_to(&s, false, 90);
+	journal_reset();
+	line_ring_timing_set(&s.ring, 50000, 4800, 10);
+	ring_cfg_fill(&ring, 400, 600);
+	ring_start_at(&s, &ring);
+	sim_to(&s, false, 500);
+	line_ring_timing_set(&s.ring, 40000, 3500, 10);
+	sim_to(&s, false, 1600);
+	CASE("ring timing: a live set applies at the next burst");
+	CHECK_UINT(rec_stamp(relay_nth(0, false)), 100 + 370);
+	CHECK_UINT(rec_stamp(relay_nth(1, true)), 100 + 1000);
+	CHECK_UINT(rec_stamp(relay_nth(1, false)), 100 + 1000 + 380);
+
+	sim_init(&s, 10, false);
+	sim_to(&s, false, 90);
+	journal_reset();
+	line_ring_timing_set(&s.ring, 40000, 3500, 10);
+	ring_cfg_fill(&ring, 400, 200);
+	ring_start_at(&s, &ring);
+	sim_to(&s, false, 190);
+	sim_to(&s, true, 400);
+	CASE("ring timing: a ring trip stops the relay on its own tick");
+	CHECK_UINT(rec_stamp(relay_nth(0, false)), 210);
+	CHECK_UINT(cmd_total(LINE_CMD_RING_RELAY), 2);
+
+	sim_init(&s, 10, false);
+	sim_to(&s, false, 90);
+	journal_reset();
+	line_ring_timing_set(&s.ring, 40000, 3500, 10);
+	ring_cfg_fill(&ring, 400, 200);
+	ring_start_at(&s, &ring);
+	sim_to(&s, false, 300);
+	ring_start_at(&s, &ring);
+	sim_to(&s, false, 800);
+	CASE("ring timing: a restart keeps the timing of the line");
+	CHECK_UINT(rec_stamp(relay_nth(1, true)), 310);
+	CHECK_UINT(rec_stamp(relay_nth(1, false)), 310 + 380);
+}
+
 static void ring_trip_test(void)
 {
 	struct udsp_ring ring;
@@ -2308,6 +2443,7 @@ int main(void)
 	hook_overlap_test();
 	hook_recall_lag_test();
 	ring_cadence_test();
+	ring_cycle_end_test();
 	ring_first_cadence_test();
 	ring_duration_test();
 	ring_trip_test();

@@ -83,6 +83,29 @@ static void index_advance(struct line_ring *r, uint8_t count)
 	r->first_cycle = false;
 }
 
+static uint32_t burst_write_ms(const struct line_ring *r, uint32_t on_ms)
+{
+	uint64_t period = r->period_us;
+	uint64_t on_us = (uint64_t)on_ms * 1000u;
+	uint64_t cycles, write_ms;
+
+	if (!period || !r->tick_ms)
+		return on_ms;
+
+	/* the count whose line burst, a quarter period short of it, is nearest
+	 * to on_ms; the lower count on a tie */
+	cycles = (on_us + period / 4u + (period - 1u) / 2u) / period;
+	if (!cycles)
+		return on_ms;
+
+	write_ms = (r->end_offset_us + cycles * period - period / 2u) / 1000u;
+	write_ms -= write_ms % r->tick_ms;
+	if (!write_ms || write_ms > UINT16_MAX)
+		return on_ms;
+
+	return (uint32_t)write_ms;
+}
+
 static void burst_start(struct line_ring *r, uint32_t now_ms, struct line_out *out)
 {
 	const struct udsp_cadence *tbl;
@@ -91,12 +114,23 @@ static void burst_start(struct line_ring *r, uint32_t now_ms, struct line_out *o
 	tbl = table_get(r, &count);
 	r->stage = LINE_RING_BURST;
 	r->phase_ms = now_ms;
-	r->phase_len_ms = tbl[r->index].on_ms;
+	r->phase_len_ms = burst_write_ms(r, tbl[r->index].on_ms);
+	r->lead_ms = (int32_t)tbl[r->index].on_ms - (int32_t)r->phase_len_ms;
 	r->bursts++;
 	relay_set(r, now_ms, true, out);
 	if (r->bursts == 1)
 		line_out_event(out, now_ms, r->line,
 			       UDSP_EV_RING_START)->u.line.ring_count = r->bursts;
+}
+
+static uint16_t break_len_ms(uint32_t off_ms, int32_t lead_ms)
+{
+	int64_t len = (int64_t)off_ms + lead_ms;
+
+	if (len < 0)
+		return 0;
+
+	return len > UINT16_MAX ? UINT16_MAX : (uint16_t)len;
 }
 
 static void burst_run(struct line_ring *r, uint32_t now_ms, struct line_out *out)
@@ -110,7 +144,7 @@ static void burst_run(struct line_ring *r, uint32_t now_ms, struct line_out *out
 	tbl = table_get(r, &count);
 	r->stage = LINE_RING_SILENCE;
 	r->phase_ms = now_ms;
-	r->phase_len_ms = tbl[r->index].off_ms;
+	r->phase_len_ms = break_len_ms(tbl[r->index].off_ms, r->lead_ms);
 	index_advance(r, count);
 }
 
@@ -173,6 +207,14 @@ void line_ring_init(struct line_ring *r, unsigned line)
 	r->line = line;
 }
 
+void line_ring_timing_set(struct line_ring *r, uint32_t period_us,
+			  uint32_t end_offset_us, unsigned tick_ms)
+{
+	r->period_us = period_us;
+	r->end_offset_us = end_offset_us;
+	r->tick_ms = tick_ms > UINT16_MAX ? 0 : (uint16_t)tick_ms;
+}
+
 bool line_ring_active(const struct line_ring *r)
 {
 	return r->stage != LINE_RING_OFF;
@@ -181,6 +223,8 @@ bool line_ring_active(const struct line_ring *r)
 int line_ring_start(struct line_ring *r, const struct udsp_ring *cfg, uint32_t now_ms,
 		    struct line_cid_gate *gate, struct line_out *out)
 {
+	uint32_t period_us = r->period_us, end_offset_us = r->end_offset_us;
+	uint16_t tick_ms = r->tick_ms;
 	unsigned line = r->line;
 
 	if (!cfg->cadence_count)
@@ -196,6 +240,9 @@ int line_ring_start(struct line_ring *r, const struct udsp_ring *cfg, uint32_t n
 		ring_end(r, now_ms, LINE_RING_RESTARTED, gate, out);
 	memset(r, 0, sizeof(*r));
 	r->line = line;
+	r->period_us = period_us;
+	r->end_offset_us = end_offset_us;
+	r->tick_ms = tick_ms;
 	r->cfg = *cfg;
 	r->stage = LINE_RING_SILENCE;
 	r->first_cycle = true;

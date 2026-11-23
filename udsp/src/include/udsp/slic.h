@@ -48,7 +48,7 @@
 
 /* libudsp accepts only this exact version (slic/plugin_load.h), so the
  * plug-in and libudsp ship in one image. */
-#define UDSP_SLIC_ABI_VERSION	9
+#define UDSP_SLIC_ABI_VERSION	10
 #define UDSP_SLIC_SAFE_MAX	256	/* bytes of the pre-framed safe transfer */
 
 enum udsp_linefeed {
@@ -195,6 +195,19 @@ struct udsp_slic_dump_result {
 	uint16_t skip[UDSP_SLIC_DUMP_SKIP_MAX];
 	uint16_t addr[UDSP_SLIC_DUMP_WORDS];
 	uint32_t value[UDSP_SLIC_DUMP_WORDS];
+};
+
+/*
+ * The ring timing of the ring preset a channel holds, filled by ring_timing.
+ * The part ends a ring burst only at end_offset_us plus a whole number of
+ * period_us after the write of ring_start, whenever ring_stop arrives, and a
+ * ring_stop that arrives too close ahead of such a point rings one period
+ * more. period_us 0 means the plug-in does not know the timing of the preset,
+ * and the host then times each burst as its cadence gives it.
+ */
+struct udsp_slic_ring_timing {
+	uint32_t period_us;
+	uint32_t end_offset_us;
 };
 
 struct udsp_slic;
@@ -349,6 +362,14 @@ struct udsp_slic_ops {
 	 * bit-banged bus. Runs on the slic thread (rule 1). */
 	int (*dump)(struct udsp_slic *s, unsigned chan, uint8_t kind,
 		    struct udsp_slic_dump_result *out);
+
+	/* Nullable. The ring timing of the preset the channel holds now. The
+	 * answer moves with region_set, so the host reads it after init and
+	 * after every region_set. -EINVAL for a channel the plug-in does not
+	 * have; *out is then untouched. Writes nothing to the part. Runs on
+	 * the slic thread (rule 1). NULL means no timing, like period_us 0. */
+	int (*ring_timing)(struct udsp_slic *s, unsigned chan,
+			   struct udsp_slic_ring_timing *out);
 };
 
 /* The exported, versioned descriptor libudsp dlsym's and validates. */

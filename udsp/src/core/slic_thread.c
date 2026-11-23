@@ -1582,6 +1582,23 @@ static int slic_job_attach(struct udsp *s)
 }
 
 /*
+ * The ring preset moves with init and with region_set, and its timing with
+ * it, so both read it again. A region_set that failed can leave either preset
+ * on the part; the plug-in answers for the one it holds, or with no timing.
+ */
+static void slic_ring_timing_read(struct udsp *s, struct udsp_chan *c)
+{
+	struct udsp_slic_ring_timing t = { 0, 0 };
+	uint_least64_t pair;
+
+	if (!s->ops->ring_timing || s->ops->ring_timing(s->slic, c->line, &t))
+		t.period_us = 0;
+
+	pair = (uint_least64_t)t.period_us << 32 | t.end_offset_us;
+	atomic_store_explicit(&c->ring_timing, pair, memory_order_release);
+}
+
+/*
  * region_set runs ProSLIC_ZsynthSetup, which resets the gain RAM to the
  * impedance preset's 0 dB plan; a failed gain re-apply inside region_set
  * leaves the RAM at that default while gain_confirmed still claims the old
@@ -1597,6 +1614,7 @@ static int slic_region_line_set(struct udsp *s, struct udsp_chan *c,
 	int rc = s->ops->region_set(s->slic, c->line, iso3);
 
 	atomic_store_explicit(&c->gain_confirmed, 0u, memory_order_release);
+	slic_ring_timing_read(s, c);
 
 	return rc;
 }
@@ -1684,6 +1702,7 @@ static void slic_line_up(struct udsp *s, struct udsp_chan *c)
 	c->relay_on = false;
 	c->lamp_on = false;
 	c->live = true;
+	slic_ring_timing_read(s, c);
 	slic_region_line_start(s, c, udsp_region_active(s));
 }
 

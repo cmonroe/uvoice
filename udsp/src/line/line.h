@@ -569,9 +569,33 @@ struct line_ring {
 	uint32_t phase_ms;
 	uint32_t start_ms;
 	uint32_t cid_open_ms;
+	/* what the stop write of the burst in progress leads its on_ms by,
+	 * which the break after it gets back; negative for a long burst */
+	int32_t lead_ms;
+	/* line_ring_timing_set; period_us 0 writes each stop at its on_ms */
+	uint32_t period_us;
+	uint32_t end_offset_us;
+	uint16_t tick_ms;
 };
 
 void line_ring_init(struct line_ring *r, unsigned line);
+/*
+ * The ring timing of the SLIC (slic.h struct udsp_slic_ring_timing) and the
+ * tick the caller drives line_ring_tick at. The part ends a burst only at
+ * end_offset_us plus a whole number of periods after the start write, and the
+ * line carries the ring for a quarter period less than that count. So the
+ * stop write of a burst goes half a period before the end point whose line
+ * burst is nearest to on_ms, on the tick at or before that time, and the
+ * break after it takes the difference, which keeps every burst start at its
+ * nominal time. Half a period keeps the write clear of the end point before
+ * it and of the lead the part needs ahead of the one it aims at.
+ *
+ * The values are state of the line, not of a session: they outlive
+ * line_ring_start, a set over a live session applies at its next burst start,
+ * and period_us 0 turns the rule off.
+ */
+void line_ring_timing_set(struct line_ring *r, uint32_t period_us,
+			  uint32_t end_offset_us, unsigned tick_ms);
 /*
  * -EINVAL on an empty or oversized cadence table, and then the running session
  * is untouched. Over a live session, a valid start ends that session cleanly

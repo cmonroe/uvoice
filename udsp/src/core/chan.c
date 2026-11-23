@@ -2223,6 +2223,20 @@ static int chan_cid_arm(struct udsp_chan *c, enum udsp_cid_kind kind,
 	return rc;
 }
 
+/*
+ * A region write in a break of a live ring session moves the ring preset of
+ * the part, so the ring machine takes the timing ahead of every tick and not
+ * once per session. It applies the pair at the next burst start.
+ */
+static void chan_ring_timing_sync(struct udsp_chan *c)
+{
+	uint_least64_t t = atomic_load_explicit(&c->ring_timing,
+						memory_order_acquire);
+
+	line_ring_timing_set(&c->ring, (uint32_t)(t >> 32), (uint32_t)t,
+			     UDSP_TICK_MS);
+}
+
 static int chan_ring_start(struct udsp *s, struct udsp_chan *c,
 			   const struct udsp_ring *ring, uint32_t now_ms)
 {
@@ -2232,6 +2246,7 @@ static int chan_ring_start(struct udsp *s, struct udsp_chan *c,
 	if (ring->cid_present && !r)
 		return -ENOTSUP;
 
+	chan_ring_timing_sync(c);
 	rc = line_ring_start(&c->ring, ring, now_ms, &c->gate, &c->out);
 	if (rc)
 		return rc;
@@ -3169,6 +3184,7 @@ static void chan_machines_run(struct udsp *s, struct udsp_chan *c,
 	if (rep.measured)
 		hook_trace_open_push(s, c, stamp_ms, &rep);
 
+	chan_ring_timing_sync(c);
 	line_ring_tick(&c->ring, stamp_ms, &rep, &c->gate, &c->out);
 	line_cidseq_tick(&c->cid, stamp_ms, &rep, &c->gate, &c->out);
 	line_hook_emit(&rep, c->line, stamp_ms, &c->out);

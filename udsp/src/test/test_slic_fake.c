@@ -719,16 +719,32 @@ static void abi9_cases_run(void)
 	CHECK(ops->mlt_run != NULL);
 	CHECK(ops->monitor_read != NULL);
 	CHECK(ops->hook_read_moved != NULL);
-	for (unsigned i = 0; i < 12; i++) {
+	for (unsigned i = 0; i < 14; i++) {
 		uint32_t mask = UDSP_SLIC_FAKE_OPT_ALL & ~(1u << i);
 
 		udsp_slic_fake_optional_set(mask);
-		CHECK(ops->dump != NULL);
+		CHECK((ops->dump != NULL) == (i != 12));
 	}
 	udsp_slic_fake_optional_set(0);
 	CHECK(ops->dump == NULL);
 	udsp_slic_fake_reset();
 	CHECK(ops->dump != NULL);
+
+	CASE("a cleared ring timing bit removes that op alone");
+	for (unsigned i = 0; i < 14; i++) {
+		uint32_t mask = UDSP_SLIC_FAKE_OPT_ALL & ~(1u << i);
+
+		udsp_slic_fake_optional_set(mask);
+		CHECK((ops->ring_timing != NULL) == (i != 13));
+	}
+	udsp_slic_fake_optional_set(UDSP_SLIC_FAKE_OPT_ALL &
+				    ~(uint32_t)UDSP_SLIC_FAKE_OPT_RING_TIMING);
+	CHECK(ops->dump != NULL);
+	CHECK(ops->region_set != NULL);
+	udsp_slic_fake_optional_set(0);
+	CHECK(ops->ring_timing == NULL);
+	udsp_slic_fake_reset();
+	CHECK(ops->ring_timing != NULL);
 }
 
 int main(void)
@@ -1087,6 +1103,40 @@ int main(void)
 		CHECK(st.gain_tx_half_db == -6);
 		CHECK(st.gain_rx_half_db == 4);
 		CHECK_UINT(st.gain_count, 1);
+		ops->detach(s);
+	}
+
+	CASE("ring_timing answers no timing until a test sets one");
+	{
+		unsigned n = 0;
+		struct udsp_slic *s = attach_fresh(2, &n);
+		struct udsp_slic_ring_timing t = { 7, 7 };
+		struct udsp_slic_fake_chan_state st;
+
+		CHECK(ops->ring_timing != NULL);
+		CHECK(ops->ring_timing(s, 1, &t) == 0);
+		CHECK_UINT(t.period_us, 0);
+		CHECK_UINT(t.end_offset_us, 0);
+
+		udsp_slic_fake_ring_timing_set(40000, 3500);
+		CHECK(ops->ring_timing(s, 1, &t) == 0);
+		CHECK_UINT(t.period_us, 40000);
+		CHECK_UINT(t.end_offset_us, 3500);
+		CHECK(udsp_slic_fake_chan_state_get(s, 1, &st));
+		CHECK_UINT(st.ring_timing_count, 2);
+		CHECK(udsp_slic_fake_chan_state_get(s, 0, &st));
+		CHECK_UINT(st.ring_timing_count, 0);
+
+		t.period_us = 7;
+		CHECK(ops->ring_timing(s, 2, &t) == -EINVAL);
+		CHECK(ops->ring_timing(s, 0, NULL) == -EINVAL);
+		CHECK_UINT(t.period_us, 7);
+		ops->detach(s);
+
+		udsp_slic_fake_reset();
+		s = attach_fresh(2, &n);
+		CHECK(ops->ring_timing(s, 0, &t) == 0);
+		CHECK_UINT(t.period_us, 0);
 		ops->detach(s);
 	}
 

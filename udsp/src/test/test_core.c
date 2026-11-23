@@ -1095,6 +1095,29 @@ static bool tc_up_line(struct eh *t, const char *region, unsigned ports,
 	return tc_start(t);
 }
 
+/* One USA line over a fake whose ring timing op is absent, or answers the
+ * given pair. tc_up_line resets the fake, so the choice is made here. */
+static bool tc_up_ring_timing(struct eh *t, bool op, uint32_t period_us,
+			      uint32_t end_offset_us)
+{
+	uint32_t opt = UDSP_SLIC_FAKE_OPT_ALL;
+	struct udsp_config cfg;
+
+	tc_backend_reset();
+	udsp_slic_fake_reset();
+	if (!op)
+		opt &= ~(uint32_t)UDSP_SLIC_FAKE_OPT_RING_TIMING;
+	udsp_slic_fake_optional_set(opt);
+	udsp_slic_fake_ring_timing_set(period_us, end_offset_us);
+	udsp_tdm_override(&tc_ops);
+	tc_cfg(&cfg, "tc", "USA");
+	cfg.populated_ports = 1;
+	if (!tc_open_handle(t, &cfg))
+		return false;
+
+	return tc_start(t);
+}
+
 static bool tc_up_rate(struct eh *t, const char *region, unsigned ports,
 		       unsigned rate)
 {
@@ -1268,6 +1291,15 @@ static bool tc_state(struct eh *t, unsigned chan,
 	tc_quiesce(t);
 
 	return udsp_slic_fake_chan_state_get(t->s->slic, chan, out);
+}
+
+/* Whether line 0 of the fake took at least *arg ring stops. */
+static bool tc_ring_stops_reached(struct eh *t, const void *arg)
+{
+	struct udsp_slic_fake_chan_state st;
+	const unsigned *want = arg;
+
+	return tc_state(t, 0, &st) && st.ring_stop_count >= *want;
 }
 
 static void tc_journal(struct eh *t)
@@ -10194,8 +10226,73 @@ static void case_slic_region(void)
 		CHECK(tc_state(&t, 0, &st));
 		CHECK_UINT(st.region_count, 2);
 		CHECK(strcmp(st.region_iso3, "GBR") == 0);
+		/* the ring timing is read once at the line up and once behind
+		 * every region write */
+		CHECK_UINT(st.ring_timing_count,
+			   st.init_count + st.region_count);
 		tc_free(&t);
 		udsp_tdm_override(NULL);
+	}
+
+	CASE("a SLIC without the ring timing op starts and rings");
+	{
+		struct udsp_ring ring;
+
+		if (!tc_up_ring_timing(&t, false, 0, 0)) {
+			CHECK(false);
+			return;
+		}
+		tc_ring_fill(&ring, 200, 300, 700);
+		CHECK(udsp_ring_start(t.s, 0, &ring) == UDSP_OK);
+		eh_wait_ms(&t, 900);
+		CHECK(tc_stop(&t));
+		CHECK(tc_state(&t, 0, &st));
+		CHECK_UINT(st.ring_timing_count, 0);
+		CHECK_UINT(st.ring_start_count, 2);
+		CHECK_UINT(st.ring_stop_count, 2);
+		tc_free(&t);
+		udsp_tdm_override(NULL);
+		udsp_slic_fake_optional_set(UDSP_SLIC_FAKE_OPT_ALL);
+	}
+
+	CASE("a ring timing of the SLIC reaches the ring cadence");
+	{
+		struct eh_gate gate = { .fd = { -1, -1 } };
+		struct udsp_ring ring;
+		unsigned stops = 1;
+
+		/* A timing far from any real part puts the two answers 31 s of
+		 * engine time apart: a period of 10 s and an end offset of
+		 * 30 s move the stop write of a 4 s burst to 35 s. The gate
+		 * holds the tick, so the two reads below do not depend on how
+		 * fast the engine ran. */
+		if (!tc_up_ring_timing(&t, true, 10000000, 30000000)) {
+			CHECK(false);
+			return;
+		}
+		tc_ring_fill(&ring, 4000, 6000, 0);
+		CHECK(udsp_ring_start(t.s, 0, &ring) == UDSP_OK);
+		if (!eh_gate_park(&gate) || !eh_gate_step(&gate, 500)) {
+			CHECK(false);
+			goto ring_timing_out;
+		}
+		/* 5 s or more into the burst: the cadence alone stops at 4 s */
+		CHECK(tc_state(&t, 0, &st));
+		CHECK_UINT(st.ring_start_count, 1);
+		CHECK_UINT(st.ring_stop_count, 0);
+		if (!eh_gate_step(&gate, 3400)) {
+			CHECK(false);
+			goto ring_timing_out;
+		}
+		CHECK(tc_poll_until(&t, tc_ring_stops_reached, &stops, 5000));
+	ring_timing_out:
+		eh_gate_disarm(&gate);
+		CHECK(udsp_ring_stop(t.s, 0) == UDSP_OK);
+		CHECK(tc_stop(&t));
+		tc_free(&t);
+		eh_gate_close(&gate);
+		udsp_tdm_override(NULL);
+		udsp_slic_fake_ring_timing_set(0, 0);
 	}
 
 	CASE("a restart re-programs the SLIC region");
@@ -10240,6 +10337,8 @@ static void case_slic_region(void)
 		CHECK(tc_state(&t, 0, &st));
 		CHECK_UINT(st.region_count, 3);
 		CHECK(strcmp(st.region_iso3, "GBR") == 0);
+		CHECK_UINT(st.ring_timing_count,
+			   st.init_count + st.region_count);
 		tc_free(&t);
 		udsp_tdm_override(NULL);
 	}

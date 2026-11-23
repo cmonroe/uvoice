@@ -131,6 +131,7 @@ static unsigned fake_channels_default = 2;
  * has, so it claims the capability by default and a case clears it to drive the
  * rate degrade. */
 static bool fake_wideband = true;
+static _Atomic uint_least64_t fake_ring_timing_word;
 
 /* The length mlt_run reports, negative for the true one (fake.h). A test
  * writes it from its control thread while the slic thread runs the op. */
@@ -818,6 +819,25 @@ static uint32_t fake_caps_get(struct udsp_slic *s)
 	return fake_wideband ? UDSP_SLIC_CAP_WIDEBAND : 0u;
 }
 
+static int fake_ring_timing(struct udsp_slic *s, unsigned chan,
+			    struct udsp_slic_ring_timing *out)
+{
+	struct udsp_slic_fake_chan_state *c = chan_get(s, chan);
+	uint_least64_t t;
+
+	if (!c || !out)
+		return -EINVAL;
+
+	pthread_mutex_lock(&s->chan_lock);
+	c->ring_timing_count++;
+	pthread_mutex_unlock(&s->chan_lock);
+	t = atomic_load_explicit(&fake_ring_timing_word, memory_order_acquire);
+	out->period_us = (uint32_t)(t >> 32);
+	out->end_offset_us = (uint32_t)t;
+
+	return 0;
+}
+
 static int fake_region_set(struct udsp_slic *s, unsigned chan, const char *iso3)
 {
 	struct udsp_slic_fake_chan_state *c;
@@ -954,6 +974,7 @@ static struct udsp_slic_ops fake_ops = {
 	.converter_read = fake_converter_read,
 	.hook_read_moved = fake_hook_read_moved,
 	.dump = fake_dump,
+	.ring_timing = fake_ring_timing,
 };
 
 const struct udsp_slic_descriptor udsp_slic_fake_descriptor = {
@@ -983,6 +1004,8 @@ void udsp_slic_fake_optional_set(uint32_t opt_mask)
 	fake_ops.hook_read_moved = (m & UDSP_SLIC_FAKE_OPT_HOOK_MOVED) ?
 		fake_hook_read_moved : NULL;
 	fake_ops.dump = (m & UDSP_SLIC_FAKE_OPT_DUMP) ? fake_dump : NULL;
+	fake_ops.ring_timing = (m & UDSP_SLIC_FAKE_OPT_RING_TIMING) ?
+		fake_ring_timing : NULL;
 }
 
 void udsp_slic_fake_channels_set(unsigned channels)
@@ -993,6 +1016,13 @@ void udsp_slic_fake_channels_set(unsigned channels)
 void udsp_slic_fake_wideband_set(bool on)
 {
 	fake_wideband = on;
+}
+
+void udsp_slic_fake_ring_timing_set(uint32_t period_us, uint32_t end_offset_us)
+{
+	atomic_store_explicit(&fake_ring_timing_word,
+			      (uint_least64_t)period_us << 32 | end_offset_us,
+			      memory_order_release);
 }
 
 void udsp_slic_fake_mlt_len_set(int len)
@@ -1010,6 +1040,7 @@ void udsp_slic_fake_reset(void)
 	memset(&fake_bus, 0, sizeof(fake_bus));
 	udsp_slic_fake_channels_set(2);
 	udsp_slic_fake_wideband_set(true);
+	udsp_slic_fake_ring_timing_set(0, 0);
 	udsp_slic_fake_mlt_len_set(-1);
 	udsp_slic_fake_dump_count_set(-1);
 	udsp_slic_fake_optional_set(UDSP_SLIC_FAKE_OPT_ALL);

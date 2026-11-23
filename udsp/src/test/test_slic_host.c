@@ -26,7 +26,7 @@
 #include "plugin_load.h"
 #include "util.h"
 
-#define OPS_SLOTS	25
+#define OPS_SLOTS	26
 #define TPATH_MAX	256
 #define SEG_SPEED	500000
 #define SEG_BITS	8

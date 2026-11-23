@@ -106,7 +106,8 @@ enum udsp_slic_fake_opt {
 	 * which the engine samples by level alone. */
 	UDSP_SLIC_FAKE_OPT_HOOK_MOVED	= (1u << 11),
 	UDSP_SLIC_FAKE_OPT_DUMP		= (1u << 12),
-	UDSP_SLIC_FAKE_OPT_ALL		= 0x1fffu,
+	UDSP_SLIC_FAKE_OPT_RING_TIMING	= (1u << 13),
+	UDSP_SLIC_FAKE_OPT_ALL		= 0x3fffu,
 };
 
 /* One journal row. arg0 and arg1 carry the op's own arguments: the linefeed,
@@ -149,6 +150,7 @@ struct udsp_slic_fake_chan_state {
 	unsigned loopback_count;
 	unsigned mlt_count;
 	unsigned region_count;
+	unsigned ring_timing_count;
 	/* reinit clears every fault bit and converter_restart the DCDC
 	 * bit alone, in this record and in the injected fault cell
 	 * (udsp_slic_fake_fault_set), the way the part's own recovery clears
@@ -191,6 +193,9 @@ void udsp_slic_fake_optional_set(uint32_t opt_mask);
  * UDSP_SLIC_CAP_WIDEBAND, so host CI reaches the 16 kHz line; false drives the
  * rate degrade. */
 void udsp_slic_fake_wideband_set(bool on);
+/* What ring_timing answers on every channel. 0 and 0, the reset default,
+ * report no timing, so the ring cadence of a test keeps its nominal times. */
+void udsp_slic_fake_ring_timing_set(uint32_t period_us, uint32_t end_offset_us);
 
 /* A host with no bus behind it. spi_xfer is the one bus primitive: it keeps the
  * last transfer's tx bytes and fills rx with a canned value, because a dumb

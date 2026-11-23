@@ -493,6 +493,15 @@ struct udsp_chan {
 	 */
 	_Atomic uint_least8_t lf_confirmed;	/* enum udsp_linefeed */
 	/*
+	 * The ring timing the slic thread read from the plug-in after the last
+	 * init or region write of the line (slic.h ring_timing), which the
+	 * tick hands to the ring machine. One word, period_us in the high half
+	 * and end_offset_us in the low half, so the tick never pairs the
+	 * period of one preset with the offset of another. A period of 0: the
+	 * plug-in gave none.
+	 */
+	_Atomic uint_least64_t ring_timing;
+	/*
 	 * The feed write in flight. The tick bumps lf_seq_emit for every
 	 * linefeed, polarity or ring relay record it queues
 	 * (slic_thread.h slic_rec_seq_carried). The slic thread stores the
