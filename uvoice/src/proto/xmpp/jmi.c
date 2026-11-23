@@ -70,6 +70,9 @@ static unsigned int carbon_unwrap(const struct xml_doc *doc,
 		return XML_NONE;
 
 	out->carbon = true;
+	if (!str_copy_whole(out->wrapper_from, sizeof(out->wrapper_from),
+			    xml_attr_get(doc, 0, "from")))
+		return XML_NONE;
 	forwarded = xml_child(doc, wrapper, "forwarded", XMPP_NS_FORWARD);
 	if (forwarded == XML_NONE)
 		return XML_NONE;
@@ -103,14 +106,12 @@ bool jmi_parse(const struct xml_doc *message, struct jmi_msg *out)
 		return false;
 
 	id = xml_attr_get(message, child, "id");
-	if (!id || !id[0])
-		return false;
-	str_copy(out->id, sizeof(out->id), id);
-
 	from = xml_attr_get(message, node, "from");
 	to = xml_attr_get(message, node, "to");
-	str_copy(out->from, sizeof(out->from), from ? from : "");
-	str_copy(out->to, sizeof(out->to), to ? to : "");
+	if (!id || !id[0] || !str_copy_whole(out->id, sizeof(out->id), id) ||
+	    !str_copy_whole(out->from, sizeof(out->from), from) ||
+	    !str_copy_whole(out->to, sizeof(out->to), to))
+		return false;
 
 	description = xml_child(message, child, "description", JINGLE_NS_RTP);
 	media = description == XML_NONE ? NULL :

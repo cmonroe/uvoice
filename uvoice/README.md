@@ -261,16 +261,40 @@ outbound call rings every device of the callee, an inbound call rings
 every device of the account, and the device that answers first takes the
 call. The other devices stop with the reason `answered_elsewhere`.
 
+Any JID can call an xmpp line, as any caller can call a SIP line. The roster
+gives the name of a known caller and does not filter calls. Before an
+inbound call rings, the line checks in this order:
+
+1. DSP is ready.
+2. Backend supports ICE and DTLS-SRTP.
+3. The line is in service.
+4. No SIP call of the line is up. A line that changes its account type keeps
+   its SIP calls until they end. A call refused for this reason gets the
+   reason `busy`.
+5. Do-not-disturb is off. A call refused by do-not-disturb gets the reason
+   `busy`.
+
+If a check fails, the caller gets a refusal and the line does not ring. In
+the same way, a new SIP INVITE gets 486 while a Jingle call of the line is
+up.
+
+An enabled xmpp line reports a line fault if the image has no XMPP, or if
+the line has no `xmpp_jid` or no `xmpp_password`. The `accounts` verb
+reports the configured type of each line.
+
 A dialled string with an `@` is a JID. Digits map through
 `xmpp_speed_dial_0` to `xmpp_speed_dial_9`, each `digits=jid`. The ubus
 verb `roster` lists the contacts of the account for a user interface.
 
 The media transport takes its STUN and TURN servers from the server
 (XEP-0215) and from `xmpp_stun`, `xmpp_turn`, `xmpp_turn_user` and
-`xmpp_turn_password`, each `host[:port]`. A call whose connectivity checks
-fail while no TURN relay is known reports a line fault, so the operator
-learns that a relay is missing. The status verb carries an `xmpp` table
-per line with the stream state, the relays and the Jingle legs.
+`xmpp_turn_password`, each `host[:port]`. TURN credentials of the server
+expire. The account asks the server again one minute before the first
+expiry, and a new call does not use expired credentials. A call whose
+connectivity checks fail while no TURN relay is known reports a line
+fault, so the operator learns that a relay is missing. The status verb
+returns an `xmpp` table per line with the stream state, the relays and the
+Jingle legs.
 
 The host build takes `-DUVOICE_XMPP=ON` and needs `expat`, `libjuice`,
 `libuvsrtp` and the `uvtransport` library of this repository with their

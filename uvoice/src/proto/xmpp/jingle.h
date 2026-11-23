@@ -135,7 +135,7 @@ struct jingle_candidate {
 /*
  * The ICE-UDP transport with its DTLS fingerprint. fp_present says the
  * fingerprint was a SHA-256 one this layer could read, with its setup.
- * candidates_dropped says the element held more than fit.
+ * candidates_dropped counts the candidates past the ones that fit.
  */
 struct jingle_transport {
 	char ufrag[JINGLE_UFRAG_MAX];
@@ -145,7 +145,7 @@ struct jingle_transport {
 	enum jingle_setup setup;
 	struct jingle_candidate candidate[JINGLE_CANDIDATES_MAX];
 	unsigned int candidates;
-	bool candidates_dropped;
+	unsigned int candidates_dropped;
 };
 
 /*
@@ -256,7 +256,7 @@ enum jingle_setup jingle_setup_of(const char *name);
  * @out: receives the values, cleared first
  *
  * Return: true when the iq is of type set and carries a jingle element with
- * an action this layer knows and a sid.
+ * an action this layer knows and a sid that fits JINGLE_SID_MAX.
  */
 bool jingle_parse(const struct xml_doc *iq, struct jingle_msg *out);
 
@@ -266,6 +266,10 @@ bool jingle_parse(const struct xml_doc *iq, struct jingle_msg *out);
  * @node: the candidate element
  * @out: receives the line
  * @len: capacity of @out
+ *
+ * The candidate must be component 1 over udp, of type host, srflx, prflx
+ * or relay, with a port from 1 to 65535. It names a related address with a
+ * port from 0 to 65535, or neither of the two.
  *
  * Return: true when the element carried what the line needs.
  */

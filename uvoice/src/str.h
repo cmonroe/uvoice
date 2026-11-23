@@ -12,13 +12,14 @@
  * width field that may carry no terminator reads past its end here, so such
  * a field keeps its own bounded-read copy.
  *
- * The header carries only the two libc includes it needs, so a libc-only unit
+ * The header has only the libc includes it needs, so a libc-only unit
  * (the star code table) can share the helper without pulling the daemon
  * headers.
  */
 #ifndef UVOICE_STR_H
 #define UVOICE_STR_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
 
@@ -35,6 +36,26 @@ static inline void str_copy(char *dst, size_t len, const char *src)
 	if (n)
 		memcpy(dst, src, n);
 	dst[n] = '\0';
+}
+
+/*
+ * The copy of a value that must not be cut, such as an identity a later
+ * compare reads. A source that does not fit leaves dst empty and answers
+ * false. A NULL src is the empty string.
+ */
+static inline bool str_copy_whole(char *dst, size_t len, const char *src)
+{
+	if (!len)
+		return false;
+
+	if (src && strlen(src) >= len) {
+		dst[0] = '\0';
+		return false;
+	}
+
+	str_copy(dst, len, src);
+
+	return true;
 }
 
 #endif

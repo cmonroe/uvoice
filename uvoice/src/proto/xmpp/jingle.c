@@ -6,6 +6,7 @@
  * Licensed under GPL-2.0-only with the linking exception stated in LICENSE.
  */
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -168,7 +169,7 @@ static void attr_copy(const struct xml_doc *doc, unsigned int node,
  * @name: the attribute
  * @out: receives the number
  *
- * Return: true when the attribute was a decimal number.
+ * Return: true when the attribute was a decimal number that fits @out.
  */
 static bool attr_uint(const struct xml_doc *doc, unsigned int node,
 		      const char *name, unsigned long *out)
@@ -179,9 +180,10 @@ static bool attr_uint(const struct xml_doc *doc, unsigned int node,
 	if (!value || !isdigit((unsigned char)value[0]))
 		return false;
 
+	errno = 0;
 	*out = strtoul(value, &end, 10);
 
-	return *end == 0;
+	return *end == 0 && errno != ERANGE;
 }
 
 /**
@@ -244,6 +246,26 @@ void jingle_fingerprint_text(const uint8_t fp[JINGLE_FP_LEN], char *out,
 	}
 }
 
+/**
+ * candidate_type_known() - whether a candidate type is one of RFC 8445
+ * @type: the type attribute
+ *
+ * Return: true for host, srflx, prflx and relay.
+ */
+static bool candidate_type_known(const char *type)
+{
+	static const char *const types[] = { "host", "srflx", "prflx",
+					     "relay" };
+	unsigned int i;
+
+	for (i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
+		if (!strcasecmp(type, types[i]))
+			return true;
+	}
+
+	return false;
+}
+
 bool jingle_candidate_sdp(const struct xml_doc *doc, unsigned int node,
 			  char *out, size_t len)
 {
@@ -253,19 +275,26 @@ bool jingle_candidate_sdp(const struct xml_doc *doc, unsigned int node,
 	const char *type = xml_attr_get(doc, node, "type");
 	const char *rel_addr = xml_attr_get(doc, node, "rel-addr");
 	unsigned long component, priority, port, rel_port, generation;
+	bool rel_port_valid = attr_uint(doc, node, "rel-port", &rel_port) &&
+			      rel_port <= 65535;
 	char tail[JINGLE_TOKEN_MAX * 2];
 	int wrote;
 
 	if (!foundation || !protocol || !ip || !type ||
-	    !attr_uint(doc, node, "component", &component) ||
+	    !attr_uint(doc, node, "component", &component) || component != 1 ||
+	    strcasecmp(protocol, "udp") || !candidate_type_known(type) ||
 	    !attr_uint(doc, node, "priority", &priority) ||
-	    !attr_uint(doc, node, "port", &port) || port > 65535 ||
+	    !attr_uint(doc, node, "port", &port) || !port || port > 65535 ||
 	    strpbrk(ip, " \t\r\n") || strpbrk(foundation, " \t\r\n"))
 		return false;
 
+	if (rel_addr && (!rel_port_valid || strpbrk(rel_addr, " \t\r\n")))
+		return false;
+	if (!rel_addr && xml_attr_get(doc, node, "rel-port"))
+		return false;
+
 	tail[0] = 0;
-	if (rel_addr && attr_uint(doc, node, "rel-port", &rel_port) &&
-	    !strpbrk(rel_addr, " \t\r\n"))
+	if (rel_addr)
 		snprintf(tail, sizeof(tail), " raddr %s rport %lu", rel_addr,
 			 rel_port);
 
@@ -286,12 +315,36 @@ bool jingle_candidate_sdp(const struct xml_doc *doc, unsigned int node,
 }
 
 /**
+ * attr_count() - an optional positive numeric attribute
+ * @doc: the tree
+ * @node: the element
+ * @name: the attribute
+ * @max: the largest value the field holds
+ * @out: receives the number, 0 when the attribute is absent
+ *
+ * Return: false when the attribute is present but no number from 1 to @max.
+ */
+static bool attr_count(const struct xml_doc *doc, unsigned int node,
+		       const char *name, unsigned long max, unsigned long *out)
+{
+	*out = 0;
+	if (!xml_attr_get(doc, node, name))
+		return true;
+
+	return attr_uint(doc, node, name, out) && *out && *out <= max;
+}
+
+/**
  * payload_parse() - one <payload-type/>
  * @doc: the tree
  * @node: the element
  * @out: receives the values
  *
- * Return: true when the element carried an id.
+ * An absent clockrate or channels reads as 0, the default of the codec. A
+ * present one that is not a usable number refuses the element, because 0
+ * would turn it into that default.
+ *
+ * Return: true when the element had an id and readable numbers.
  */
 static bool payload_parse(const struct xml_doc *doc, unsigned int node,
 			  struct jingle_payload *out)
@@ -299,15 +352,15 @@ static bool payload_parse(const struct xml_doc *doc, unsigned int node,
 	unsigned long id, clockrate, channels;
 
 	memset(out, 0, sizeof(*out));
-	if (!attr_uint(doc, node, "id", &id) || id > 127)
+	if (!attr_uint(doc, node, "id", &id) || id > 127 ||
+	    !attr_count(doc, node, "clockrate", UINT32_MAX, &clockrate) ||
+	    !attr_count(doc, node, "channels", UINT8_MAX, &channels))
 		return false;
 
 	out->id = (uint8_t)id;
 	attr_copy(doc, node, "name", out->name, sizeof(out->name));
-	if (attr_uint(doc, node, "clockrate", &clockrate))
-		out->clockrate = (uint32_t)clockrate;
-	if (attr_uint(doc, node, "channels", &channels) && channels <= 255)
-		out->channels = (uint8_t)channels;
+	out->clockrate = (uint32_t)clockrate;
+	out->channels = (uint8_t)channels;
 
 	return true;
 }
@@ -364,6 +417,9 @@ static void fingerprint_parse(const struct xml_doc *doc, unsigned int node,
  * @doc: the tree
  * @node: the transport element
  * @out: the content
+ *
+ * A ufrag or a pwd that does not fit its field refuses the transport, which
+ * then reads as absent: a cut credential would fail the checks later.
  */
 static void transport_parse(const struct xml_doc *doc, unsigned int node,
 			    struct jingle_content *out)
@@ -372,9 +428,13 @@ static void transport_parse(const struct xml_doc *doc, unsigned int node,
 	struct jingle_candidate *slot;
 	unsigned int child;
 
+	if (!str_copy_whole(ice->ufrag, sizeof(ice->ufrag),
+			    xml_attr_get(doc, node, "ufrag")) ||
+	    !str_copy_whole(ice->pwd, sizeof(ice->pwd),
+			    xml_attr_get(doc, node, "pwd")))
+		return;
+
 	out->transport = true;
-	attr_copy(doc, node, "ufrag", ice->ufrag, sizeof(ice->ufrag));
-	attr_copy(doc, node, "pwd", ice->pwd, sizeof(ice->pwd));
 
 	child = xml_child(doc, node, "fingerprint", JINGLE_NS_DTLS);
 	if (child != XML_NONE)
@@ -384,7 +444,7 @@ static void transport_parse(const struct xml_doc *doc, unsigned int node,
 	while (child != XML_NONE) {
 		slot = &ice->candidate[ice->candidates];
 		if (ice->candidates >= JINGLE_CANDIDATES_MAX)
-			ice->candidates_dropped = true;
+			ice->candidates_dropped++;
 		else if (jingle_candidate_sdp(doc, child, slot->sdp,
 					      sizeof(slot->sdp)))
 			ice->candidates++;
@@ -462,7 +522,9 @@ bool jingle_parse(const struct xml_doc *iq, struct jingle_msg *out)
 		return false;
 
 	out->action = jingle_action_of(xml_attr_get(iq, jingle, "action"));
-	attr_copy(iq, jingle, "sid", out->sid, sizeof(out->sid));
+	if (!str_copy_whole(out->sid, sizeof(out->sid),
+			    xml_attr_get(iq, jingle, "sid")))
+		return false;
 	attr_copy(iq, jingle, "initiator", out->initiator,
 		  sizeof(out->initiator));
 	attr_copy(iq, jingle, "responder", out->responder,

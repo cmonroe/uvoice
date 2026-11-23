@@ -23,6 +23,16 @@
  * checks while no TURN relay was known reports a line fault, so the user
  * learns that a relay is missing (host->line_fault).
  *
+ * TURN credentials of the server expire (XEP-0215 expires). The layer asks
+ * the server again XMPP_RELAY_LEAD_MS before the first expiry, and an
+ * expired relay goes into no new call. A refresh that is not sent, not
+ * answered or refused asks again after a backoff, a bounded number of times.
+ * A TURN relay with an expires that is no XEP-0082 DateTime goes into no
+ * call. Each discovery answer replaces the relays an earlier answer named;
+ * the relays the channel names stay. Each configuration of an account has
+ * a generation, and a discovery answer or a resolver answer of an earlier
+ * generation is dropped.
+ *
  * The SIP account layer leaves an xmpp line alone (account.c
  * acct_cfg_derive), so one line registers with one layer.
  */
@@ -38,6 +48,14 @@
 
 #define XMPP_ROSTER_MAX		32U
 #define XMPP_SERVICES_MAX	4U
+/* How long before the first expiry of a TURN credential the server is asked
+ * again. UVOICE_XMPP_RELAY_LEAD_MS replaces it for a test. */
+#define XMPP_RELAY_LEAD_MS	60000U
+/* The wait before the first retry of a failed refresh. Each further failure
+ * doubles it, and the layer stops after XMPP_RELAY_RETRIES retries.
+ * UVOICE_XMPP_RELAY_RETRY_MS replaces it for a test. */
+#define XMPP_RELAY_RETRY_MS	5000U
+#define XMPP_RELAY_RETRIES	4U
 
 struct blob_buf;
 
@@ -45,9 +63,16 @@ struct blob_buf;
  * xmpp_accounts_init() - wire the layer and the legs
  * @host: the host table
  * @cb: the callbacks of the line shell the legs report through
+ * @dnd: whether do-not-disturb holds a line, which the legs read before
+ *	 they ring
+ * @legs_held: whether a line drives a leg table, which the legs read before
+ *	       they ring
  */
 void xmpp_accounts_init(const struct proto_host *host,
-			const struct call_cb *cb);
+			const struct call_cb *cb,
+			bool (*dnd)(unsigned int line),
+			bool (*legs_held)(unsigned int line,
+					  const struct call_leg_ops *legs));
 
 /**
  * xmpp_accounts_start() - build the account of every xmpp line

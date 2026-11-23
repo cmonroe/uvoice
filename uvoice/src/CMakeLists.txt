@@ -593,6 +593,11 @@ if(UVOICE_TESTS)
 					   ${UBOX_INCLUDE_DIR} ${UBUS_INCLUDE_DIR})
 		target_compile_definitions(test_account PRIVATE PHF_NET_PORTS
 					   PHF_NET_CORE)
+		# account.c reports an xmpp line by the flag of the image
+		if(UVOICE_XMPP)
+			target_compile_definitions(test_account PRIVATE
+						   UVOICE_XMPP)
+		endif()
 		target_link_libraries(test_account uvoice_sdp uvoice_sip
 				      uvoice_sip_txn uvoice_sip_udp
 				      uvoice_sip_stream ${UBOX_LIBRARY}
@@ -756,6 +761,31 @@ if(UVOICE_TESTS)
 					      ${UBOX_LIBRARY} OpenSSL::SSL
 					      OpenSSL::Crypto)
 			add_test(NAME test_xmpp_stream COMMAND test_xmpp_stream)
+
+			# The account suite compiles account.c over a stream the
+			# suite defines itself, so it opens no socket. The wraps
+			# let it answer the resolver, read the environment of the
+			# legs, read the delay of each timer and run the timers on
+			# a virtual clock.
+			add_executable(test_xmpp_account
+				       ${UVOICE_TEST_DIR}/unit/test_xmpp_account.c
+				       ${UVOICE_TEST_DIR}/unit/proto_host_fake.c
+				       proto/xmpp/account.c proto/shared/tls.c
+				       trace.c)
+			target_include_directories(test_xmpp_account PRIVATE
+						   ${UVOICE_TEST_DIR}/unit
+						   ${CMAKE_CURRENT_SOURCE_DIR})
+			target_link_options(test_xmpp_account PRIVATE
+					    -Wl,--wrap=sip_dns_resolve
+					    -Wl,--wrap=sip_dns_cancel
+					    -Wl,--wrap=xcalls_init
+					    -Wl,--wrap=proto_timer_arm
+					    -Wl,--wrap=proto_timer_env_uloop_init)
+			target_link_libraries(test_xmpp_account uvoice_xmpp_core
+					      uvoice_sdp ${UBOX_LIBRARY}
+					      OpenSSL::SSL OpenSSL::Crypto)
+			add_test(NAME test_xmpp_account
+				 COMMAND test_xmpp_account)
 		endif()
 
 		add_executable(test_desk ${UVOICE_TEST_DIR}/unit/test_desk.c

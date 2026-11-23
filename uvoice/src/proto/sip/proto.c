@@ -60,7 +60,8 @@ static void sip_init(const struct proto_host *host, const struct cfg *cfg)
 	calls_hal_ready_bind(sip_hal_ready);
 	calls_line_admit_bind(sip_line_admit);
 #ifdef UVOICE_XMPP
-	xmpp_accounts_init(host, sip_line_call_cb());
+	xmpp_accounts_init(host, sip_line_call_cb(), sip_line_dnd,
+			   sip_line_legs_held);
 #endif
 }
 

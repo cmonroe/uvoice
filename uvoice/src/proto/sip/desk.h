@@ -127,7 +127,8 @@ struct desk_ops {
 			  char digit, uint16_t duration_ms);
 	void (*call_xfer)(void *priv, unsigned int line, unsigned int slot,
 			  const char *target);
-	void (*call_xfer_consult)(void *priv, unsigned int line,
+	/* false when the transfer did not start: both calls stay up */
+	bool (*call_xfer_consult)(void *priv, unsigned int line,
 				  unsigned int referee, unsigned int replaced);
 	void (*conf_set)(void *priv, unsigned int line, bool on);
 	void (*tone)(void *priv, enum hal_tone tone);
@@ -222,6 +223,7 @@ int desk_hold(struct desk *d, unsigned int line, unsigned int slot);
 int desk_resume(struct desk *d, unsigned int line, unsigned int slot);
 int desk_transfer(struct desk *d, unsigned int line, unsigned int slot,
 		  const char *target);
+/* -EIO when the leg layer refused the consult transfer; both calls stay. */
 int desk_transfer_attended(struct desk *d, unsigned int line,
 			   unsigned int slot, unsigned int slot2);
 int desk_conference(struct desk *d, unsigned int line, unsigned int slot,

@@ -60,6 +60,11 @@
 #include "proto/sip/tap.h"
 #include "proto/sip/transport.h"
 #include "uvoice.h"
+#ifdef UVOICE_XMPP
+#include "proto/xmpp/call.h"
+#include "proto/xmpp/jmi.h"
+#include "proto/xmpp/xml.h"
+#endif
 #include "test_util.h"
 #include "test_uloop.h"
 
@@ -1379,12 +1384,12 @@ void calls_done(void)
 	calls_cfg_loaded = false;
 }
 
-void calls_line_teardown(unsigned int line)
+static void fake_line_teardown(unsigned int line)
 {
 	cop_add(C_TEARDOWN, line);
 }
 
-void calls_line_end(unsigned int line)
+static void fake_line_end(unsigned int line)
 {
 	cop_add(C_LINE_END, line);
 }
@@ -1393,23 +1398,26 @@ void calls_line_end(unsigned int line)
  * clears it to stage a line that cannot carry a dial */
 static bool dial_ready_answer = true;
 
-bool calls_line_dial_ready(unsigned int line)
+static bool fake_line_dial_ready(unsigned int line)
 {
 	(void)line;
 	return dial_ready_answer;
 }
 
-bool call_slot_free(unsigned int line, unsigned int *slot)
+static bool fake_slot_free(unsigned int line, unsigned int *slot)
 {
 	(void)line;
 	*slot = 0;
 	return true;
 }
 
+/* the desk user interface, which a case turns on before fixture_start() */
+static bool ui_desk_answer;
+
 bool cfg_ui_desk(const struct cfg *cfg)
 {
 	(void)cfg;
-	return false;
+	return ui_desk_answer;
 }
 
 const char *const *cfg_ring_sound_names(void)
@@ -1603,10 +1611,25 @@ struct ubus_context *uvoice_ubus_ctx(void)
 	return NULL;
 }
 
+/* the reason of the last desk call record that named one */
+static char notify_reason[32];
+
 void uvoice_ubus_notify(const char *type, struct blob_attr *msg)
 {
-	(void)type;
-	(void)msg;
+	static const struct blobmsg_policy reason_policy = {
+		.name = "reason",
+		.type = BLOBMSG_TYPE_STRING,
+	};
+	struct blob_attr *reason = NULL;
+
+	if (strcmp(type, "call") || !msg)
+		return;
+
+	blobmsg_parse(&reason_policy, 1, &reason, blob_data(msg),
+		      blob_len(msg));
+	if (reason)
+		snprintf(notify_reason, sizeof(notify_reason), "%s",
+			 blobmsg_get_string(reason));
 }
 
 int ubus_send_reply(struct ubus_context *ctx, struct ubus_request_data *req,
@@ -1645,7 +1668,7 @@ static void busy_wait_ms(unsigned int ms)
 	} while (elapsed < ms);
 }
 
-bool call_dial(unsigned int line, unsigned int slot, const char *number, bool cid_present)
+static bool fake_dial(unsigned int line, unsigned int slot, const char *number, bool cid_present)
 {
 	struct cop *c;
 	unsigned int i;
@@ -1698,7 +1721,7 @@ bool call_dial(unsigned int line, unsigned int slot, const char *number, bool ci
  */
 static bool call_ring_refuse;
 
-bool call_ring(unsigned int line, unsigned int slot)
+static bool fake_ring(unsigned int line, unsigned int slot)
 {
 	cop_add(C_RING, line)->slot = slot;
 
@@ -1710,14 +1733,14 @@ bool call_ring(unsigned int line, unsigned int slot)
 	return false;
 }
 
-bool call_answer(unsigned int line, unsigned int slot)
+static bool fake_answer(unsigned int line, unsigned int slot)
 {
 	cop_add(C_ANSWER, line)->slot = slot;
 
 	return true;
 }
 
-bool call_reject(unsigned int line, unsigned int slot, uint32_t code)
+static bool fake_reject(unsigned int line, unsigned int slot, uint32_t code)
 {
 	struct cop *c = cop_add(C_REJECT, line);
 
@@ -1727,7 +1750,7 @@ bool call_reject(unsigned int line, unsigned int slot, uint32_t code)
 	return true;
 }
 
-bool call_hangup(unsigned int line, unsigned int slot)
+static bool fake_hangup(unsigned int line, unsigned int slot)
 {
 	cop_add(C_HANGUP, line)->slot = slot;
 
@@ -1738,22 +1761,22 @@ bool call_hangup(unsigned int line, unsigned int slot)
 static bool hold_refuse;
 static bool resume_refuse;
 
-bool call_hold(unsigned int line, unsigned int slot)
+static bool fake_hold(unsigned int line, unsigned int slot)
 {
 	cop_add(C_HOLD, line)->slot = slot;
 
 	return !hold_refuse;
 }
 
-bool call_resume(unsigned int line, unsigned int slot)
+static bool fake_resume(unsigned int line, unsigned int slot)
 {
 	cop_add(C_RESUME, line)->slot = slot;
 
 	return !resume_refuse;
 }
 
-bool call_dtmf(unsigned int line, unsigned int slot, char digit,
-	       uint16_t duration_ms, bool measured)
+static bool fake_dtmf(unsigned int line, unsigned int slot, char digit,
+		      uint16_t duration_ms, bool measured)
 {
 	struct cop *c = cop_add(C_DTMF, line);
 
@@ -1768,7 +1791,7 @@ bool call_dtmf(unsigned int line, unsigned int slot, char digit,
 /* a leg layer with no offered call to redirect */
 static bool forward_refuse;
 
-bool call_forward(unsigned int line, unsigned int slot, const char *target)
+static bool fake_forward(unsigned int line, unsigned int slot, const char *target)
 {
 	struct cop *c = cop_add(C_FORWARD, line);
 
@@ -1781,7 +1804,7 @@ bool call_forward(unsigned int line, unsigned int slot, const char *target)
 /* a leg layer with no confirmed dialog to relay the flash on */
 static bool flash_relay_refuse;
 
-bool call_flash_relay(unsigned int line, unsigned int slot)
+static bool fake_flash_relay(unsigned int line, unsigned int slot)
 {
 	cop_add(C_FLASH_RELAY, line)->slot = slot;
 
@@ -1791,7 +1814,7 @@ bool call_flash_relay(unsigned int line, unsigned int slot)
 /* a leg layer that cannot take the fax switch, which the shell only traces */
 static bool fax_start_refuse;
 
-bool call_fax_start(unsigned int line, unsigned int slot)
+static bool fake_fax_start(unsigned int line, unsigned int slot)
 {
 	cop_add(C_FAX, line)->slot = slot;
 
@@ -1804,14 +1827,14 @@ bool call_fax_start(unsigned int line, unsigned int slot)
  * the shell owes the leg one record per remote answer tone on a connected line
  * and none anywhere else.
  */
-void call_fax_hint(unsigned int line, unsigned int slot)
+static void fake_fax_hint(unsigned int line, unsigned int slot)
 {
 	cop_add(C_FAX_HINT, line)->slot = slot;
 }
 
 static bool fax_on_answer;
 
-bool call_fax_on(unsigned int line, unsigned int slot)
+static bool fake_fax_on(unsigned int line, unsigned int slot)
 {
 	cop_add(C_FAX_ON, line)->slot = slot;
 
@@ -1821,14 +1844,14 @@ bool call_fax_on(unsigned int line, unsigned int slot)
 static bool fax_kind_refuse;
 static uint8_t fax_kind_answer;
 
-uint8_t call_fax_kind_get(unsigned int line, unsigned int slot)
+static uint8_t fake_fax_kind_get(unsigned int line, unsigned int slot)
 {
 	cop_add(C_FAX_KIND_GET, line)->slot = slot;
 
 	return fax_kind_answer;
 }
 
-bool call_fax_kind_set(unsigned int line, unsigned int slot, uint8_t kind)
+static bool fake_fax_kind_set(unsigned int line, unsigned int slot, uint8_t kind)
 {
 	struct cop *c = cop_add(C_FAX_KIND, line);
 
@@ -1850,7 +1873,7 @@ bool call_fax_kind_set(unsigned int line, unsigned int slot, uint8_t kind)
 static bool fax_ced_wait;
 static bool fax_proof_refuse;
 
-bool call_fax_ced_proof(unsigned int line, unsigned int slot, uint16_t code)
+static bool fake_fax_ced_proof(unsigned int line, unsigned int slot, uint16_t code)
 {
 	struct cop *c = cop_add(C_FAX_PROOF, line);
 
@@ -1889,9 +1912,10 @@ static uint32_t leg_handle_of(unsigned int line, unsigned int slot,
 	return ((line * CALL_SLOTS + slot) << 16) | gen;
 }
 
-enum call_fax_tone call_fax_tone_note(unsigned int line, unsigned int slot,
-				      uint16_t code, uint8_t direction,
-				      bool end, uint16_t duration_ms)
+static enum call_fax_tone fake_fax_tone_note(unsigned int line,
+					      unsigned int slot, uint16_t code,
+					      uint8_t direction, bool end,
+					      uint16_t duration_ms)
 {
 	struct cop *c = cop_add(C_FAX_TONE_NOTE, line);
 
@@ -1908,7 +1932,7 @@ enum call_fax_tone call_fax_tone_note(unsigned int line, unsigned int slot,
 	return end ? fax_tone_answer : CALL_FAX_TONE_NOTED;
 }
 
-uint32_t call_leg_handle_get(unsigned int line, unsigned int ui_slot)
+static uint32_t fake_leg_handle_get(unsigned int line, unsigned int ui_slot)
 {
 	struct cop *c = cop_add(C_LEG_HANDLE, line);
 	uint32_t handle = leg_handle_of(line, ui_slot, leg_gen_answer);
@@ -1919,7 +1943,7 @@ uint32_t call_leg_handle_get(unsigned int line, unsigned int ui_slot)
 	return handle;
 }
 
-bool call_fax_exit(uint32_t handle)
+static bool fake_fax_exit(uint32_t handle)
 {
 	unsigned int index = handle >> 16;
 	struct cop *c = cop_add(C_FAX_EXIT, index / CALL_SLOTS);
@@ -1940,7 +1964,7 @@ bool call_fax_exit(uint32_t handle)
  */
 static enum call_t38_answer t38_start_answer;
 
-enum call_t38_answer call_t38_start(unsigned int line, unsigned int slot)
+static enum call_t38_answer fake_t38_start(unsigned int line, unsigned int slot)
 {
 	cop_add(C_T38, line)->slot = slot;
 
@@ -1960,8 +1984,8 @@ enum call_t38_answer call_t38_start(unsigned int line, unsigned int slot)
  */
 static bool xfer_refuse;
 
-bool call_xfer(unsigned int line, unsigned int slot, enum call_xfer_kind kind,
-	       const char *target)
+static bool fake_xfer(unsigned int line, unsigned int slot,
+		      enum call_xfer_kind kind, const char *target)
 {
 	struct cop *c = cop_add(C_XFER, line);
 
@@ -1974,7 +1998,7 @@ bool call_xfer(unsigned int line, unsigned int slot, enum call_xfer_kind kind,
 
 static bool xfer_consult_refuse;
 
-bool call_xfer_consult(unsigned int line, unsigned int referee, unsigned int replaced)
+static bool fake_xfer_consult(unsigned int line, unsigned int referee, unsigned int replaced)
 {
 	struct cop *c = cop_add(C_XFER_CONSULT, line);
 
@@ -2007,9 +2031,12 @@ static void xfer_stream_map(unsigned int ui_slot, unsigned int stream)
 	xfer_stream_of[ui_slot] = stream;
 }
 
-unsigned int call_slot_stream(unsigned int line, unsigned int ui_slot)
+/* the fake leg layer holds no leg, as the SIP one after its ended record */
+static bool fake_legs_none;
+
+static unsigned int fake_slot_stream(unsigned int line, unsigned int ui_slot)
 {
-	if (line >= CFG_CHANNEL_MAX || ui_slot >= CALL_SLOTS)
+	if (line >= CFG_CHANNEL_MAX || ui_slot >= CALL_SLOTS || fake_legs_none)
 		return CALL_SLOTS;
 
 	return xfer_stream_set ? xfer_stream_of[ui_slot] : ui_slot;
@@ -2022,10 +2049,42 @@ void calls_status_dump(struct blob_buf *b, unsigned int line)
 	blobmsg_close_array(b, arr);
 }
 
-void call_codec_dump(struct blob_buf *b, unsigned int line,
-		     unsigned int ui_slot)
+static void fake_codec_dump(struct blob_buf *b, unsigned int line,
+			    unsigned int ui_slot)
 {
 }
+
+/* The SIP leg table the shell drives on a SIP line (call.h). */
+const struct call_leg_ops calls_leg_ops = {
+	.slot_free = fake_slot_free,
+	.slot_stream = fake_slot_stream,
+	.dial_ready = fake_line_dial_ready,
+	.dial = fake_dial,
+	.ring = fake_ring,
+	.answer = fake_answer,
+	.reject = fake_reject,
+	.forward = fake_forward,
+	.hangup = fake_hangup,
+	.hold = fake_hold,
+	.resume = fake_resume,
+	.dtmf = fake_dtmf,
+	.flash_relay = fake_flash_relay,
+	.fax_start = fake_fax_start,
+	.fax_hint = fake_fax_hint,
+	.fax_on = fake_fax_on,
+	.fax_kind_set = fake_fax_kind_set,
+	.fax_kind_get = fake_fax_kind_get,
+	.fax_ced_proof = fake_fax_ced_proof,
+	.fax_tone_note = fake_fax_tone_note,
+	.leg_handle_get = fake_leg_handle_get,
+	.fax_exit = fake_fax_exit,
+	.t38_start = fake_t38_start,
+	.xfer = fake_xfer,
+	.xfer_consult = fake_xfer_consult,
+	.line_end = fake_line_end,
+	.line_teardown = fake_line_teardown,
+	.codec_dump = fake_codec_dump,
+};
 
 /* ------------------------------------------------------------- status view */
 
@@ -2643,6 +2702,8 @@ static void fixture_start(void)
 	t38_start_answer = CALL_T38_STARTED;
 	xfer_refuse = false;
 	xfer_consult_refuse = false;
+	fake_legs_none = false;
+	notify_reason[0] = 0;
 	conf_transient_n = 0;
 	conf_unsupported = false;
 	conf_refuse = false;
@@ -11538,7 +11599,7 @@ static void t_t38(void)
 	CASE("a followed leg names the kind of the carrier it already runs");
 	t38_line_connect();
 	fax_on_answer = true;
-	CHECK(call_fax_kind_set(0, 0, HAL_PASSTHROUGH_MODEM));
+	CHECK(fake_fax_kind_set(0, 0, HAL_PASSTHROUGH_MODEM));
 	cops_reset();
 	inject_tone(0, HAL_TONE_DET_V21_PREAMBLE, HAL_TONE_DIR_LOCAL, 0);
 	CHECK_UINT(cop_count(C_FAX_KIND_GET), 1);
@@ -11583,7 +11644,7 @@ static void t_t38(void)
 	CASE("a local CED on a followed profile takes no latch or upspeed");
 	t38_line_connect();
 	fax_on_answer = true;
-	CHECK(call_fax_kind_set(0, 0, HAL_PASSTHROUGH_MODEM));
+	CHECK(fake_fax_kind_set(0, 0, HAL_PASSTHROUGH_MODEM));
 	cops_reset();
 	inject_tone(0, HAL_TONE_DET_CED, HAL_TONE_DIR_LOCAL, 0);
 	CHECK_UINT(cop_count(C_FAX_ON), 1);
@@ -11605,7 +11666,7 @@ static void t_t38(void)
 	CASE("a kind-only preamble selects FAX with T.38 enabled");
 	t38_line_connect();
 	inject_tone(0, HAL_TONE_DET_ANSAM, HAL_TONE_DIR_REMOTE, 0);
-	CHECK_UINT(call_fax_kind_get(0, 0), HAL_PASSTHROUGH_MODEM);
+	CHECK_UINT(fake_fax_kind_get(0, 0), HAL_PASSTHROUGH_MODEM);
 	CHECK(!fax_on_answer);
 	cops_reset();
 	inject_tone(0, HAL_TONE_DET_V21_PREAMBLE, HAL_TONE_DIR_LOCAL, 0);
@@ -11621,7 +11682,7 @@ static void t_t38(void)
 	CASE("a kind-only preamble selects FAX with T.38 disabled");
 	fax_line_connect(false);
 	inject_tone(0, HAL_TONE_DET_ANSAM, HAL_TONE_DIR_REMOTE, 0);
-	CHECK_UINT(call_fax_kind_get(0, 0), HAL_PASSTHROUGH_MODEM);
+	CHECK_UINT(fake_fax_kind_get(0, 0), HAL_PASSTHROUGH_MODEM);
 	CHECK(!fax_on_answer);
 	cops_reset();
 	inject_tone(0, HAL_TONE_DET_V21_PREAMBLE, HAL_TONE_DIR_LOCAL, 0);
@@ -18838,7 +18899,343 @@ static void t_transport_forward(void)
 	CHECK_UINT(xcall_transport_last.state, HAL_ICE_FAILED);
 	CHECK_UINT(xcall_transport_last.gen, 0x1234);
 }
+
+/*
+ * The Jingle legs behind the real shell and the real desk. The legs run over
+ * a stream environment of the suite and report to the callbacks of the
+ * shell, as the account layer wires them in the daemon.
+ */
+#define XL_SELF		"user@sip.example.test/uvoice"
+#define XL_SELF_BARE	"user@sip.example.test"
+#define XL_PEER		"romeo@montague.example/orchard"
+#define XL_PEER_BARE	"romeo@montague.example"
+#define XL_PROPOSE(id)							\
+	"<message from='" XL_PEER "' to='" XL_SELF_BARE "' type='chat'>"	\
+	"<propose xmlns='" JMI_NS "' id='" id "'><description xmlns='"	\
+	"urn:xmpp:jingle:apps:rtp:1' media='audio'/></propose></message>"
+
+static struct {
+	unsigned int sends;
+	unsigned int ids;
+	char last[1024];
+} xl;
+static struct proto_timer_env xl_timer;
+static struct xml_stream xl_parser;
+
+static bool xl_ready(void *priv, unsigned int line)
+{
+	return true;
+}
+
+static int xl_send(void *priv, unsigned int line, const char *text,
+		   size_t len)
+{
+	xl.sends++;
+	snprintf(xl.last, sizeof(xl.last), "%.*s", (int)len, text);
+
+	return 0;
+}
+
+static int xl_iq_send(void *priv, unsigned int line, const char *text,
+		      size_t len, const char *id, const char *peer,
+		      xcall_reply_cb cb, void *cb_priv)
+{
+	return xl_send(priv, line, text, len);
+}
+
+static int xl_reply_result(void *priv, unsigned int line,
+			   const struct xml_doc *iq)
+{
+	return 0;
+}
+
+static int xl_reply_error(void *priv, unsigned int line,
+			  const struct xml_doc *iq, const char *type,
+			  const char *condition)
+{
+	return 0;
+}
+
+static void xl_id_next(void *priv, unsigned int line, char *out, size_t len)
+{
+	snprintf(out, len, "xl%u", ++xl.ids);
+}
+
+static bool xl_self_jid(void *priv, unsigned int line, struct jid *out)
+{
+	return jid_parse(XL_SELF, out);
+}
+
+static bool xl_speed_dial(void *priv, unsigned int line, const char *digits,
+			  char *out, size_t len)
+{
+	if (strcmp(digits, "42"))
+		return false;
+
+	snprintf(out, len, "%s", XL_PEER_BARE);
+
+	return true;
+}
+
+static bool xl_legs_held(void *priv, unsigned int line)
+{
+	return sip_line_legs_held(line, &xcalls_leg_ops);
+}
+
+/* The legs of the daemon over the environment of the suite. */
+static void xl_bind(void)
+{
+	struct xcall_env env = {
+		.timer = &xl_timer,
+		.cb = sip_line_call_cb(),
+		.host = proto_host_get(),
+		.ready = xl_ready,
+		.send = xl_send,
+		.iq_send = xl_iq_send,
+		.reply_result = xl_reply_result,
+		.reply_error = xl_reply_error,
+		.id_next = xl_id_next,
+		.self_jid = xl_self_jid,
+		.speed_dial = xl_speed_dial,
+		.legs_held = xl_legs_held,
+	};
+
+	memset(&xl, 0, sizeof(xl));
+	proto_timer_env_uloop_init(&xl_timer);
+	xcalls_init(&env);
+	xcalls_reload(&cfg);
+	xcalls_hal_features_set(HAL_FEAT_ICE_DTLS);
+}
+
+static void xl_on_stanza(void *user, const struct xml_doc *doc)
+{
+	if (xml_node_is(doc, 0, "iq", XMPP_NS_CLIENT))
+		xcall_jingle_rx(0, doc);
+	else
+		xcall_jmi_rx(0, doc);
+}
+
+static const struct xml_stream_cb xl_parser_cb = {
+	.stanza = xl_on_stanza,
+};
+
+/* One stanza of the peer to line 0. */
+static void xl_rx(const char *xml)
+{
+	static const char open[] =
+		"<stream:stream xmlns='jabber:client' "
+		"xmlns:stream='http://etherx.jabber.org/streams'>";
+
+	xml_stream_reset(&xl_parser);
+	xml_stream_feed(&xl_parser, open, strlen(open));
+	xml_stream_feed(&xl_parser, xml, strlen(xml));
+}
+
+static void t_xmpp_legs(void)
+{
+	struct call_ended info;
+	uint32_t desk_id = 0;
+
+	SUITE_CHECK(xml_stream_init(&xl_parser, &xl_parser_cb, NULL) == 0);
+
+	CASE("desk: a retract of the caller ends the call as cancelled");
+	cfg_default();
+	cfg.channel[0].account_type = CFG_ACCOUNT_XMPP;
+	ui_desk_answer = true;
+	fixture_start();
+	region_ready();
+	xl_bind();
+	xl_rx(XL_PROPOSE("x1"));
+	CHECK(strstr(xl.last, "<ringing ") != NULL);
+	CHECK(!notify_reason[0]);
+	xl_rx("<message from='" XL_PEER "' to='" XL_SELF_BARE "' type='chat'>"
+	      "<retract xmlns='" JMI_NS "' id='x1'/></message>");
+	CHECK(!strcmp(notify_reason, "cancelled"));
+
+	CASE("desk: an accept of another device ends it as answered elsewhere");
+	notify_reason[0] = 0;
+	xl_rx(XL_PROPOSE("x2"));
+	CHECK(!notify_reason[0]);
+	xl_rx("<message from='" XL_SELF_BARE "' to='" XL_SELF "' type='chat'>"
+	      "<sent xmlns='urn:xmpp:carbons:2'><forwarded xmlns='"
+	      XMPP_NS_FORWARD "'><message xmlns='jabber:client' from='"
+	      XL_SELF_BARE "/pc' to='" XL_SELF_BARE "' type='chat'><accept "
+	      "xmlns='" JMI_NS "' id='x2'/></message></forwarded></sent>"
+	      "</message>");
+	CHECK(!strcmp(notify_reason, "answered_elsewhere"));
+
+	/* the desk keeps the machine at rest, so a reload lands at once */
+	CASE("desk: a call that is up ends through the table it started with");
+	cfg_default();
+	ui_desk_answer = true;
+	fixture_start();
+	region_ready();
+	xl_bind();
+	CHECK(sip_desk_dial(0, "5551234", &desk_id) == 0);
+	CHECK(cop_has(C_DIAL));
+	rec_cb.answered(0, cop_find(C_DIAL)->slot);
+	cfg.channel[0].account_type = CFG_ACCOUNT_XMPP;
+	lines_reload(&cfg);
+	cops_reset();
+	CHECK(sip_desk_hangup(desk_id) == 0);
+	CHECK(cop_has(C_HANGUP));
+	CHECK_UINT(xl.sends, 0);
+
+	CASE("desk: the line takes the table of its type once its legs ended");
+	fake_legs_none = true;
+	memset(&info, 0, sizeof(info));
+	rec_cb.ended(0, 0, &info);
+	uloop_pump(20);
+	cops_reset();
+	CHECK(sip_desk_dial(0, "42", &desk_id) == 0);
+	CHECK(!cop_has(C_DIAL));
+	CHECK(strstr(xl.last, "<propose ") != NULL);
+	ui_desk_answer = false;
+
+	CASE("legs: a call that is up ends through the table it started with");
+	cfg_default();
+	cfg.channel[0].warmline_enable = true;
+	cfg.channel[0].warmline_timeout_s = 0;
+	snprintf(cfg.channel[0].warmline_number,
+		 sizeof(cfg.channel[0].warmline_number), "42");
+	fixture_start();
+	region_ready();
+	xl_bind();
+	inject_hook(0, HAL_HOOK_SEIZE, 0);
+	CHECK(cop_has(C_DIAL));
+	rec_cb.answered(0, 0);
+	CHECK(state_is(0, "CONNECTED"));
+	cfg.channel[0].account_type = CFG_ACCOUNT_XMPP;
+	lines_reload(&cfg);
+	cops_reset();
+	inject_hook(0, HAL_HOOK_RELEASE, 0);
+	CHECK(cop_has(C_HANGUP));
+	CHECK_UINT(xl.sends, 0);
+
+	CASE("legs: the line takes the table of its type once its legs ended");
+	fake_legs_none = true;
+	memset(&info, 0, sizeof(info));
+	rec_cb.ended(0, 0, &info);
+	uloop_pump(20);
+	dial_ready_answer = false;
+	cops_reset();
+	inject_hook(0, HAL_HOOK_SEIZE, 0);
+	CHECK(!cop_has(C_DIAL));
+	CHECK_UINT(xl.sends, 1);
+	CHECK(strstr(xl.last, "<propose ") != NULL);
+	CHECK(strstr(xl.last, "to=\"" XL_PEER_BARE "\"") != NULL);
+	inject_hook(0, HAL_HOOK_RELEASE, 0);
+
+	CASE("legs: a forward the Jingle table lacks is refused, not sent as SIP");
+	cfg_default();
+	cfg_dnd_cf_codes(&cfg.channel[0]);
+	cfg.channel[0].account_type = CFG_ACCOUNT_XMPP;
+	cfg.channel[0].call_fwd_local_mode = 1;
+	snprintf(cfg.channel[0].call_fwd_uncond_uri,
+		 sizeof(cfg.channel[0].call_fwd_uncond_uri), "5551111");
+	fixture_start();
+	region_ready();
+	xl_bind();
+	cops_reset();
+	xl_rx(XL_PROPOSE("x3"));
+	CHECK(!cop_has(C_FORWARD));
+	CHECK_UINT(xl.sends, 2);
+	CHECK(strstr(xl.last, "<reject ") != NULL);
+	CHECK(!xcalls_line_busy(0));
+	CHECK(state_is(0, "IDLE"));
+
+	CASE("legs: a propose during a SIP call of a line switched to xmpp is "
+	     "refused busy");
+	cfg_default();
+	cfg.channel[0].warmline_enable = true;
+	cfg.channel[0].warmline_timeout_s = 0;
+	snprintf(cfg.channel[0].warmline_number,
+		 sizeof(cfg.channel[0].warmline_number), "42");
+	fixture_start();
+	region_ready();
+	xl_bind();
+	CHECK(sip_line_legs_held(0, &calls_leg_ops));
+	inject_hook(0, HAL_HOOK_SEIZE, 0);
+	CHECK(cop_has(C_DIAL));
+	rec_cb.answered(0, cop_find(C_DIAL)->slot);
+	CHECK(state_is(0, "CONNECTED"));
+	cfg.channel[0].account_type = CFG_ACCOUNT_XMPP;
+	lines_reload(&cfg);
+	CHECK(sip_line_legs_held(0, &calls_leg_ops));
+	CHECK(!sip_line_legs_held(0, &xcalls_leg_ops));
+	xl.sends = 0;
+	xl_rx(XL_PROPOSE("x4"));
+	CHECK_UINT(xl.sends, 1);
+	CHECK(strstr(xl.last, "<reject ") != NULL);
+	CHECK(!xcalls_line_busy(0));
+	CHECK(state_is(0, "CONNECTED"));
+	inject_hook(0, HAL_HOOK_RELEASE, 0);
+
+	xml_stream_done(&xl_parser);
+}
 #endif
+
+enum { AC_ACCOUNTS, __AC_MAX };
+static const struct blobmsg_policy ac_policy[__AC_MAX] = {
+	[AC_ACCOUNTS] = { "accounts", BLOBMSG_TYPE_ARRAY },
+};
+
+enum { AE_LINE, AE_TYPE, AE_USER, __AE_MAX };
+static const struct blobmsg_policy ae_policy[__AE_MAX] = {
+	[AE_LINE] = { "line", BLOBMSG_TYPE_INT32 },
+	[AE_TYPE] = { "type", BLOBMSG_TYPE_STRING },
+	[AE_USER] = { "user", BLOBMSG_TYPE_STRING },
+};
+
+/* The type and the user the accounts verb reports for a line, "" if none. */
+static void accounts_entry_get(unsigned int line, char *type, char *user,
+			       size_t len)
+{
+	struct blob_attr *ta[__AC_MAX], *te[__AE_MAX], *entry;
+	unsigned int rem;
+
+	type[0] = 0;
+	user[0] = 0;
+	blob_buf_init(&sb, 0);
+	sip_desk_accounts_dump(&sb);
+	blobmsg_parse(ac_policy, __AC_MAX, ta, blob_data(sb.head),
+		      blob_len(sb.head));
+	if (!ta[AC_ACCOUNTS])
+		return;
+
+	blobmsg_for_each_attr(entry, ta[AC_ACCOUNTS], rem) {
+		blobmsg_parse(ae_policy, __AE_MAX, te, blobmsg_data(entry),
+			      blobmsg_data_len(entry));
+		if (!te[AE_LINE] || blobmsg_get_u32(te[AE_LINE]) != line ||
+		    !te[AE_TYPE] || !te[AE_USER])
+			continue;
+		snprintf(type, len, "%s", blobmsg_get_string(te[AE_TYPE]));
+		snprintf(user, len, "%s", blobmsg_get_string(te[AE_USER]));
+		return;
+	}
+}
+
+static void t_accounts_type(void)
+{
+	char type[CFG_STR_MAX], user[CFG_STR_MAX];
+
+	cfg_default();
+	cfg.channel[0].account_type = CFG_ACCOUNT_XMPP;
+	snprintf(cfg.channel[0].xmpp_jid, sizeof(cfg.channel[0].xmpp_jid),
+		 "user@xmpp.example.test");
+	cfg.channel[1].enabled = true;
+	fixture_start();
+
+	CASE("accounts: an xmpp line reports its configured type in any image");
+	CHECK(cfg.channel[0].enabled);
+	accounts_entry_get(0, type, user, sizeof(user));
+	CHECK(!strcmp(type, "xmpp"));
+	CHECK(!strcmp(user, "user@xmpp.example.test"));
+
+	CASE("accounts: a sip line reports sip");
+	accounts_entry_get(1, type, user, sizeof(user));
+	CHECK(!strcmp(type, "sip"));
+}
 
 /* Whether both lines of the fixture read out of service. */
 static bool lines_both_oos(void)
@@ -19078,7 +19475,9 @@ int main(void)
 	t_proto_streams();
 #ifdef UVOICE_XMPP
 	t_transport_forward();
+	t_xmpp_legs();
 #endif
+	t_accounts_type();
 	t_proto_null();
 	t_proto_host();
 	t_proto_oos();

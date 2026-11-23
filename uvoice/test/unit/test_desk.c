@@ -9,6 +9,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "proto/sip/desk.h"
 #include "test_util.h"
@@ -122,10 +123,14 @@ static void op_call_xfer(void *priv, unsigned int line, unsigned int slot,
 	act("xfer(%u,%u,%s)", line, slot, target);
 }
 
-static void op_call_xfer_consult(void *priv, unsigned int line,
+static bool consult_refuse;
+
+static bool op_call_xfer_consult(void *priv, unsigned int line,
 				 unsigned int referee, unsigned int replaced)
 {
 	act("consult(%u,%u,%u)", line, referee, replaced);
+
+	return !consult_refuse;
 }
 
 static void op_conf_set(void *priv, unsigned int line, bool on)
@@ -181,6 +186,12 @@ static void op_led(void *priv, enum hal_led led, enum hal_led_mode mode)
 static void op_call_changed(void *priv, unsigned int line, unsigned int slot)
 {
 	const struct desk_call *c = desk_call_get(&d, line, slot);
+
+	if (c && c->state == DESK_CALL_IDLE) {
+		act("call(%u,%u,idle,%s)", line, slot,
+		    desk_end_reason_name(c->end_reason));
+		return;
+	}
 
 	act("call(%u,%u,%s)", line, slot,
 	    c ? desk_call_state_name(c->state) : "?");
@@ -242,6 +253,7 @@ static void reset(void)
 	cfg.dp[0] = &dp;
 	cfg.dp[1] = &dp;
 	line_ready[0] = line_ready[1] = true;
+	consult_refuse = false;
 	desk_init(&d, &fk.env, &cfg, &ops, NULL);
 	log_reset();
 }
@@ -756,6 +768,50 @@ static void cases_xfer_conf(void)
 	CHECK(did("consult(0,0,1)"));
 	CHECK(st(0, 0) == DESK_CALL_IDLE && st(0, 1) == DESK_CALL_IDLE);
 
+	CASE("ACTIVE + HELD x transfer key refused: both calls stay");
+	reset();
+	talk_out();
+	key(HAL_KEY_TRANSFER);
+	ev(DESK_EV_CALL_REINVITE_OK, 0, 0, 0);
+	digits("456");
+	ev(DESK_EV_CALL_ANSWERED, 0, 1, 0);
+	consult_refuse = true;
+	log_reset();
+	key(HAL_KEY_TRANSFER);
+	CHECK(did("consult(0,0,1)"));
+	CHECK(!did("hangup("));
+	CHECK(st(0, 0) == DESK_CALL_HELD);
+	CHECK(st(0, 1) == DESK_CALL_CONNECTED);
+
+	CASE("ubus attended transfer: both calls clear as transferred");
+	reset();
+	talk_out();
+	key(HAL_KEY_TRANSFER);
+	ev(DESK_EV_CALL_REINVITE_OK, 0, 0, 0);
+	digits("456");
+	ev(DESK_EV_CALL_ANSWERED, 0, 1, 0);
+	log_reset();
+	CHECK(desk_transfer_attended(&d, 0, 0, 1) == 0);
+	CHECK(did("consult(0,0,1)"));
+	CHECK(st(0, 0) == DESK_CALL_IDLE && st(0, 1) == DESK_CALL_IDLE);
+	CHECK(did("call(0,0,idle,transferred)"));
+	CHECK(did("call(0,1,idle,transferred)"));
+
+	CASE("ubus attended transfer refused: -EIO, both calls stay");
+	reset();
+	talk_out();
+	key(HAL_KEY_TRANSFER);
+	ev(DESK_EV_CALL_REINVITE_OK, 0, 0, 0);
+	digits("456");
+	ev(DESK_EV_CALL_ANSWERED, 0, 1, 0);
+	consult_refuse = true;
+	log_reset();
+	CHECK(desk_transfer_attended(&d, 0, 0, 1) == -EIO);
+	CHECK(did("consult(0,0,1)"));
+	CHECK(st(0, 0) == DESK_CALL_HELD);
+	CHECK(st(0, 1) == DESK_CALL_CONNECTED);
+	CHECK(desk_state_get(&d) == DESK_ACTIVE);
+
 	CASE("ACTIVE x ubus transfer refused: the call stays active");
 	reset();
 	talk_out();
@@ -974,6 +1030,8 @@ static void cases_verbs(void)
 
 int main(void)
 {
+	alarm(240);
+
 	cases_idle();
 	cases_dial();
 	cases_alert();

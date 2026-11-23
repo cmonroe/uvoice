@@ -359,7 +359,8 @@ static bool phf_media_rand_bytes(void *priv, void *buf, size_t len)
  * @stream: the stream
  * @sdp: the a=candidate line, kept in phf.candidate
  *
- * Return: phf.status.
+ * Return: HAL_FATAL while phf.candidate_add_fail counts down, phf.status
+ * then.
  */
 static enum hal_status phf_media_candidate_add(void *priv, unsigned int line,
 					       unsigned int stream,
@@ -371,7 +372,7 @@ static enum hal_status phf_media_candidate_add(void *priv, unsigned int line,
 	phf.stream = stream;
 	snprintf(phf.candidate, sizeof(phf.candidate), "%s", sdp ? sdp : "");
 
-	return phf.status;
+	return phf_fail_take(&phf.candidate_add_fail);
 }
 
 /**

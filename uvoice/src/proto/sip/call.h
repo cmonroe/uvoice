@@ -1085,6 +1085,60 @@ struct blob_buf;
 void call_codec_dump(struct blob_buf *b, unsigned int line,
 		     unsigned int ui_slot);
 
+/*
+ * The command set of one leg layer, the way sip/line.c drives a line. This
+ * file fills calls_leg_ops with the entries above, and xmpp/call.h fills
+ * xcalls_leg_ops for a line with a Jingle account. Each entry keeps the
+ * contract of its call_* or calls_* function here.
+ *
+ * A NULL entry is a command the layer does not support. sip/line.c refuses it
+ * the way the contract of the entry refuses: a dial reports congestion, an
+ * entry with an answer gives its refusal answer, and the rest do nothing.
+ */
+struct call_leg_ops {
+	bool (*slot_free)(unsigned int line, unsigned int *slot);
+	unsigned int (*slot_stream)(unsigned int line, unsigned int ui_slot);
+	bool (*dial_ready)(unsigned int line);
+	bool (*dial)(unsigned int line, unsigned int slot, const char *number,
+		     bool cid_present);
+	bool (*ring)(unsigned int line, unsigned int slot);
+	bool (*answer)(unsigned int line, unsigned int slot);
+	bool (*reject)(unsigned int line, unsigned int slot, uint32_t code);
+	bool (*forward)(unsigned int line, unsigned int slot,
+			const char *target);
+	bool (*hangup)(unsigned int line, unsigned int slot);
+	bool (*hold)(unsigned int line, unsigned int slot);
+	bool (*resume)(unsigned int line, unsigned int slot);
+	bool (*dtmf)(unsigned int line, unsigned int slot, char digit,
+		     uint16_t duration_ms, bool measured);
+	bool (*flash_relay)(unsigned int line, unsigned int slot);
+	bool (*fax_start)(unsigned int line, unsigned int slot);
+	void (*fax_hint)(unsigned int line, unsigned int slot);
+	bool (*fax_on)(unsigned int line, unsigned int slot);
+	bool (*fax_kind_set)(unsigned int line, unsigned int slot,
+			     uint8_t kind);
+	uint8_t (*fax_kind_get)(unsigned int line, unsigned int slot);
+	bool (*fax_ced_proof)(unsigned int line, unsigned int slot,
+			      uint16_t code);
+	enum call_fax_tone (*fax_tone_note)(unsigned int line,
+					    unsigned int slot, uint16_t code,
+					    uint8_t direction, bool end,
+					    uint16_t duration_ms);
+	uint32_t (*leg_handle_get)(unsigned int line, unsigned int ui_slot);
+	bool (*fax_exit)(uint32_t handle);
+	enum call_t38_answer (*t38_start)(unsigned int line, unsigned int slot);
+	bool (*xfer)(unsigned int line, unsigned int slot,
+		     enum call_xfer_kind kind, const char *target);
+	bool (*xfer_consult)(unsigned int line, unsigned int referee_slot,
+			     unsigned int replaced_slot);
+	void (*line_end)(unsigned int line);
+	void (*line_teardown)(unsigned int line);
+	void (*codec_dump)(struct blob_buf *b, unsigned int line,
+			   unsigned int ui_slot);
+};
+
+extern const struct call_leg_ops calls_leg_ops;
+
 /* per line and per slot state for voice status and the e2e asserts */
 void calls_status_dump(struct blob_buf *b, unsigned int line);
 

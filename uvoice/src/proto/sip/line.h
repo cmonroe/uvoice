@@ -35,6 +35,7 @@
 
 struct blob_buf;
 struct call_cb;
+struct call_leg_ops;
 
 /* The host table of the SIP unit, set by sip_lines_init(). */
 extern const struct proto_host *sip_host;
@@ -67,6 +68,21 @@ uint32_t sip_line_flags(unsigned int line);
 const char *sip_line_state_name(unsigned int line);
 bool sip_line_digit_play_allowed(unsigned int line, unsigned int stream);
 unsigned int sip_line_stream_of_slot(unsigned int line, unsigned int slot);
+
+/*
+ * Whether do-not-disturb holds the line: the switch of the desk in desk mode,
+ * the star code state of the line otherwise. The Jingle legs read it before
+ * they answer a caller with ringing.
+ */
+bool sip_line_dnd(unsigned int line);
+
+/*
+ * Whether the line drives the leg table @legs now. A line whose account type
+ * changed keeps the old table while a call of it is up (line_legs_take), and
+ * each layer refuses a new inbound call while the line holds the table of
+ * the other layer.
+ */
+bool sip_line_legs_held(unsigned int line, const struct call_leg_ops *legs);
 
 /* The machine keys of the call[] entry of the line. */
 void sip_line_status_dump(struct blob_buf *b, unsigned int line);

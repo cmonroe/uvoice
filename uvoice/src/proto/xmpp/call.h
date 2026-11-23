@@ -99,10 +99,16 @@ typedef void (*xcall_reply_cb)(void *priv, bool ok,
  * local_addr   the address of the voice interface the media binds to.
  * bind_dev     the netdev the media scopes to, "" for none.
  * contact_name the roster name of a bare JID, false for none.
- * speed_dial   the JID a dialled digit string stands for, false for none.
+ * speed_dial   the JID a dialed digit string stands for, false for none.
  * ice_servers  the STUN and TURN servers of the line, into the transport.
  * relay_missing the transport failed and no relay was available, so the
  *              user is told.
+ * dnd          whether the subscriber set do-not-disturb on the line, which
+ *              refuses a new inbound call before this phone rings.
+ * legs_held    whether the line drives these legs now. A line that switches
+ *              its account type keeps the old table while a call of it is
+ *              up, and refuses a new inbound call of the other table. An
+ *              environment without it refuses every inbound call.
  */
 struct xcall_env {
 	struct proto_timer_env *timer;
@@ -133,7 +139,12 @@ struct xcall_env {
 	void (*ice_servers)(void *priv, unsigned int line,
 			    struct hal_transport *out);
 	void (*relay_missing)(void *priv, unsigned int line);
+	bool (*dnd)(void *priv, unsigned int line);
+	bool (*legs_held)(void *priv, unsigned int line);
 };
+
+/* The leg table of a line with a Jingle account (sip/call.h). */
+extern const struct call_leg_ops xcalls_leg_ops;
 
 /**
  * xcalls_init() - wire the leg layer

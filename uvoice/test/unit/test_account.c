@@ -69,6 +69,14 @@ void sip_line_mwi_push(unsigned int line)
 	mwi_push_line = line;
 }
 
+/* The line drives the Jingle legs while a case sets line_legs_jingle. */
+static bool line_legs_jingle;
+
+bool sip_line_legs_held(unsigned int line, const struct call_leg_ops *legs)
+{
+	return legs == &calls_leg_ops && !line_legs_jingle;
+}
+
 /*
  * The call trace controller is not linked into this suite either, so its one
  * notification is recorded here. It counts the calls and keeps the line and
@@ -3570,6 +3578,77 @@ static void test_early_reload(void)
 	CASE("pre-start: the register commands are refused");
 	CHECK(!account_register_cmd(0));
 	CHECK(!account_unregister_cmd(0));
+}
+
+/**
+ * test_type_fault() - an enabled xmpp line nothing registers reports once
+ *
+ * In an image without XMPP every enabled xmpp line has the fault. In an
+ * XMPP image a line without its JID or its password has it.
+ */
+static void test_type_fault(void)
+{
+	static struct cfg start_cfg, same_cfg, both_cfg, sip_cfg;
+	struct cfg_channel *ch;
+	unsigned int before;
+
+	base_default();
+	start_cfg = base;
+	chan_default(&start_cfg.channel[0], 0);
+	chan_default(&start_cfg.channel[1], 1);
+	start_cfg.channel[0].account_type = CFG_ACCOUNT_XMPP;
+	start_cfg.channel[1].account_type = CFG_ACCOUNT_XMPP;
+	start_cfg.channel[1].enabled = false;
+	snprintf(start_cfg.channel[0].xmpp_jid,
+		 sizeof(start_cfg.channel[0].xmpp_jid), "phone@example.net");
+
+	CASE("type fault: the start reports the enabled xmpp line once");
+	before = phf.n[PHF_LINE_FAULT];
+	core_start(&start_cfg);
+	CHECK_UINT(phf.n[PHF_LINE_FAULT], before + 1);
+	CHECK_UINT(phf.line, 0);
+#ifdef UVOICE_XMPP
+	CHECK(!strcmp(phf.reason,
+		      "account_type xmpp needs xmpp_jid and xmpp_password"));
+#else
+	CHECK(!strcmp(phf.reason,
+		      "account_type xmpp needs an image built with XMPP"));
+#endif
+
+	CASE("type fault: a reload that keeps the fault reports nothing");
+	same_cfg = start_cfg;
+	same_cfg.channel[0].sip_tos = 46;
+	core_reload(&start_cfg, &same_cfg);
+	CHECK_UINT(phf.n[PHF_LINE_FAULT], before + 1);
+
+	CASE("type fault: a reload that enables the disabled line reports it");
+	both_cfg = same_cfg;
+	both_cfg.channel[1].enabled = true;
+	core_reload(&same_cfg, &both_cfg);
+	CHECK_UINT(phf.n[PHF_LINE_FAULT], before + 2);
+	CHECK_UINT(phf.line, 1);
+
+	/* without XMPP the fault stays and was reported already */
+	CASE("type fault: a jid and a password add no report");
+	same_cfg = both_cfg;
+	for (ch = &same_cfg.channel[0]; ch <= &same_cfg.channel[1]; ch++) {
+		snprintf(ch->xmpp_jid, sizeof(ch->xmpp_jid),
+			 "phone@example.net");
+		snprintf(ch->xmpp_password, sizeof(ch->xmpp_password),
+			 "pencil");
+	}
+	core_reload(&both_cfg, &same_cfg);
+	CHECK_UINT(phf.n[PHF_LINE_FAULT], before + 2);
+
+	CASE("type fault: a sip line without its proxy reports nothing");
+	sip_cfg = same_cfg;
+	sip_cfg.channel[0].account_type = CFG_ACCOUNT_SIP;
+	sip_cfg.channel[1].account_type = CFG_ACCOUNT_SIP;
+	core_reload(&same_cfg, &sip_cfg);
+	core_reload(&sip_cfg, &start_cfg);
+	CHECK_UINT(phf.n[PHF_LINE_FAULT], before + 3);
+	core_reload(&start_cfg, &sip_cfg);
+	CHECK_UINT(phf.n[PHF_LINE_FAULT], before + 3);
 }
 
 static void test_tls_cert_trigger(void)
@@ -7462,6 +7541,17 @@ static void test_view_registered(void)
 	calls_hal_codecs_set(~0u);
 	call_port = udp_loopback_open(&call_fd);
 	CHECK(call_port);
+
+	CASE("intake: a line that drives the Jingle legs answers a new INVITE "
+	     "486, with both slots free");
+	CHECK(call_slot_free(0, &slot));
+	line_legs_jingle = true;
+	CHECK(view_invite_answer(call_fd, call_port, local_port, "view-jingle",
+				 NULL, "SIP/2.0 486"));
+	line_legs_jingle = false;
+	CHECK(!calls_line_busy(0));
+	CHECK_UINT(refused_u32(0, "busy"), 1);
+
 	CHECK(loopback_invite_send(call_fd, call_port, local_port, "view-busy-1",
 				   NULL));
 	CHECK(loopback_invite_send(call_fd, call_port, local_port, "view-busy-2",
@@ -7474,7 +7564,7 @@ static void test_view_registered(void)
 	     "counts it as busy");
 	CHECK(view_invite_answer(call_fd, call_port, local_port, "view-486", NULL,
 				 "SIP/2.0 486"));
-	CHECK_UINT(refused_u32(0, "busy"), 1);
+	CHECK_UINT(refused_u32(0, "busy"), 2);
 	CHECK_UINT(refused_u32(0, "last_code"), 486);
 
 	CASE("view: a refresh in flight keeps the registration live");
@@ -10768,6 +10858,7 @@ static void test_grace_reload(void)
 
 int main(void)
 {
+	alarm(240);
 	/* The end of the graceful stop ends the drain loop, the way
 	 * proto/proto.c ends proto_stop_wait(). */
 	proto_host_fake_reset();
@@ -10806,6 +10897,8 @@ int main(void)
 	test_reg_events();
 	test_early_reload();
 	test_tls_cert_trigger();
+	/* starts xmpp lines, which the SIP layer builds nothing for */
+	test_type_fault();
 	/* Both classes below start accounts, so they run after the pre-start
 	 * window above and before the three live classes at the end. */
 	test_netifd_addr6();

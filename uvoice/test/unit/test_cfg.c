@@ -6915,10 +6915,27 @@ static void xmpp_options_test(void)
 		   1);
 	fixture_free(&fixture);
 	warn_capture_end();
+
+	/* The account layer reports the line (sip/account.c), so the load
+	 * keeps the type whatever the image and whatever is missing. */
+	CASE("an xmpp channel without a jid or a password stays xmpp");
+	warn_capture_begin();
+	FIXTURE_LOAD_OR_RETURN(fixture, channel_option_load(
+		"\toption enabled '1'\n"
+		"\toption account_type 'xmpp'\n"));
+	ch = &fixture.cfg->channel[0];
+	CHECK_UINT(ch->account_type, CFG_ACCOUNT_XMPP);
+	CHECK(ch->enabled);
+	CHECK(!ch->xmpp_jid[0]);
+	CHECK(!ch->xmpp_password[0]);
+	CHECK_UINT(warn_capture_count("account_type"), 0);
+	fixture_free(&fixture);
+	warn_capture_end();
 }
 
 int main(void)
 {
+	alarm(240);
 	trace_ident_test();
 	xmpp_options_test();
 	hal_schema_test();

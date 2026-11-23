@@ -2257,7 +2257,7 @@ static bool account_request_recv(struct account *a, struct sip_msg *msg,
 	struct sip_dialog *d;
 	enum ua_policy pol;
 	uint32_t owner, target;
-	bool new_invite;
+	bool new_invite, admit;
 
 	switch (ua_msg_recv(&a->ua, msg)) {
 	/* the compiler checks the set; the cases below are the whole of it */
@@ -2294,12 +2294,19 @@ static bool account_request_recv(struct account *a, struct sip_msg *msg,
 	new_invite = msg->method == SIP_METHOD_INVITE && !d;
 
 	/*
+	 * A line that switched its account type keeps the Jingle legs while a
+	 * call of them is up, and the SIP legs cannot place a new call there.
+	 */
+	admit = new_invite && sip_line_legs_held(a->line, &calls_leg_ops) &&
+		call_slot_free(a->line, &slot);
+
+	/*
 	 * The owner is fixed when the transaction starts, so a new INVITE
 	 * names the slot it is about to fill. Everything else belongs to the
 	 * UA core, which needs no upcall of its own.
 	 */
 	owner = acct_owner_make(ACCT_OWNER_UA, a->line + 1);
-	if (new_invite && call_slot_free(a->line, &slot))
+	if (admit)
 		owner = acct_owner_make(ACCT_OWNER_CALL, call_slot_handle(a->line, slot));
 
 	txn = sip_txn_server_start(&a->mgr, msg, src, owner);
@@ -2366,8 +2373,7 @@ static bool account_request_recv(struct account *a, struct sip_msg *msg,
 	 * caller's request, and that is the order call.c keeps in front of its
 	 * own admission.
 	 */
-	if (new_invite && !call_slot_free(a->line, &slot) &&
-	    !acct_invite_replaces(msg)) {
+	if (new_invite && !admit && !acct_invite_replaces(msg)) {
 		acct_invite_refuse(a, txn, msg, 486);
 		return true;
 	}
@@ -4073,6 +4079,55 @@ void accounts_hal_features_set(uint32_t features)
 	acct_family_lines_rebuild(&mv);
 }
 
+/**
+ * acct_type_fault() - why an enabled xmpp line cannot register
+ * @cfg: the configuration
+ * @line: the line
+ *
+ * This layer sees the configured type in every image, and the XMPP layer
+ * exists only in an XMPP image. An XMPP image also needs the JID and the
+ * password before its layer takes the line.
+ *
+ * Return: the text of the fault, or NULL for a line that has none.
+ */
+static const char *acct_type_fault(const struct cfg *cfg, unsigned int line)
+{
+	const struct cfg_channel *ch = &cfg->channel[line];
+
+	if (!cfg->enabled || line >= cfg->channels || !ch->present ||
+	    !ch->enabled || ch->account_type != CFG_ACCOUNT_XMPP)
+		return NULL;
+#ifdef UVOICE_XMPP
+	if (!ch->xmpp_jid[0] || !ch->xmpp_password[0])
+		return "account_type xmpp needs xmpp_jid and xmpp_password";
+
+	return NULL;
+#else
+	return "account_type xmpp needs an image built with XMPP";
+#endif
+}
+
+/**
+ * acct_type_report() - report the fault of an xmpp line once
+ * @old_cfg: the configuration before a reload, NULL at the start
+ * @cfg: the configuration now
+ * @line: the line
+ *
+ * A reload reports a fault only when the earlier configuration of the line
+ * did not have the same fault.
+ */
+static void acct_type_report(const struct cfg *old_cfg, const struct cfg *cfg,
+			     unsigned int line)
+{
+	const char *text = acct_type_fault(cfg, line);
+	const char *was = old_cfg ? acct_type_fault(old_cfg, line) : NULL;
+
+	if (!text || (was && !strcmp(was, text)))
+		return;
+
+	vr.host->line_fault(vr.host->ctx, line, true, text);
+}
+
 void accounts_start(const struct cfg *cfg)
 {
 	unsigned int i;
@@ -4104,6 +4159,7 @@ void accounts_start(const struct cfg *cfg)
 			if (!ch->present || i >= cfg->channels)
 				continue;
 
+			acct_type_report(NULL, cfg, i);
 			acct_cfg_derive(cfg, ch, &c);
 			if (!c.enabled) {
 				if (ch->enabled &&
@@ -4215,6 +4271,7 @@ void accounts_reload(const struct cfg *old_cfg, const struct cfg *new_cfg)
 		 * question again from the first rung, the line a reload leaves
 		 * in place included. */
 		dns_retry_reset(a);
+		acct_type_report(old_cfg, new_cfg, i);
 
 		if (ch->present && i < new_cfg->channels)
 			acct_cfg_derive(new_cfg, ch, &nc);

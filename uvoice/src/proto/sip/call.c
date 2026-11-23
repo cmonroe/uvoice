@@ -9611,3 +9611,34 @@ void calls_status_dump(struct blob_buf *b, unsigned int line)
 
 	refused_dump(b, line);
 }
+
+const struct call_leg_ops calls_leg_ops = {
+	.slot_free = call_slot_free,
+	.slot_stream = call_slot_stream,
+	.dial_ready = calls_line_dial_ready,
+	.dial = call_dial,
+	.ring = call_ring,
+	.answer = call_answer,
+	.reject = call_reject,
+	.forward = call_forward,
+	.hangup = call_hangup,
+	.hold = call_hold,
+	.resume = call_resume,
+	.dtmf = call_dtmf,
+	.flash_relay = call_flash_relay,
+	.fax_start = call_fax_start,
+	.fax_hint = call_fax_hint,
+	.fax_on = call_fax_on,
+	.fax_kind_set = call_fax_kind_set,
+	.fax_kind_get = call_fax_kind_get,
+	.fax_ced_proof = call_fax_ced_proof,
+	.fax_tone_note = call_fax_tone_note,
+	.leg_handle_get = call_leg_handle_get,
+	.fax_exit = call_fax_exit,
+	.t38_start = call_t38_start,
+	.xfer = call_xfer,
+	.xfer_consult = call_xfer_consult,
+	.line_end = calls_line_end,
+	.line_teardown = calls_line_teardown,
+	.codec_dump = call_codec_dump,
+};

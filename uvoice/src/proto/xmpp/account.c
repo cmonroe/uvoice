@@ -16,13 +16,16 @@
  * pending answer to the callback the leg layer gave.
  */
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
+#include <time.h>
 
 #include <libubox/blobmsg.h>
 
+#include "posix.h"
 #include "str.h"
 #include "proto/proto_trace.h"
 #include "proto/shared/resolve.h"
@@ -42,6 +45,8 @@
 #define XMPP_RELAYS_MAX		16U
 #define XMPP_OWNER_STREAM	0U
 #define XMPP_OWNER_SHIFT	8U
+#define XMPP_OWNER_GEN_SHIFT	16U
+#define XMPP_TIMER_REFRESH	1U
 #define XMPP_STANZA_MAX		4096U
 #define XMPP_FAULT_TEXT							\
 	"the call could not connect and no TURN relay is configured"
@@ -51,21 +56,35 @@ struct xmpp_contact {
 	char name[XCALL_NAME_MAX];
 };
 
+/* A row with an empty host is free. */
 struct xmpp_service {
 	bool turn;
 	bool resolved;
+	bool configured;	/* the channel names it */
 	char host[HAL_TRANSPORT_HOST_MAX];
 	char addr[HAL_TRANSPORT_HOST_MAX];
 	char user[HAL_TRANSPORT_CRED_MAX];
 	char pass[HAL_TRANSPORT_CRED_MAX];
 	uint16_t port;
 	uint32_t query;
+	uint64_t expires_ms;	/* on the timer clock, 0 for no expiry */
+};
+
+/* One service element of a discovery answer, valid while the answer is. */
+struct service_row {
+	bool turn;
+	uint16_t port;
+	const char *host;
+	const char *user;
+	const char *pass;
+	uint64_t expires_ms;
 };
 
 struct xmpp_account {
 	bool active;
 	bool ready_posted;
 	unsigned int line;
+	uint16_t gen;			/* the generation of the configuration */
 	struct cfg_channel ch;
 	char iface[CFG_STR_MAX];
 	struct sip_tls tls;
@@ -74,6 +93,10 @@ struct xmpp_account {
 	unsigned int contacts;
 	struct xmpp_service service[XMPP_SERVICES_MAX];
 	unsigned int services;
+	struct proto_timer refresh;	/* asks for the relays again */
+	uint64_t refresh_at;		/* its deadline on the timer clock */
+	unsigned int refresh_fails;	/* failed refreshes in a row */
+	bool refreshing;		/* the pending discovery is a refresh */
 	char label[JID_MAX];
 };
 
@@ -90,6 +113,9 @@ static struct {
 	struct proto_timer_env timer_env;
 	struct xmpp_account acct[CFG_CHANNEL_MAX];
 	struct xmpp_relay relay[XMPP_RELAYS_MAX];
+	bool (*dnd)(unsigned int line);
+	bool (*legs_held)(unsigned int line, const struct call_leg_ops *legs);
+	uint16_t gen;
 	bool inited;
 	bool started;
 } xa;
@@ -106,12 +132,36 @@ static void account_teardown(struct xmpp_account *acct);
  * owner_make() - the resolver owner of a question
  * @line: the line
  * @kind: XMPP_OWNER_STREAM, or the relay index plus one
+ * @gen: the generation of the account a relay question belongs to
  *
  * Return: the owner handle.
  */
-static uint32_t owner_make(unsigned int line, unsigned int kind)
+static uint32_t owner_make(unsigned int line, unsigned int kind, uint16_t gen)
 {
-	return ((uint32_t)line << XMPP_OWNER_SHIFT) | kind;
+	return ((uint32_t)gen << XMPP_OWNER_GEN_SHIFT) |
+	       ((uint32_t)line << XMPP_OWNER_SHIFT) | kind;
+}
+
+/**
+ * gen_tag() - the reply pointer of a discovery request
+ * @acct: the account
+ *
+ * Return: the line and the generation of the account in one value.
+ */
+static void *gen_tag(const struct xmpp_account *acct)
+{
+	return (void *)(((uintptr_t)acct->gen << XMPP_OWNER_GEN_SHIFT) |
+			acct->line);
+}
+
+/**
+ * now_ms() - the clock of the relay timers
+ *
+ * Return: milliseconds.
+ */
+static uint64_t now_ms(void)
+{
+	return xa.timer_env.now_ms(&xa.timer_env);
 }
 
 /**
@@ -169,49 +219,158 @@ static void host_port_split(const char *text, char *host, size_t len,
 /* ---------------------------------------------------------------- relays */
 
 /**
+ * service_is() - whether a relay row is the relay of a type, host and port
+ * @svc: the row
+ * @turn: whether the relay relays
+ * @host: its host
+ * @port: its port
+ *
+ * Return: true on a match.
+ */
+static bool service_is(const struct xmpp_service *svc, bool turn,
+		       const char *host, uint16_t port)
+{
+	return svc->host[0] && svc->turn == turn && svc->port == port &&
+	       !strcmp(svc->host, host);
+}
+
+/**
+ * service_find() - the row of a relay the account knows
+ * @acct: the account
+ * @turn: whether the relay relays
+ * @host: its host
+ * @port: its port
+ *
+ * Return: the row, or NULL.
+ */
+static struct xmpp_service *service_find(struct xmpp_account *acct, bool turn,
+					 const char *host, uint16_t port)
+{
+	unsigned int i;
+
+	for (i = 0; i < acct->services; i++) {
+		if (service_is(&acct->service[i], turn, host, port))
+			return &acct->service[i];
+	}
+
+	return NULL;
+}
+
+/**
+ * service_slot() - a free row of the relay table
+ * @acct: the account
+ *
+ * A row keeps its index while it is used, because the index is the owner of
+ * its resolver question.
+ *
+ * Return: the row, or NULL when the table is full.
+ */
+static struct xmpp_service *service_slot(struct xmpp_account *acct)
+{
+	unsigned int i;
+
+	for (i = 0; i < acct->services; i++) {
+		if (!acct->service[i].host[0])
+			return &acct->service[i];
+	}
+
+	if (acct->services >= XMPP_SERVICES_MAX)
+		return NULL;
+
+	return &acct->service[acct->services++];
+}
+
+/**
+ * service_drop() - forget one relay and its resolver question
+ * @acct: the account
+ * @svc: the row
+ */
+static void service_drop(struct xmpp_account *acct, struct xmpp_service *svc)
+{
+	XMPP_ACCT_TRACE(acct, "%s server %s:%u dropped",
+			svc->turn ? "turn" : "stun", svc->host, svc->port);
+	if (svc->query != SIP_HANDLE_NONE)
+		sip_dns_cancel(&xa.dns, svc->query);
+	memset(svc, 0, sizeof(*svc));
+
+	while (acct->services && !acct->service[acct->services - 1].host[0])
+		acct->services--;
+}
+
+/**
  * service_add() - remember one STUN or TURN server and resolve it
  * @acct: the account
  * @turn: whether it relays
  * @host: its host, a name or an address
- * @port: its port
+ * @port: its port, 0 for the default
  * @user: the TURN user, "" for none
  * @pass: the TURN password, "" for none
+ * @expires_ms: when the credentials expire on the timer clock, 0 for never
+ *
+ * A server the account knows keeps its address and takes the credentials
+ * of the newer answer.
+ *
+ * Return: the row of the server, or NULL when the table is full.
  */
-static void service_add(struct xmpp_account *acct, bool turn, const char *host,
-			uint16_t port, const char *user, const char *pass)
+static struct xmpp_service *service_add(struct xmpp_account *acct, bool turn,
+					const char *host, uint16_t port,
+					const char *user, const char *pass,
+					uint64_t expires_ms)
 {
 	struct xmpp_service *svc;
-	unsigned int i;
 
 	if (!host || !host[0])
-		return;
+		return NULL;
 
-	for (i = 0; i < acct->services; i++) {
-		if (acct->service[i].turn == turn &&
-		    !strcmp(acct->service[i].host, host) &&
-		    acct->service[i].port == port)
-			return;
+	if (!port)
+		port = XMPP_STUN_PORT;
+
+	svc = service_find(acct, turn, host, port);
+	if (svc) {
+		str_copy(svc->user, sizeof(svc->user), user);
+		str_copy(svc->pass, sizeof(svc->pass), pass);
+		svc->expires_ms = expires_ms;
+		return svc;
 	}
 
-	if (acct->services >= XMPP_SERVICES_MAX)
-		return;
+	svc = service_slot(acct);
+	if (!svc)
+		return NULL;
 
-	svc = &acct->service[acct->services++];
 	memset(svc, 0, sizeof(*svc));
 	svc->turn = turn;
-	svc->port = port ? port : XMPP_STUN_PORT;
+	svc->port = port;
+	svc->expires_ms = expires_ms;
 	str_copy(svc->host, sizeof(svc->host), host);
-	str_copy(svc->user, sizeof(svc->user), user ? user : "");
-	str_copy(svc->pass, sizeof(svc->pass), pass ? pass : "");
+	str_copy(svc->user, sizeof(svc->user), user);
+	str_copy(svc->pass, sizeof(svc->pass), pass);
 
 	svc->query = sip_dns_resolve(&xa.dns, svc->host, SIP_DNS_ADDR,
 				     svc->port,
 				     owner_make(acct->line,
 						(unsigned int)(svc -
 							       acct->service) +
-						1));
+						1, acct->gen));
 	XMPP_ACCT_TRACE(acct, "%s server %s:%u", turn ? "turn" : "stun",
 			svc->host, svc->port);
+
+	return svc;
+}
+
+/**
+ * services_cancel() - drop the resolver questions of the relays
+ * @acct: the account
+ */
+static void services_cancel(struct xmpp_account *acct)
+{
+	unsigned int i;
+
+	for (i = 0; i < acct->services; i++) {
+		if (acct->service[i].query == SIP_HANDLE_NONE)
+			continue;
+		sip_dns_cancel(&xa.dns, acct->service[i].query);
+		acct->service[i].query = SIP_HANDLE_NONE;
+	}
 }
 
 /**
@@ -221,19 +380,25 @@ static void service_add(struct xmpp_account *acct, bool turn, const char *host,
 static void services_configured(struct xmpp_account *acct)
 {
 	char host[HAL_TRANSPORT_HOST_MAX];
+	struct xmpp_service *svc;
 	uint16_t port;
 
 	if (acct->ch.xmpp_stun[0]) {
 		port = XMPP_STUN_PORT;
 		host_port_split(acct->ch.xmpp_stun, host, sizeof(host), &port);
-		service_add(acct, false, host, port, "", "");
+		svc = service_add(acct, false, host, port, "", "", 0);
+		if (svc)
+			svc->configured = true;
 	}
 
 	if (acct->ch.xmpp_turn[0]) {
 		port = XMPP_STUN_PORT;
 		host_port_split(acct->ch.xmpp_turn, host, sizeof(host), &port);
-		service_add(acct, true, host, port, acct->ch.xmpp_turn_user,
-			    acct->ch.xmpp_turn_password);
+		svc = service_add(acct, true, host, port,
+				  acct->ch.xmpp_turn_user,
+				  acct->ch.xmpp_turn_password, 0);
+		if (svc)
+			svc->configured = true;
 	}
 }
 
@@ -265,55 +430,439 @@ static void service_resolved(struct xmpp_account *acct, unsigned int index,
 }
 
 /**
+ * field_get() - a decimal field of a fixed width and the separator after it
+ * @text: the cursor, moved past the field and the separator
+ * @width: the number of digits
+ * @sep: the separator, 0 for none
+ * @out: receives the value
+ *
+ * Return: true when @width digits and @sep stand at the cursor.
+ */
+static bool field_get(const char **text, unsigned int width, char sep,
+		      int *out)
+{
+	const char *p = *text;
+	unsigned int i;
+	int value = 0;
+
+	for (i = 0; i < width; i++) {
+		if (p[i] < '0' || p[i] > '9')
+			return false;
+		value = value * 10 + (p[i] - '0');
+	}
+
+	p += width;
+	if (sep && *p++ != sep)
+		return false;
+
+	*text = p;
+	*out = value;
+
+	return true;
+}
+
+/**
+ * month_days() - the days of a month
+ * @year: the year
+ * @month: the month, 1 to 12
+ *
+ * Return: the count.
+ */
+static int month_days(int year, int month)
+{
+	static const int days[] = {
+		31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
+	};
+	bool leap = (!(year % 4) && year % 100) || !(year % 400);
+
+	return month == 2 && leap ? 29 : days[month - 1];
+}
+
+/**
+ * datetime_ms() - the UTC milliseconds of an XEP-0082 DateTime
+ * @text: CCYY-MM-DDThh:mm:ss[.sss]TZD, TZD being Z or +hh:mm or -hh:mm
+ * @out: receives the milliseconds since the epoch
+ *
+ * timegm() moves a field out of its range into the next one, so the fields
+ * are checked first. A second of 60 is a leap second.
+ *
+ * Return: true when the text is such a DateTime.
+ */
+static bool datetime_ms(const char *text, int64_t *out)
+{
+	int year, month, day, hour, min, sec, off_h = 0, off_m = 0;
+	int64_t ms = 0, scale = 100, offset;
+	struct tm tm;
+	time_t secs;
+	char tzd;
+
+	if (!text || !field_get(&text, 4, '-', &year) ||
+	    !field_get(&text, 2, '-', &month) ||
+	    !field_get(&text, 2, 'T', &day) ||
+	    !field_get(&text, 2, ':', &hour) ||
+	    !field_get(&text, 2, ':', &min) || !field_get(&text, 2, 0, &sec))
+		return false;
+
+	if (month < 1 || month > 12 || day < 1 ||
+	    day > month_days(year, month) || hour > 23 || min > 59 || sec > 60)
+		return false;
+
+	if (*text == '.') {
+		if (text[1] < '0' || text[1] > '9')
+			return false;
+		for (text++; *text >= '0' && *text <= '9'; text++) {
+			ms += (*text - '0') * scale;
+			scale /= 10;
+		}
+	}
+
+	tzd = *text;
+	if (tzd != 'Z' && tzd != '+' && tzd != '-')
+		return false;
+	text++;
+	if (tzd != 'Z' && (!field_get(&text, 2, ':', &off_h) ||
+			   !field_get(&text, 2, 0, &off_m) || off_h > 23 ||
+			   off_m > 59))
+		return false;
+	if (*text)
+		return false;
+
+	offset = (int64_t)(off_h * 60 + off_m) * 60;
+	if (tzd == '-')
+		offset = -offset;
+
+	memset(&tm, 0, sizeof(tm));
+	tm.tm_year = year - 1900;
+	tm.tm_mon = month - 1;
+	tm.tm_mday = day;
+	tm.tm_hour = hour;
+	tm.tm_min = min;
+	tm.tm_sec = sec;
+	secs = timegm(&tm);
+	if (secs == (time_t)-1)
+		return false;
+
+	*out = ((int64_t)secs - offset) * 1000 + ms;
+
+	return true;
+}
+
+/**
+ * expiry_take() - the timer clock deadline of an expires attribute
+ * @text: the attribute
+ * @out: receives the deadline, now for a time that passed
+ *
+ * The attribute names a wall clock time, and the timers run on a monotonic
+ * clock, so only the distance from now goes into the deadline.
+ *
+ * Return: false when the attribute is no XEP-0082 DateTime.
+ */
+static bool expiry_take(const char *text, uint64_t *out)
+{
+	struct timespec wall;
+	int64_t expires, left;
+	uint64_t now = now_ms();
+
+	if (!datetime_ms(text, &expires) ||
+	    clock_gettime(CLOCK_REALTIME, &wall))
+		return false;
+
+	left = expires - ((int64_t)wall.tv_sec * 1000 +
+			  wall.tv_nsec / 1000000);
+	*out = left > 0 ? now + (uint64_t)left : now;
+
+	return true;
+}
+
+/**
+ * refresh_timer_arm() - arm the refresh timer toward its deadline
+ * @acct: the account
+ *
+ * The uloop timer holds an int, so a deadline further away than INT_MAX ms
+ * takes more than one expiry of the timer.
+ */
+static void refresh_timer_arm(struct xmpp_account *acct)
+{
+	uint64_t now = now_ms();
+	uint64_t left = acct->refresh_at > now ? acct->refresh_at - now : 0;
+
+	proto_timer_arm(&xa.timer_env, &acct->refresh,
+			left < INT_MAX ? (unsigned int)left : INT_MAX);
+}
+
+/**
+ * relays_refresh_arm() - plan the next discovery before an expiry
+ * @acct: the account
+ *
+ * The timer runs XMPP_RELAY_LEAD_MS before the first expiry that is still
+ * ahead, or at half the time left when less than that remains.
+ */
+static void relays_refresh_arm(struct xmpp_account *acct)
+{
+	uint64_t lead = env_ms_get("UVOICE_XMPP_RELAY_LEAD_MS",
+				   XMPP_RELAY_LEAD_MS);
+	uint64_t now = now_ms(), first = 0, left;
+	const struct xmpp_service *svc;
+	unsigned int i;
+
+	proto_timer_cancel(&xa.timer_env, &acct->refresh);
+	acct->refresh_at = 0;
+
+	for (i = 0; i < acct->services; i++) {
+		svc = &acct->service[i];
+		if (svc->turn && svc->expires_ms > now &&
+		    (!first || svc->expires_ms < first))
+			first = svc->expires_ms;
+	}
+	if (!first)
+		return;
+
+	left = first - now;
+	left = left > lead ? left - lead : left / 2;
+	acct->refresh_at = now + left;
+	refresh_timer_arm(acct);
+}
+
+/**
+ * relays_retry() - plan the next try of a failed refresh
+ * @acct: the account
+ * @why: what failed, for the trace
+ *
+ * The wait doubles from XMPP_RELAY_RETRY_MS, and the layer stops after
+ * XMPP_RELAY_RETRIES retries. A new connection asks the server again.
+ */
+static void relays_retry(struct xmpp_account *acct, const char *why)
+{
+	unsigned int base = env_ms_get("UVOICE_XMPP_RELAY_RETRY_MS",
+				       XMPP_RELAY_RETRY_MS);
+
+	if (acct->refresh_fails >= XMPP_RELAY_RETRIES) {
+		XMPP_ACCT_TRACE(acct, "relay refresh %s, no retry left", why);
+		acct->refreshing = false;
+		acct->refresh_fails = 0;
+		return;
+	}
+
+	acct->refresh_fails++;
+	XMPP_ACCT_TRACE(acct, "relay refresh %s, retry %u of %u", why,
+			acct->refresh_fails, XMPP_RELAY_RETRIES);
+	acct->refresh_at = now_ms() +
+			   retry_delay_ms(acct->refresh_fails, base, UINT_MAX);
+	refresh_timer_arm(acct);
+}
+
+/**
+ * relays_refresh_stop() - drop the refresh schedule and its retries
+ * @acct: the account
+ */
+static void relays_refresh_stop(struct xmpp_account *acct)
+{
+	proto_timer_cancel(&xa.timer_env, &acct->refresh);
+	acct->refresh_at = 0;
+	acct->refresh_fails = 0;
+	acct->refreshing = false;
+}
+
+/**
+ * service_row_get() - one service element of a discovery answer
+ * @acct: the account
+ * @reply: the answer
+ * @node: the service element
+ * @row: receives the relay
+ *
+ * A TURN relay with an expires that the layer cannot read is left out,
+ * because its credentials can be stale already.
+ *
+ * Return: true for a STUN or TURN relay over UDP that the layer can use.
+ */
+static bool service_row_get(struct xmpp_account *acct,
+			    const struct xml_doc *reply, unsigned int node,
+			    struct service_row *row)
+{
+	const char *type = xml_attr_get(reply, node, "type");
+	const char *transport = xml_attr_get(reply, node, "transport");
+	const char *port_text = xml_attr_get(reply, node, "port");
+	const char *expires = xml_attr_get(reply, node, "expires");
+	unsigned long port = port_text ? strtoul(port_text, NULL, 10) : 0;
+
+	memset(row, 0, sizeof(*row));
+	row->host = xml_attr_get(reply, node, "host");
+	if (!type || !row->host || !row->host[0] || port > 65535 ||
+	    (transport && strcmp(transport, "udp")))
+		return false;
+
+	row->port = port ? (uint16_t)port : XMPP_STUN_PORT;
+	if (!strcmp(type, XMPP_SERVICE_STUN))
+		return true;
+	if (strcmp(type, XMPP_SERVICE_TURN))
+		return false;
+
+	row->turn = true;
+	row->user = xml_attr_get(reply, node, "username");
+	row->pass = xml_attr_get(reply, node, "password");
+	if (!expires || expiry_take(expires, &row->expires_ms))
+		return true;
+
+	XMPP_ACCT_TRACE(acct, "turn server %s: expires '%s' unreadable, dropped",
+			row->host, expires);
+
+	return false;
+}
+
+/**
+ * service_named() - whether a discovery answer names a relay
+ * @svc: the row of the relay
+ * @row: the relays of the answer
+ * @rows: their count
+ *
+ * Return: true when one of @row is @svc.
+ */
+static bool service_named(const struct xmpp_service *svc,
+			  const struct service_row *row, unsigned int rows)
+{
+	unsigned int i;
+
+	for (i = 0; i < rows; i++) {
+		if (service_is(svc, row[i].turn, row[i].host, row[i].port))
+			return true;
+	}
+
+	return false;
+}
+
+/**
+ * service_row_merge() - add a relay of a discovery answer to its list
+ * @row: the distinct relays of the answer so far
+ * @rows: their count
+ * @cand: the relay
+ *
+ * A relay that the answer names twice keeps its later row. The list holds
+ * at most XMPP_SERVICES_MAX distinct relays.
+ *
+ * Return: the new count.
+ */
+static unsigned int service_row_merge(struct service_row *row,
+				      unsigned int rows,
+				      const struct service_row *cand)
+{
+	unsigned int i;
+
+	for (i = 0; i < rows; i++) {
+		if (row[i].turn == cand->turn && row[i].port == cand->port &&
+		    !strcmp(row[i].host, cand->host)) {
+			row[i] = *cand;
+			return rows;
+		}
+	}
+
+	if (rows < XMPP_SERVICES_MAX)
+		row[rows++] = *cand;
+
+	return rows;
+}
+
+/**
+ * service_configured_restore() - give a relay the channel names its
+ * configured credentials back
+ * @acct: the account
+ * @svc: the row of the relay
+ */
+static void service_configured_restore(struct xmpp_account *acct,
+				       struct xmpp_service *svc)
+{
+	str_copy(svc->user, sizeof(svc->user),
+		 svc->turn ? acct->ch.xmpp_turn_user : "");
+	str_copy(svc->pass, sizeof(svc->pass),
+		 svc->turn ? acct->ch.xmpp_turn_password : "");
+	svc->expires_ms = 0;
+}
+
+/**
+ * services_replace() - take the relays of a discovery answer
+ * @acct: the account
+ * @row: the relays the answer names
+ * @rows: their count
+ *
+ * The answer replaces the relays of an earlier answer. The relays the
+ * channel names stay, with their configured credentials when the answer
+ * does not name them.
+ */
+static void services_replace(struct xmpp_account *acct,
+			     const struct service_row *row, unsigned int rows)
+{
+	struct xmpp_service *svc;
+	unsigned int i;
+
+	for (i = 0; i < acct->services; i++) {
+		svc = &acct->service[i];
+		if (!svc->host[0] || service_named(svc, row, rows))
+			continue;
+		if (svc->configured)
+			service_configured_restore(acct, svc);
+		else
+			service_drop(acct, svc);
+	}
+
+	for (i = 0; i < rows; i++)
+		service_add(acct, row[i].turn, row[i].host, row[i].port,
+			    row[i].user, row[i].pass, row[i].expires_ms);
+}
+
+/**
  * services_reply() - the answer of the XEP-0215 query
  * @xs: the stream
  * @reply: the iq, NULL for none
- * @priv: the account
+ * @priv: the line and the generation of the request (gen_tag())
  */
 static void services_reply(struct xmpp_stream *xs, const struct xml_doc *reply,
 			   void *priv)
 {
-	struct xmpp_account *acct = priv;
-	const char *type, *transport, *host, *port_text;
-	unsigned int list, node;
-	unsigned long port;
+	uintptr_t tag = (uintptr_t)priv;
+	struct xmpp_account *acct = acct_get(tag & 0xff);
+	struct service_row row[XMPP_SERVICES_MAX], cand;
+	unsigned int rows = 0, list = XML_NONE, node;
+	const char *why = "unanswered";
+	const char *type;
 
-	if (!reply)
+	if (!acct || (uint16_t)(tag >> XMPP_OWNER_GEN_SHIFT) != acct->gen)
 		return;
 
-	type = xml_attr_get(reply, 0, "type");
-	if (!type || strcmp(type, "result"))
-		return;
-
-	list = xml_child(reply, XML_NONE, "services", XMPP_NS_EXTDISCO);
-	node = xml_child(reply, list, "service", XMPP_NS_EXTDISCO);
-	while (node != XML_NONE) {
-		type = xml_attr_get(reply, node, "type");
-		transport = xml_attr_get(reply, node, "transport");
-		host = xml_attr_get(reply, node, "host");
-		port_text = xml_attr_get(reply, node, "port");
-		port = port_text ? strtoul(port_text, NULL, 10) : 0;
-		if (type && host && (!transport || !strcmp(transport, "udp")) &&
-		    port <= 65535) {
-			if (!strcmp(type, XMPP_SERVICE_STUN))
-				service_add(acct, false, host, (uint16_t)port,
-					    "", "");
-			else if (!strcmp(type, XMPP_SERVICE_TURN))
-				service_add(acct, true, host, (uint16_t)port,
-					    xml_attr_get(reply, node,
-							 "username"),
-					    xml_attr_get(reply, node,
-							 "password"));
+	if (reply) {
+		type = xml_attr_get(reply, 0, "type");
+		why = "refused";
+		if (type && !strcmp(type, "result")) {
+			why = "answered without services";
+			list = xml_child(reply, XML_NONE, "services",
+					 XMPP_NS_EXTDISCO);
 		}
-		node = xml_next(reply, node, "service", XMPP_NS_EXTDISCO);
 	}
+
+	if (list == XML_NONE) {
+		if (acct->refreshing)
+			relays_retry(acct, why);
+		return;
+	}
+
+	node = xml_child(reply, list, "service", XMPP_NS_EXTDISCO);
+	for (; node != XML_NONE;
+	     node = xml_next(reply, node, "service", XMPP_NS_EXTDISCO)) {
+		if (service_row_get(acct, reply, node, &cand))
+			rows = service_row_merge(row, rows, &cand);
+	}
+
+	services_replace(acct, row, rows);
+	acct->refreshing = false;
+	acct->refresh_fails = 0;
+	relays_refresh_arm(acct);
 }
 
 /**
  * services_ask() - the XEP-0215 query to the server
  * @acct: the account
+ *
+ * Return: 0, or the errno of the stream.
  */
-static void services_ask(struct xmpp_account *acct)
+static int services_ask(struct xmpp_account *acct)
 {
 	char mem[XMPP_STANZA_MAX];
 	char id[XMPP_ID_MAX];
@@ -331,9 +880,34 @@ static void services_ask(struct xmpp_account *acct)
 	xml_w_end(&writer);
 	xml_w_end(&writer);
 	len = xml_w_finish(&writer);
-	if (len)
-		xmpp_stream_iq_send(&acct->stream, mem, len, id, NULL,
-				    services_reply, acct);
+	if (!len)
+		return -EMSGSIZE;
+
+	return xmpp_stream_iq_send(&acct->stream, mem, len, id, NULL,
+				   services_reply, gen_tag(acct));
+}
+
+/**
+ * relays_refresh_fire() - the credentials of a relay expire soon
+ * @timer: the refresh timer of the account
+ */
+static void relays_refresh_fire(struct proto_timer *timer)
+{
+	struct xmpp_account *acct = timer->owner;
+
+	if (now_ms() < acct->refresh_at) {
+		refresh_timer_arm(acct);
+		return;
+	}
+
+	acct->refresh_at = 0;
+	XMPP_ACCT_TRACE(acct, "relay credentials expire, asking again");
+	if (!xmpp_stream_ready(&acct->stream))
+		return;
+
+	acct->refreshing = true;
+	if (services_ask(acct))
+		relays_retry(acct, "not sent");
 }
 
 /* ---------------------------------------------------------------- roster */
@@ -459,6 +1033,8 @@ static void stream_state(struct xmpp_stream *xs, enum xmpp_stream_state state,
 		return;
 	}
 
+	/* The next connection asks the server again. */
+	relays_refresh_stop(acct);
 	if (acct->ready_posted) {
 		xcalls_stream_down(acct->line);
 		reg_post(acct, false);
@@ -500,8 +1076,9 @@ static const struct xmpp_stream_cb stream_cb = {
 static void dns_done(struct sip_dns *resolver, uint32_t query, uint32_t owner,
 		     const struct sip_dns_result *res, void *priv)
 {
-	unsigned int line = owner >> XMPP_OWNER_SHIFT;
+	unsigned int line = (owner >> XMPP_OWNER_SHIFT) & 0xff;
 	unsigned int kind = owner & ((1u << XMPP_OWNER_SHIFT) - 1);
+	uint16_t gen = (uint16_t)(owner >> XMPP_OWNER_GEN_SHIFT);
 	struct xmpp_account *acct = acct_get(line);
 
 	if (!acct)
@@ -509,7 +1086,7 @@ static void dns_done(struct sip_dns *resolver, uint32_t query, uint32_t owner,
 
 	if (kind == XMPP_OWNER_STREAM)
 		xmpp_stream_dns_done(&acct->stream, query, res);
-	else
+	else if (gen == acct->gen)
 		service_resolved(acct, kind - 1, res);
 }
 
@@ -797,7 +1374,7 @@ static bool env_contact_name(void *priv, unsigned int line, const char *bare,
 }
 
 /**
- * env_speed_dial() - the JID a dialled digit string stands for
+ * env_speed_dial() - the JID a dialed digit string stands for
  * @priv: unused
  * @line: the line
  * @digits: the digits
@@ -842,6 +1419,7 @@ static void env_ice_servers(void *priv, unsigned int line,
 	struct xmpp_account *acct = acct_get(line);
 	const struct xmpp_service *svc;
 	struct hal_turn *turn;
+	uint64_t now = now_ms();
 	unsigned int i;
 
 	if (!acct)
@@ -849,7 +1427,7 @@ static void env_ice_servers(void *priv, unsigned int line,
 
 	for (i = 0; i < acct->services; i++) {
 		svc = &acct->service[i];
-		if (!svc->resolved)
+		if (!svc->resolved || (svc->expires_ms && now >= svc->expires_ms))
 			continue;
 		if (!svc->turn) {
 			if (out->stun_host[0])
@@ -884,6 +1462,30 @@ static void env_relay_missing(void *priv, unsigned int line)
 	if (xa.host->log)
 		xa.host->log(xa.host->ctx, LOG_WARNING, "xmpp line %u: %s",
 			     line, XMPP_FAULT_TEXT);
+}
+
+/**
+ * env_dnd() - whether do-not-disturb holds a line
+ * @priv: unused
+ * @line: the line
+ *
+ * Return: what the shell answers.
+ */
+static bool env_dnd(void *priv, unsigned int line)
+{
+	return xa.dnd && xa.dnd(line);
+}
+
+/**
+ * env_legs_held() - whether a line drives the Jingle legs
+ * @priv: unused
+ * @line: the line
+ *
+ * Return: what the shell answers.
+ */
+static bool env_legs_held(void *priv, unsigned int line)
+{
+	return xa.legs_held && xa.legs_held(line, &xcalls_leg_ops);
 }
 
 /* ---------------------------------------------------------------- build */
@@ -927,14 +1529,17 @@ static void account_build(struct xmpp_account *acct, const struct cfg *cfg,
 	struct xmpp_stream_env env = {
 		.host = xa.host,
 		.dns = &xa.dns,
-		.dns_owner = owner_make(line, XMPP_OWNER_STREAM),
+		.dns_owner = owner_make(line, XMPP_OWNER_STREAM, 0),
 	};
 	struct xmpp_stream_cfg scfg;
 	int ret;
 
 	memset(acct, 0, sizeof(*acct));
 	acct->line = line;
+	acct->gen = ++xa.gen;
 	acct->ch = *ch;
+	proto_timer_init(&acct->refresh, acct, XMPP_TIMER_REFRESH,
+			 relays_refresh_fire);
 	str_copy(acct->iface, sizeof(acct->iface),
 		 ch->local_interface[0] ? ch->local_interface :
 					  cfg->local_interface);
@@ -973,16 +1578,14 @@ static void account_build(struct xmpp_account *acct, const struct cfg *cfg,
  */
 static void account_teardown(struct xmpp_account *acct)
 {
-	unsigned int i;
-
 	if (!acct->active)
 		return;
 
 	xcalls_line_teardown(acct->line);
-	for (i = 0; i < acct->services; i++) {
-		if (acct->service[i].query != SIP_HANDLE_NONE)
-			sip_dns_cancel(&xa.dns, acct->service[i].query);
-	}
+	services_cancel(acct);
+	/* The iq flush of the stream answers a refresh in flight, and that
+	 * answer must not plan a retry. */
+	relays_refresh_stop(acct);
 	xmpp_stream_done(&acct->stream);
 	reg_post(acct, false);
 	sip_tls_done(&acct->tls);
@@ -1014,7 +1617,10 @@ static bool stream_options_moved(const struct cfg_channel *old_ch,
 
 /* -------------------------------------------------------------- lifecycle */
 
-void xmpp_accounts_init(const struct proto_host *host, const struct call_cb *cb)
+void xmpp_accounts_init(const struct proto_host *host, const struct call_cb *cb,
+			bool (*dnd)(unsigned int line),
+			bool (*legs_held)(unsigned int line,
+					  const struct call_leg_ops *legs))
 {
 	struct sip_dns_cb dcb = { .done = dns_done };
 	struct sip_dns_cfg dcfg;
@@ -1036,10 +1642,14 @@ void xmpp_accounts_init(const struct proto_host *host, const struct call_cb *cb)
 		.speed_dial = env_speed_dial,
 		.ice_servers = env_ice_servers,
 		.relay_missing = env_relay_missing,
+		.dnd = env_dnd,
+		.legs_held = env_legs_held,
 	};
 
 	memset(&xa, 0, sizeof(xa));
 	xa.host = host;
+	xa.dnd = dnd;
+	xa.legs_held = legs_held;
 	proto_timer_env_uloop_init(&xa.timer_env);
 
 	sip_dns_cfg_default(&dcfg);
@@ -1104,6 +1714,9 @@ void xmpp_accounts_reload(const struct cfg *old_cfg, const struct cfg *new_cfg)
 			continue;
 
 		acct->ch = new_cfg->channel[i];
+		services_cancel(acct);
+		relays_refresh_stop(acct);
+		acct->gen = ++xa.gen;
 		acct->services = 0;
 		services_configured(acct);
 		if (xmpp_stream_ready(&acct->stream))
@@ -1191,6 +1804,8 @@ static void account_dump(const struct xmpp_account *acct, struct blob_buf *b)
 	arr = blobmsg_open_array(b, "relays");
 	for (i = 0; i < acct->services; i++) {
 		svc = &acct->service[i];
+		if (!svc->host[0])
+			continue;
 		row = blobmsg_open_table(b, NULL);
 		blobmsg_add_string(b, "type", svc->turn ? XMPP_SERVICE_TURN :
 							  XMPP_SERVICE_STUN);

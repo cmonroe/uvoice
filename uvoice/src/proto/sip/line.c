@@ -216,6 +216,9 @@ struct sip_line {
 	bool fwd_disc_fired;		/* this clearing episode already reversed */
 	bool fwd_disc_avail;		/* the backend carries HAL_FEAT_POLARITY */
 	bool conf_avail;		/* the backend carries HAL_FEAT_CONF */
+	/* the leg layer of the account; it follows chan at rest
+	 * (line_legs_take) */
+	const struct call_leg_ops *legs;
 };
 
 static struct sip_line sip_lines[CFG_CHANNEL_MAX];
@@ -244,6 +247,8 @@ static void flash_derive(struct sip_line *l, const struct cfg_channel *ch,
 static void line_fault_report(const struct sip_line *l, bool loud,
 			      const char *text);
 static uint32_t sip_line_flags_of(const struct sip_line *l);
+static void cb_failed(unsigned int line, unsigned int slot,
+		      enum call_fail_class cls);
 
 static struct sip_line *sip_line_get(unsigned int index)
 {
@@ -402,6 +407,292 @@ static uint32_t sec_to_ms(unsigned int sec)
 	return (uint32_t)sec * 1000u;
 }
 
+/**
+ * line_legs_of() - the leg table a channel names
+ * @ch: the channel
+ *
+ * Return: the Jingle table for an XMPP account in a build with the XMPP
+ * unit, the SIP table otherwise.
+ */
+static const struct call_leg_ops *line_legs_of(const struct cfg_channel *ch)
+{
+#ifdef UVOICE_XMPP
+	if (ch->account_type == CFG_ACCOUNT_XMPP)
+		return &xcalls_leg_ops;
+#endif
+	return &calls_leg_ops;
+}
+
+/**
+ * line_legs() - the leg table a line drives now
+ * @line: the line
+ *
+ * Return: the table, one with no entry for an unknown line.
+ */
+static const struct call_leg_ops *line_legs(unsigned int line)
+{
+	static const struct call_leg_ops none;
+	const struct sip_line *l = sip_line_get(line);
+
+	return l && l->legs ? l->legs : &none;
+}
+
+/*
+ * The wrappers below are the one way from this file to a leg layer. Each
+ * turns a NULL entry into the refusal its call.h contract states.
+ */
+
+static unsigned int leg_slot_stream(unsigned int line, unsigned int slot)
+{
+	const struct call_leg_ops *legs = line_legs(line);
+
+	return legs->slot_stream ? legs->slot_stream(line, slot) : CALL_SLOTS;
+}
+
+static bool leg_slot_free(unsigned int line, unsigned int *slot)
+{
+	const struct call_leg_ops *legs = line_legs(line);
+
+	return legs->slot_free && legs->slot_free(line, slot);
+}
+
+static bool leg_dial_ready(unsigned int line)
+{
+	const struct call_leg_ops *legs = line_legs(line);
+
+	return legs->dial_ready && legs->dial_ready(line);
+}
+
+/* call.h call_dial: a dial with no place to go reports congestion. */
+static bool leg_dial(unsigned int line, unsigned int slot, const char *number,
+		     bool cid_present)
+{
+	const struct call_leg_ops *legs = line_legs(line);
+
+	if (legs->dial)
+		return legs->dial(line, slot, number, cid_present);
+
+	cb_failed(line, slot, CALL_FAIL_CONGESTION);
+
+	return false;
+}
+
+static bool leg_ring(unsigned int line, unsigned int slot)
+{
+	const struct call_leg_ops *legs = line_legs(line);
+
+	return legs->ring && legs->ring(line, slot);
+}
+
+static bool leg_answer(unsigned int line, unsigned int slot)
+{
+	const struct call_leg_ops *legs = line_legs(line);
+
+	return legs->answer && legs->answer(line, slot);
+}
+
+static bool leg_reject(unsigned int line, unsigned int slot, uint32_t code)
+{
+	const struct call_leg_ops *legs = line_legs(line);
+
+	return legs->reject && legs->reject(line, slot, code);
+}
+
+static bool leg_forward(unsigned int line, unsigned int slot,
+			const char *target)
+{
+	const struct call_leg_ops *legs = line_legs(line);
+
+	return legs->forward && legs->forward(line, slot, target);
+}
+
+static bool leg_hangup(unsigned int line, unsigned int slot)
+{
+	const struct call_leg_ops *legs = line_legs(line);
+
+	return legs->hangup && legs->hangup(line, slot);
+}
+
+static bool leg_hold(unsigned int line, unsigned int slot)
+{
+	const struct call_leg_ops *legs = line_legs(line);
+
+	return legs->hold && legs->hold(line, slot);
+}
+
+static bool leg_resume(unsigned int line, unsigned int slot)
+{
+	const struct call_leg_ops *legs = line_legs(line);
+
+	return legs->resume && legs->resume(line, slot);
+}
+
+static bool leg_dtmf(unsigned int line, unsigned int slot, char digit,
+		     uint16_t duration_ms, bool measured)
+{
+	const struct call_leg_ops *legs = line_legs(line);
+
+	return legs->dtmf &&
+	       legs->dtmf(line, slot, digit, duration_ms, measured);
+}
+
+static bool leg_flash_relay(unsigned int line, unsigned int slot)
+{
+	const struct call_leg_ops *legs = line_legs(line);
+
+	return legs->flash_relay && legs->flash_relay(line, slot);
+}
+
+static bool leg_fax_start(unsigned int line, unsigned int slot)
+{
+	const struct call_leg_ops *legs = line_legs(line);
+
+	return legs->fax_start && legs->fax_start(line, slot);
+}
+
+static void leg_fax_hint(unsigned int line, unsigned int slot)
+{
+	const struct call_leg_ops *legs = line_legs(line);
+
+	if (legs->fax_hint)
+		legs->fax_hint(line, slot);
+}
+
+static bool leg_fax_on(unsigned int line, unsigned int slot)
+{
+	const struct call_leg_ops *legs = line_legs(line);
+
+	return legs->fax_on && legs->fax_on(line, slot);
+}
+
+static bool leg_fax_kind_set(unsigned int line, unsigned int slot,
+			     uint8_t kind)
+{
+	const struct call_leg_ops *legs = line_legs(line);
+
+	return legs->fax_kind_set && legs->fax_kind_set(line, slot, kind);
+}
+
+static uint8_t leg_fax_kind_get(unsigned int line, unsigned int slot)
+{
+	const struct call_leg_ops *legs = line_legs(line);
+
+	return legs->fax_kind_get ? legs->fax_kind_get(line, slot) :
+				    HAL_PASSTHROUGH_OFF;
+}
+
+static bool leg_fax_ced_proof(unsigned int line, unsigned int slot,
+			      uint16_t code)
+{
+	const struct call_leg_ops *legs = line_legs(line);
+
+	return legs->fax_ced_proof && legs->fax_ced_proof(line, slot, code);
+}
+
+/* call.h call_fax_tone_note: a slot with no leg answers by the edge alone. */
+static enum call_fax_tone leg_fax_tone_note(unsigned int line,
+					    unsigned int slot, uint16_t code,
+					    uint8_t direction, bool end,
+					    uint16_t duration_ms)
+{
+	const struct call_leg_ops *legs = line_legs(line);
+
+	if (legs->fax_tone_note)
+		return legs->fax_tone_note(line, slot, code, direction, end,
+					   duration_ms);
+
+	return end ? CALL_FAX_TONE_END : CALL_FAX_TONE_NOTED;
+}
+
+static uint32_t leg_handle_get(unsigned int line, unsigned int ui_slot)
+{
+	const struct call_leg_ops *legs = line_legs(line);
+
+	return legs->leg_handle_get ? legs->leg_handle_get(line, ui_slot) :
+				      SIP_HANDLE_NONE;
+}
+
+static bool leg_fax_exit(unsigned int line, uint32_t handle)
+{
+	const struct call_leg_ops *legs = line_legs(line);
+
+	return legs->fax_exit && legs->fax_exit(handle);
+}
+
+static enum call_t38_answer leg_t38_start(unsigned int line, unsigned int slot)
+{
+	const struct call_leg_ops *legs = line_legs(line);
+
+	return legs->t38_start ? legs->t38_start(line, slot) :
+				 CALL_T38_REFUSED;
+}
+
+static bool leg_xfer(unsigned int line, unsigned int slot,
+		     enum call_xfer_kind kind, const char *target)
+{
+	const struct call_leg_ops *legs = line_legs(line);
+
+	return legs->xfer && legs->xfer(line, slot, kind, target);
+}
+
+static bool leg_xfer_consult(unsigned int line, unsigned int referee,
+			     unsigned int replaced)
+{
+	const struct call_leg_ops *legs = line_legs(line);
+
+	return legs->xfer_consult &&
+	       legs->xfer_consult(line, referee, replaced);
+}
+
+static void leg_line_end(unsigned int line)
+{
+	const struct call_leg_ops *legs = line_legs(line);
+
+	if (legs->line_end)
+		legs->line_end(line);
+}
+
+static void leg_line_teardown(unsigned int line)
+{
+	const struct call_leg_ops *legs = line_legs(line);
+
+	if (legs->line_teardown)
+		legs->line_teardown(line);
+}
+
+static void leg_codec_dump(struct blob_buf *b, unsigned int line,
+			   unsigned int ui_slot)
+{
+	const struct call_leg_ops *legs = line_legs(line);
+
+	if (legs->codec_dump)
+		legs->codec_dump(b, line, ui_slot);
+}
+
+/*
+ * The leg table follows the channel line_cfg_apply() installed. A call that
+ * is up ends through the table it started with, so the switch waits until no
+ * UI slot holds a leg. The rest state of the machine does not prove that:
+ * the desk keeps the machine in IDLE while its calls run.
+ */
+static void line_legs_take(struct sip_line *l)
+{
+	const struct call_leg_ops *legs = line_legs_of(&l->chan);
+	unsigned int slot;
+
+	if (legs == l->legs)
+		return;
+
+	for (slot = 0; slot < CALL_SLOTS; slot++) {
+		if (leg_slot_stream(l->index, slot) < CALL_SLOTS)
+			return;
+	}
+
+	l->legs = legs;
+	LTRACE(TRACE_FSM, "line %u takes the %s legs", l->index,
+	       legs == &calls_leg_ops ? "SIP" : "Jingle");
+}
+
 /*
  * The physical leg behind a UI slot (call.h call_slot_stream, the two-name
  * contract). Everything the core keys by stream is a leg fact: its
@@ -413,206 +704,6 @@ static uint32_t sec_to_ms(unsigned int sec)
  * before a leg exists, or after one is gone, reads the slot as the stream,
  * and the refusals behind it read that index.
  */
-/**
- * line_xmpp() - whether the line carries Jingle legs
- * @line: the line
- *
- * Return: true when the channel names an XMPP account in a build that
- * carries the XMPP unit.
- */
-static bool line_xmpp(unsigned int line)
-{
-#ifdef UVOICE_XMPP
-	return line < CFG_CHANNEL_MAX &&
-	       sip_lines[line].chan.account_type == CFG_ACCOUNT_XMPP;
-#else
-	return false;
-#endif
-}
-
-/**
- * leg_slot_stream() - the stream a UI slot runs on, in either leg layer
- * @line: the line
- * @slot: the UI slot
- *
- * Return: the stream, CALL_SLOTS when no leg holds the slot.
- */
-static unsigned int leg_slot_stream(unsigned int line, unsigned int slot)
-{
-#ifdef UVOICE_XMPP
-	if (line_xmpp(line))
-		return xcall_slot_stream(line, slot);
-#endif
-	return call_slot_stream(line, slot);
-}
-
-/**
- * leg_slot_free() - the admission check of a new call, in either leg layer
- * @line: the line
- * @slot: receives a free slot
- *
- * Return: true when a slot is free.
- */
-static bool leg_slot_free(unsigned int line, unsigned int *slot)
-{
-#ifdef UVOICE_XMPP
-	if (line_xmpp(line))
-		return xcall_slot_free(line, slot);
-#endif
-	return call_slot_free(line, slot);
-}
-
-/**
- * leg_dial_ready() - whether the line can place a call now
- * @line: the line
- *
- * Return: true when its account is live.
- */
-static bool leg_dial_ready(unsigned int line)
-{
-#ifdef UVOICE_XMPP
-	if (line_xmpp(line))
-		return xcall_line_dial_ready(line);
-#endif
-	return calls_line_dial_ready(line);
-}
-
-/**
- * leg_dial() - place a call through the leg layer of the line
- * @line: the line
- * @slot: the free slot
- * @number: the target
- * @cid_present: the caller id presentation, which the SIP legs read
- *
- * Return: true when the leg left.
- */
-static bool leg_dial(unsigned int line, unsigned int slot, const char *number,
-		     bool cid_present)
-{
-#ifdef UVOICE_XMPP
-	if (line_xmpp(line))
-		return xcall_dial(line, slot, number);
-#endif
-	return call_dial(line, slot, number, cid_present);
-}
-
-/**
- * leg_ring() - tell the caller that the line rings
- * @line: the line
- * @slot: the slot
- *
- * Return: true when the leg took it.
- */
-static bool leg_ring(unsigned int line, unsigned int slot)
-{
-#ifdef UVOICE_XMPP
-	if (line_xmpp(line))
-		return xcall_ring(line, slot);
-#endif
-	return call_ring(line, slot);
-}
-
-/**
- * leg_answer() - take an offered call
- * @line: the line
- * @slot: the slot
- *
- * Return: true when the leg took it.
- */
-static bool leg_answer(unsigned int line, unsigned int slot)
-{
-#ifdef UVOICE_XMPP
-	if (line_xmpp(line))
-		return xcall_answer(line, slot);
-#endif
-	return call_answer(line, slot);
-}
-
-/**
- * leg_reject() - decline an offered call
- * @line: the line
- * @slot: the slot
- * @code: the SIP status of the refusal
- *
- * Return: true when the leg took it.
- */
-static bool leg_reject(unsigned int line, unsigned int slot, uint32_t code)
-{
-#ifdef UVOICE_XMPP
-	if (line_xmpp(line))
-		return xcall_reject(line, slot, code);
-#endif
-	return call_reject(line, slot, code);
-}
-
-/**
- * leg_hangup() - end a call in any state
- * @line: the line
- * @slot: the slot
- *
- * Return: true when a leg was there.
- */
-static bool leg_hangup(unsigned int line, unsigned int slot)
-{
-#ifdef UVOICE_XMPP
-	if (line_xmpp(line))
-		return xcall_hangup(line, slot);
-#endif
-	return call_hangup(line, slot);
-}
-
-/**
- * leg_hold() - hold an active call
- * @line: the line
- * @slot: the slot
- *
- * Return: true when the exchange left.
- */
-static bool leg_hold(unsigned int line, unsigned int slot)
-{
-#ifdef UVOICE_XMPP
-	if (line_xmpp(line))
-		return xcall_hold(line, slot);
-#endif
-	return call_hold(line, slot);
-}
-
-/**
- * leg_resume() - resume a held call
- * @line: the line
- * @slot: the slot
- *
- * Return: true when the exchange left.
- */
-static bool leg_resume(unsigned int line, unsigned int slot)
-{
-#ifdef UVOICE_XMPP
-	if (line_xmpp(line))
-		return xcall_resume(line, slot);
-#endif
-	return call_resume(line, slot);
-}
-
-/**
- * leg_dtmf() - send a digit toward the far end
- * @line: the line
- * @slot: the slot
- * @digit: the digit
- * @duration_ms: its length
- * @measured: whether a detector of the line timed it
- *
- * Return: true when the leg took it.
- */
-static bool leg_dtmf(unsigned int line, unsigned int slot, char digit,
-		     uint16_t duration_ms, bool measured)
-{
-#ifdef UVOICE_XMPP
-	if (line_xmpp(line))
-		return xcall_dtmf(line, slot, digit, duration_ms, measured);
-#endif
-	return call_dtmf(line, slot, digit, duration_ms, measured);
-}
-
 static unsigned int slot_stream(unsigned int line, unsigned int slot)
 {
 	unsigned int stream = leg_slot_stream(line, slot);
@@ -862,6 +953,7 @@ static void line_queue_drain(struct sip_line *l)
 	}
 
 	line_cfg_apply(l);
+	line_legs_take(l);
 
 	/*
 	 * Before the settle below, because the two meet on the same wire: a
@@ -1110,7 +1202,7 @@ static void op_flash_relay(void *priv)
 	}
 
 	l->fsm_depth++;
-	ok = call_flash_relay(l->index, slot);
+	ok = leg_flash_relay(l->index, slot);
 	l->fsm_depth--;
 
 	LTRACE(TRACE_FSM, "line %u flash relay slot %u %s", l->index, slot,
@@ -1323,7 +1415,9 @@ static bool op_feature_invoke_arg(void *priv, const char *code, const char *arg)
  * owes this slot nothing more. A leg that cannot take the redirect is traced
  * and the caller hears whatever the far end does with an unanswered INVITE:
  * inventing a local treatment here would contradict the cell that chose the
- * forward.
+ * forward. A leg table without a redirect cannot serve the forward at all,
+ * and the machine is done with the slot after it, so the offer is rejected
+ * rather than left ringing until the caller gives up.
  */
 static void op_call_forward(void *priv, unsigned int slot, const char *target)
 {
@@ -1331,7 +1425,14 @@ static void op_call_forward(void *priv, unsigned int slot, const char *target)
 	bool ok;
 
 	l->fsm_depth++;
-	ok = call_forward(l->index, slot, target);
+	if (!line_legs(l->index)->forward) {
+		leg_reject(l->index, slot, 480);
+		l->fsm_depth--;
+		LTRACE(TRACE_FSM, "line %u forward slot %u to '%s': the legs have "
+		       "no redirect, rejected", l->index, slot, target);
+		return;
+	}
+	ok = leg_forward(l->index, slot, target);
 	l->fsm_depth--;
 
 	LTRACE(TRACE_FSM, "line %u forward slot %u to '%s' %s", l->index, slot, target,
@@ -1406,7 +1507,7 @@ static void op_call_xfer(void *priv, unsigned int slot, enum feature_action act,
 	l->fsm_depth++;
 
 	if (referable) {
-		ok = call_xfer(l->index, slot, kind, target);
+		ok = leg_xfer(l->index, slot, kind, target);
 		LTRACE(TRACE_FSM, "line %u transfer slot %u (%s%s) to '%s' %s", l->index,
 		       slot, feature_action_name(act), onhook ? ", on hook" : "",
 		       target ? target : "", ok ? "sent" : "refused");
@@ -1421,7 +1522,7 @@ static void op_call_xfer(void *priv, unsigned int slot, enum feature_action act,
 		 * IDLE on a leg the call layer already ended.
 		 */
 		if (onhook)
-			call_hangup(l->index, slot);
+			leg_hangup(l->index, slot);
 		line_ev_deliver(l, FSM_EV_CALL_XFER_FAIL, slot);
 	}
 
@@ -1437,25 +1538,32 @@ static void op_call_xfer(void *priv, unsigned int slot, enum feature_action act,
  * legs are still up with nobody left to clear them, because the machine owns
  * no transfer to fail and no leg to hang up.
  */
-static void op_call_xfer_consult(void *priv, unsigned int referee,
-				 unsigned int replaced)
+static bool xfer_consult_send(struct sip_line *l, unsigned int referee,
+			      unsigned int replaced)
 {
-	struct sip_line *l = priv;
 	bool ok;
 
 	l->fsm_depth++;
-	ok = call_xfer_consult(l->index, referee, replaced);
+	ok = leg_xfer_consult(l->index, referee, replaced);
 	l->fsm_depth--;
 
 	LTRACE(TRACE_FSM, "line %u consult transfer refers slot %u to slot %u %s",
 	       l->index, referee, replaced, ok ? "sent" : "refused");
 
-	if (ok)
+	return ok;
+}
+
+static void op_call_xfer_consult(void *priv, unsigned int referee,
+				 unsigned int replaced)
+{
+	struct sip_line *l = priv;
+
+	if (xfer_consult_send(l, referee, replaced))
 		return;
 
 	l->fsm_depth++;
-	call_hangup(l->index, referee);
-	call_hangup(l->index, replaced);
+	leg_hangup(l->index, referee);
+	leg_hangup(l->index, replaced);
 	l->fsm_depth--;
 }
 
@@ -1934,7 +2042,7 @@ static void fax_exit_expire(struct uloop_timeout *t)
 	if (!l || e->stream >= CALL_SLOTS)
 		return;
 
-	if (!call_fax_exit(e->handle)) {
+	if (!leg_fax_exit(e->line, e->handle)) {
 		LTRACE(TRACE_HOOK, "line %u stream %u does not return to voice "
 		       "after the answer tone", e->line, e->stream);
 		return;
@@ -1961,7 +2069,7 @@ static void fax_exit_arm(struct sip_line *l, unsigned int stream,
 	e = &l->fax_exit[stream];
 	e->line = l->index;
 	e->stream = stream;
-	e->handle = call_leg_handle_get(l->index, slot);
+	e->handle = leg_handle_get(l->index, slot);
 	e->timer.cb = fax_exit_expire;
 	uloop_timeout_set(&e->timer, CALL_FAX_EXIT_DEFER_MS);
 }
@@ -1988,6 +2096,13 @@ static void cb_ended(unsigned int line, unsigned int slot,
 		l->t38_switched[slot] = false;
 		early_rx_clear(l, slot);
 		fax_exit_cancel(l, slot);
+	}
+
+	/* a leg table that waits for this leg to go switches at the next
+	 * drain, which no other event of an idle line may start */
+	if (l && line_legs_of(&l->chan) != l->legs) {
+		l->drain.cb = drain_expire;
+		uloop_timeout_set(&l->drain, 0);
 	}
 
 	sip_host->cdr_call_ended(sip_host->ctx, line, slot, info);
@@ -2095,7 +2210,7 @@ static bool fax_tone_note(struct sip_line *l, const struct proto_line_event *ev,
 	unsigned int stream = slot_stream(l->index, slot);
 	enum call_fax_tone note;
 
-	note = call_fax_tone_note(l->index, slot, ev->u.tone.code,
+	note = leg_fax_tone_note(l->index, slot, ev->u.tone.code,
 				  ev->u.tone.direction, ev->u.tone.end != 0,
 				  ev->u.tone.duration_ms);
 
@@ -2140,7 +2255,7 @@ static void fax_ced_proof_event(struct sip_line *l,
 	if (l->fsm.state != FSM_CONNECTED || slot >= CALL_SLOTS)
 		return;
 
-	if (!call_fax_ced_proof(l->index, slot, code))
+	if (!leg_fax_ced_proof(l->index, slot, code))
 		return;
 
 	LTRACE(TRACE_FSM, "line %u slot %u %s from the %s after the plain "
@@ -2198,7 +2313,7 @@ static void t38_tone_event(struct sip_line *l,
 
 	stream = slot_stream(l->index, slot);
 	if (!l->fax_switched[stream] &&
-	    call_fax_kind_get(l->index, slot) == HAL_PASSTHROUGH_OFF) {
+	    leg_fax_kind_get(l->index, slot) == HAL_PASSTHROUGH_OFF) {
 		LTRACE(TRACE_HOOK, "line %u slot %u V.21 preamble dropped, no "
 		       "passthrough on this leg, the far end owns the T.38 offer",
 		       l->index, slot);
@@ -2207,7 +2322,7 @@ static void t38_tone_event(struct sip_line *l,
 
 	/* the call runs outside the trace, which evaluates nothing while its
 	 * domain is off */
-	kind_set = call_fax_kind_set(l->index, slot, HAL_PASSTHROUGH_FAX);
+	kind_set = leg_fax_kind_set(l->index, slot, HAL_PASSTHROUGH_FAX);
 	LTRACE(TRACE_FSM, "line %u slot %u V.21 preamble, the fax kind %s",
 	       l->index, slot, kind_set ? "reached the leg" : "was refused");
 
@@ -2231,7 +2346,7 @@ static void t38_tone_event(struct sip_line *l,
 		return;
 	}
 
-	answer = call_t38_start(l->index, slot);
+	answer = leg_t38_start(l->index, slot);
 	if (answer == CALL_T38_BUSY) {
 		LTRACE(TRACE_HOOK, "line %u slot %u V.21 preamble held, an exchange of "
 		       "that leg is still open", l->index, slot);
@@ -2298,7 +2413,7 @@ static void tone_event(struct sip_line *l, const struct proto_line_event *ev)
 			return;
 		}
 
-		call_fax_hint(l->index, slot);
+		leg_fax_hint(l->index, slot);
 		if (ev->u.tone.code == HAL_TONE_DET_CED) {
 			LTRACE(TRACE_HOOK, "line %u fax tone %s from the wire: "
 			       "no kind before a V.21 preamble or a modem "
@@ -2307,7 +2422,7 @@ static void tone_event(struct sip_line *l, const struct proto_line_event *ev)
 			return;
 		}
 
-		kind_set = call_fax_kind_set(l->index, slot,
+		kind_set = leg_fax_kind_set(l->index, slot,
 					     HAL_PASSTHROUGH_MODEM);
 		LTRACE(TRACE_HOOK, "line %u fax tone %s from the wire: "
 		       "the modem kind %s, no offer", l->index,
@@ -2323,7 +2438,7 @@ static void tone_event(struct sip_line *l, const struct proto_line_event *ev)
 		return;
 	}
 
-	if (call_fax_on(l->index, slot)) {
+	if (leg_fax_on(l->index, slot)) {
 		LTRACE(TRACE_HOOK, "line %u slot %u fax tone %s dropped, "
 		       "the profile already applies", l->index, slot,
 		       hal_tone_detect_name(ev->u.tone.code));
@@ -2341,7 +2456,7 @@ static void tone_event(struct sip_line *l, const struct proto_line_event *ev)
 	LTRACE(TRACE_FSM, "line %u slot %u fax tone %s, switching to passthrough",
 	       l->index, slot, hal_tone_detect_name(ev->u.tone.code));
 
-	if (call_fax_start(l->index, slot))
+	if (leg_fax_start(l->index, slot))
 		return;
 
 	LTRACE(TRACE_FSM, "line %u slot %u refused the fax switch, the call keeps "
@@ -3089,18 +3204,18 @@ static void desk_op_call_xfer(void *priv, unsigned int line, unsigned int slot,
 	bool ok;
 
 	l->fsm_depth++;
-	ok = !line_xmpp(line) &&
-	     call_xfer(line, slot, CALL_XFER_BLIND, target);
+	ok = leg_xfer(line, slot, CALL_XFER_BLIND, target);
 	if (!ok)
 		line_ev_deliver(l, FSM_EV_CALL_XFER_FAIL, slot);
 	l->fsm_depth--;
 }
 
-static void desk_op_call_xfer_consult(void *priv, unsigned int line,
+/* The desk keeps both calls on a refusal, so no hangup follows it here. */
+static bool desk_op_call_xfer_consult(void *priv, unsigned int line,
 				      unsigned int referee,
 				      unsigned int replaced)
 {
-	op_call_xfer_consult(sip_line_get(line), referee, replaced);
+	return xfer_consult_send(sip_line_get(line), referee, replaced);
 }
 
 static void desk_op_conf_set(void *priv, unsigned int line, bool on)
@@ -3174,7 +3289,7 @@ static void desk_call_blob(struct blob_buf *b, const struct desk_call *c,
 				     focus == line * DESK_SLOTS + slot);
 	blobmsg_add_u32(b, "since", c->since);
 	blobmsg_add_u32(b, "connected", c->connected);
-	call_codec_dump(b, line, slot);
+	leg_codec_dump(b, line, slot);
 }
 
 static void desk_device_blob(struct blob_buf *b)
@@ -3648,7 +3763,7 @@ void sip_desk_accounts_dump(struct blob_buf *b)
 
 		tbl = blobmsg_open_table(b, NULL);
 		blobmsg_add_u32(b, "line", i);
-		if (line_xmpp(i)) {
+		if (l->chan.account_type == CFG_ACCOUNT_XMPP) {
 			blobmsg_add_string(b, "label",
 					   l->chan.sip_callerid_name[0] ?
 					   l->chan.sip_callerid_name :
@@ -3694,6 +3809,7 @@ void sip_lines_init(const struct proto_host *host, const struct cfg *cfg)
 		memset(l, 0, sizeof(*l));
 		l->index = i;
 		line_codes_take(l, &cfg->channel[i], &l->chan);
+		l->legs = line_legs_of(&l->chan);
 		feature_state_init(&l->features, &l->chan);
 		line_cfg_derive(l, cfg, &l->dp, &l->fcfg);
 		fsm_init(&l->fsm, i, &line_env, &l->fcfg, &line_ops, l);
@@ -3744,7 +3860,7 @@ static void sip_hook_take(struct sip_line *l, uint8_t state)
 
 	switch (state) {
 	case HAL_HOOK_SEIZE:
-		dial_ready = calls_line_dial_ready(l->index);
+		dial_ready = leg_dial_ready(l->index);
 		if (!dial_ready)
 			LTRACE(TRACE_FSM, "line %u seized with no account, "
 			       "target or live registration to dial "
@@ -3761,7 +3877,7 @@ static void sip_hook_take(struct sip_line *l, uint8_t state)
 	case HAL_HOOK_FLASH:
 		/* the CLEARING FLASH cell reads the account as it is now, the
 		 * way the IDLE SEIZE cell does */
-		fsm_dial_ready_set(&l->fsm, calls_line_dial_ready(l->index));
+		fsm_dial_ready_set(&l->fsm, leg_dial_ready(l->index));
 		line_ev_deliver(l, FSM_EV_FLASH, 0);
 		return;
 	}
@@ -3892,9 +4008,9 @@ void sip_line_service(unsigned int line, bool in_service,
 	}
 
 	if (sip_stopping)
-		calls_line_end(line);
+		leg_line_end(line);
 	else
-		calls_line_teardown(line);
+		leg_line_teardown(line);
 	line_oos_force(l);
 }
 
@@ -3952,6 +4068,23 @@ bool sip_line_digit_play_allowed(unsigned int line, unsigned int stream)
 	const struct sip_line *l = sip_line_get(line);
 
 	return l && digit_play_allowed(l, slot_ui_of(line, stream));
+}
+
+bool sip_line_legs_held(unsigned int line, const struct call_leg_ops *legs)
+{
+	return line_legs(line) == legs;
+}
+
+bool sip_line_dnd(unsigned int line)
+{
+	const struct sip_line *l = sip_line_get(line);
+
+	if (!l)
+		return false;
+	if (sip_desk_on)
+		return sip_desk.dnd;
+
+	return feature_dnd_is(&l->features);
 }
 
 unsigned int sip_line_stream_of_slot(unsigned int line, unsigned int slot)

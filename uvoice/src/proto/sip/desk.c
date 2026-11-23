@@ -657,8 +657,9 @@ static void transfer_key(struct desk *d)
 
 	if (from != DESK_NONE && from != i && line_of(from) == line_of(i) &&
 	    d->calls[from].state == DESK_CALL_HELD) {
-		d->ops->call_xfer_consult(d->priv, line_of(i), slot_of(from),
-					  slot_of(i));
+		if (!d->ops->call_xfer_consult(d->priv, line_of(i),
+					       slot_of(from), slot_of(i)))
+			return;
 		call_clear(d, from, DESK_END_TRANSFERRED);
 		call_clear(d, i, DESK_END_TRANSFERRED);
 		return;
@@ -1355,7 +1356,9 @@ int desk_transfer_attended(struct desk *d, unsigned int line,
 	    i == j || i == DESK_DIAL_IDX || j == DESK_DIAL_IDX)
 		return -ENOENT;
 
-	d->ops->call_xfer_consult(d->priv, line, slot, slot2);
+	if (!d->ops->call_xfer_consult(d->priv, line, slot, slot2))
+		return -EIO;
+
 	call_clear(d, i, DESK_END_TRANSFERRED);
 	call_clear(d, j, DESK_END_TRANSFERRED);
 	focus_lost(d);

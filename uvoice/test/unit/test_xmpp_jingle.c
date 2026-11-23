@@ -11,6 +11,7 @@
  * the stream hands them a tree.
  */
 #include <string.h>
+#include <unistd.h>
 
 #include "proto/xmpp/jingle.h"
 #include "proto/xmpp/jmi.h"
@@ -473,13 +474,200 @@ static void test_jmi(void)
 	CHECK(!strcmp(jmi_kind_name(JMI_NONE), ""));
 }
 
+/**
+ * candidate_taken() - whether a transport-info keeps its one candidate
+ * @attrs: the attributes of the candidate element
+ *
+ * Return: true when the parsed transport holds the candidate.
+ */
+static bool candidate_taken(const char *attrs)
+{
+	char xml[1024];
+
+	snprintf(xml, sizeof(xml), IQ_SET_OPEN "action='transport-info' "
+		 "sid='s'><content creator='initiator' name='voice'><transport "
+		 "xmlns='urn:xmpp:jingle:transports:ice-udp:1' ufrag='a' "
+		 "pwd='b'><candidate foundation='1' ip='192.0.2.3' "
+		 "priority='1' %s/></transport></content></jingle></iq>",
+		 attrs);
+
+	return parse(xml) && jm_ok && jm.content.ice.candidates == 1;
+}
+
+/**
+ * test_candidate_rules() - a candidate element the conversion refuses
+ */
+static void test_candidate_rules(void)
+{
+	CASE("a candidate of component 1 over udp with a known type is taken");
+	CHECK(candidate_taken("component='1' port='9' protocol='udp' "
+			      "type='host'"));
+	CHECK(candidate_taken("component='1' port='65535' protocol='UDP' "
+			      "type='prflx'"));
+	CHECK(candidate_taken("component='1' port='9' protocol='udp' "
+			      "type='relay' rel-addr='10.0.0.1' rel-port='0'"));
+	CHECK(!strcmp(jm.content.ice.candidate[0].sdp,
+		      "a=candidate:1 1 udp 1 192.0.2.3 9 typ relay raddr "
+		      "10.0.0.1 rport 0"));
+
+	CASE("a candidate of another component is refused");
+	CHECK(!candidate_taken("component='2' port='9' protocol='udp' "
+			       "type='host'"));
+
+	CASE("a candidate over tcp is refused");
+	CHECK(!candidate_taken("component='1' port='9' protocol='tcp' "
+			       "type='host'"));
+
+	CASE("a candidate of an unknown type is refused");
+	CHECK(!candidate_taken("component='1' port='9' protocol='udp' "
+			       "type='mdns'"));
+
+	CASE("a candidate port out of range is refused");
+	CHECK(!candidate_taken("component='1' port='0' protocol='udp' "
+			       "type='host'"));
+	CHECK(!candidate_taken("component='1' port='65536' protocol='udp' "
+			       "type='host'"));
+
+	CASE("a related address needs its port, and a port needs its address");
+	CHECK(!candidate_taken("component='1' port='9' protocol='udp' "
+			       "type='srflx' rel-addr='10.0.0.1'"));
+	CHECK(!candidate_taken("component='1' port='9' protocol='udp' "
+			       "type='srflx' rel-port='8998'"));
+	CHECK(!candidate_taken("component='1' port='9' protocol='udp' "
+			       "type='srflx' rel-addr='10.0.0.1' "
+			       "rel-port='65536'"));
+	CHECK(!candidate_taken("component='1' port='9' protocol='udp' "
+			       "type='srflx' rel-addr='10.0.0.1' rel-port='x'"));
+}
+
+/**
+ * test_fit() - a value longer than its field refuses the element
+ */
+static void test_fit(void)
+{
+	char value[JINGLE_UFRAG_MAX + 1];
+	char xml[4096];
+
+	CASE("a sid that fits is taken, one that does not refuses the jingle");
+	snprintf(value, sizeof(value), "%0*d", (int)JINGLE_SID_MAX - 1, 0);
+	snprintf(xml, sizeof(xml), IQ_SET_OPEN "action='session-info' "
+		 "sid='%s'/></iq>", value);
+	CHECK(parse(xml));
+	CHECK(jm_ok && !strcmp(jm.sid, value));
+	snprintf(value, sizeof(value), "%0*d", (int)JINGLE_SID_MAX, 0);
+	snprintf(xml, sizeof(xml), IQ_SET_OPEN "action='session-info' "
+		 "sid='%s'/></iq>", value);
+	CHECK(parse(xml));
+	CHECK(!jm_ok);
+
+	CASE("a ufrag that does not fit leaves the transport absent");
+	snprintf(value, sizeof(value), "%0*d", (int)JINGLE_UFRAG_MAX - 1, 0);
+	snprintf(xml, sizeof(xml), IQ_SET_OPEN "action='transport-info' "
+		 "sid='s'><content creator='initiator' name='voice'><transport "
+		 "xmlns='urn:xmpp:jingle:transports:ice-udp:1' ufrag='%s' "
+		 "pwd='b'/></content></jingle></iq>", value);
+	CHECK(parse(xml));
+	CHECK(jm_ok && jm.content.transport);
+	snprintf(value, sizeof(value), "%0*d", (int)JINGLE_UFRAG_MAX, 0);
+	snprintf(xml, sizeof(xml), IQ_SET_OPEN "action='transport-info' "
+		 "sid='s'><content creator='initiator' name='voice'><transport "
+		 "xmlns='urn:xmpp:jingle:transports:ice-udp:1' ufrag='%s' "
+		 "pwd='b'/></content></jingle></iq>", value);
+	CHECK(parse(xml));
+	CHECK(jm_ok && !jm.content.transport && !jm.content.ice.ufrag[0]);
+
+	CASE("a pwd that does not fit leaves the transport absent");
+	snprintf(value, sizeof(value), "%0*d", (int)JINGLE_PWD_MAX, 0);
+	snprintf(xml, sizeof(xml), IQ_SET_OPEN "action='transport-info' "
+		 "sid='s'><content creator='initiator' name='voice'><transport "
+		 "xmlns='urn:xmpp:jingle:transports:ice-udp:1' ufrag='a' "
+		 "pwd='%s'/></content></jingle></iq>", value);
+	CHECK(parse(xml));
+	CHECK(jm_ok && !jm.content.transport);
+
+	CASE("a JMI id that does not fit refuses the message");
+	snprintf(value, sizeof(value), "%0*d", (int)JINGLE_SID_MAX, 0);
+	snprintf(xml, sizeof(xml), "<message from='romeo@montague.example/o' "
+		 "type='chat'><retract xmlns='urn:xmpp:jingle-message:0' "
+		 "id='%s'/></message>", value);
+	CHECK(parse(xml));
+	CHECK(!mm_ok);
+
+	CASE("a carbon keeps the from of its wrapper");
+	CHECK(parse(CARBON_PROCEED));
+	CHECK(mm_ok && !strcmp(mm.wrapper_from, "user@sip.example.test"));
+	CHECK(parse(PROPOSE));
+	CHECK(mm_ok && !mm.wrapper_from[0]);
+}
+
+/**
+ * payload_rx() - parse a description with one payload type and a PCMU
+ * @attrs: the attributes of the first payload type, after its id
+ *
+ * Return: the number of payload types the parser kept.
+ */
+static unsigned int payload_rx(const char *attrs)
+{
+	char xml[1024];
+
+	snprintf(xml, sizeof(xml), IQ_SET_OPEN "action='content-add' "
+		 "sid='s'><content creator='initiator' name='voice'>"
+		 "<description xmlns='urn:xmpp:jingle:apps:rtp:1' media='audio'>"
+		 "<payload-type id='96' %s/><payload-type id='0' name='PCMU'/>"
+		 "</description></content></jingle></iq>", attrs);
+	if (!parse(xml) || !jm_ok)
+		return 0;
+
+	return jm.content.payloads;
+}
+
+/*
+ * A clockrate or a channel count that is absent reads as 0, which the legs
+ * fill with the default of the codec. One that is present must be a number
+ * the payload can hold.
+ */
+static void test_payload_numbers(void)
+{
+	const struct jingle_payload *first = &jm.content.payload[0];
+
+	CASE("a payload type without a clock or channels reads both as 0");
+	CHECK(payload_rx("name='opus'") == 2);
+	CHECK(first->clockrate == 0 && first->channels == 0);
+
+	CASE("a payload type with a valid clock and channels keeps both");
+	CHECK(payload_rx("name='opus' clockrate='48000' channels='2'") == 2);
+	CHECK(first->clockrate == 48000 && first->channels == 2);
+	CHECK(payload_rx("name='x' clockrate='4294967295' channels='255'") == 2);
+	CHECK(first->clockrate == 4294967295U && first->channels == 255);
+
+	CASE("a clock that is no number, zero or too large drops the payload "
+	     "type");
+	CHECK(payload_rx("name='opus' clockrate='fast'") == 1);
+	CHECK(first->id == 0);
+	CHECK(payload_rx("name='opus' clockrate='0'") == 1);
+	CHECK(payload_rx("name='opus' clockrate='4294967296'") == 1);
+	CHECK(payload_rx("name='opus' clockrate=''") == 1);
+
+	CASE("channels that are no number, zero or too large drop the payload "
+	     "type");
+	CHECK(payload_rx("name='opus' channels='two'") == 1);
+	CHECK(first->id == 0);
+	CHECK(payload_rx("name='opus' channels='0'") == 1);
+	CHECK(payload_rx("name='opus' channels='256'") == 1);
+	CHECK(payload_rx("name='opus' channels='2x'") == 1);
+}
+
 int main(void)
 {
+	alarm(240);
 	test_parse_initiate();
 	test_candidates();
+	test_candidate_rules();
 	test_fingerprint();
 	test_write_round_trip();
 	test_jmi();
+	test_fit();
+	test_payload_numbers();
 
 	return tu_summary("test_xmpp_jingle");
 }

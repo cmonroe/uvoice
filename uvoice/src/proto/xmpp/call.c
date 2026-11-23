@@ -35,6 +35,7 @@
 #define XCALL_DTMF_CLOCK	8000U
 #define XCALL_OPUS_CLOCK	48000U
 #define XCALL_G711_CLOCK	8000U
+#define XCALL_PT_DYNAMIC	96U
 #define XCALL_DISCARD_PORT	9
 #define XCALL_FLUSH_MAX		JINGLE_CANDIDATES_MAX
 #define XCALL_GUARD_ID		1
@@ -67,7 +68,7 @@ struct xcall {
 	char sid[JINGLE_SID_MAX];
 	char peer[JID_MAX];		/* the device, "" until it is known */
 	char peer_bare[JID_MAX];	/* the account */
-	char target[XCALL_TARGET_MAX];	/* what was dialled */
+	char target[XCALL_TARGET_MAX];	/* what was dialed */
 	char name[XCALL_NAME_MAX];
 	struct cfg_channel ch;
 	char local_addr[SDP_ADDR_MAX];
@@ -77,6 +78,7 @@ struct xcall {
 	struct xcall_remote remote;
 	struct jingle_candidate pending[JINGLE_CANDIDATES_MAX];
 	unsigned int pendings;
+	unsigned int candidates_dropped;
 	enum sdp_codec_id codec;
 	uint8_t codec_pt;
 	int dtmf_pt;
@@ -93,10 +95,21 @@ struct xcall {
 	bool dtls_up;
 	bool dtls_closed;
 	bool relay;
+	bool remote_ready;		/* the backend took the remote description */
+	bool ending;			/* the end is being reported to the shell */
 	uint16_t transport_gen;		/* hal_ice_local.gen of the stream */
 	uint64_t answered_ms;
 	uint64_t cleared_ms;
 	struct proto_timer guard;
+};
+
+/* How a leg ends towards the shell, reported before the release. */
+enum xcall_end {
+	XCALL_END_SILENT = 0,
+	XCALL_END_FAILED,
+	XCALL_END_BYE,
+	XCALL_END_CANCEL,
+	XCALL_END_ELSEWHERE,
 };
 
 static struct {
@@ -108,6 +121,16 @@ static struct {
 } xv;
 
 static struct xcall legs[CFG_CHANNEL_MAX][CALL_SLOTS];
+
+/*
+ * The generation of each slot. It lives outside the leg because the leg is
+ * cleared at its release, and a reply to an iq of a released leg must not
+ * reach the next leg of the same slot.
+ */
+static uint16_t slot_gens[CFG_CHANNEL_MAX][CALL_SLOTS];
+
+_Static_assert(CFG_CHANNEL_MAX <= 256 && CALL_SLOTS <= 256,
+	       "a line and a slot fit one byte of the iq tag");
 
 static const char *const state_names[XCALL_STATE_MAX] = {
 	[XCALL_FREE] = "free",
@@ -135,15 +158,51 @@ const char *xcall_state_name(enum xcall_state state)
  * @line: the line
  * @slot: the slot
  *
- * Return: the leg, or NULL for an index out of range or a free slot.
+ * A leg whose end is being reported takes no command: the shell can hang
+ * up from inside the report, and the release follows the report anyway.
+ *
+ * Return: the leg, or NULL for an index out of range, a free slot or a leg
+ * that ends.
  */
 static struct xcall *leg_get(unsigned int line, unsigned int slot)
 {
 	if (line >= CFG_CHANNEL_MAX || slot >= CALL_SLOTS ||
-	    !legs[line][slot].in_use)
+	    !legs[line][slot].in_use || legs[line][slot].ending)
 		return NULL;
 
 	return &legs[line][slot];
+}
+
+/**
+ * iq_tag() - the reply pointer of an iq a leg sends
+ * @leg: the leg
+ *
+ * Return: the line, the slot and the generation of the slot in one value.
+ */
+static void *iq_tag(const struct xcall *leg)
+{
+	uintptr_t tag = ((uintptr_t)slot_gens[leg->line][leg->slot] << 16) |
+			((uintptr_t)leg->line << 8) | leg->slot;
+
+	return (void *)tag;
+}
+
+/**
+ * iq_leg() - the leg an iq reply belongs to
+ * @tag: the value iq_tag() gave
+ *
+ * Return: the leg, or NULL when the slot holds another generation now.
+ */
+static struct xcall *iq_leg(void *tag)
+{
+	uintptr_t value = (uintptr_t)tag;
+	unsigned int line = (value >> 8) & 0xff, slot = value & 0xff;
+
+	if (line >= CFG_CHANNEL_MAX || slot >= CALL_SLOTS ||
+	    (uint16_t)(value >> 16) != slot_gens[line][slot])
+		return NULL;
+
+	return leg_get(line, slot);
 }
 
 /**
@@ -241,18 +300,23 @@ static struct xcall *leg_alloc(unsigned int line, unsigned int slot,
 }
 
 /**
- * media_stop() - stop the stream of a leg, once
+ * media_stop() - release the stream of a leg, once
  * @leg: the leg
+ *
+ * A configured stream that never started still holds the ICE agent of the
+ * backend, and only a stop releases it.
  */
 static void media_stop(struct xcall *leg)
 {
 	const struct call_media_ops *ops = xv.env.media;
+	bool started = leg->media_started;
 
-	if (!leg->media_started)
+	if (!leg->media_configured && !started)
 		return;
 
+	leg->media_configured = false;
 	leg->media_started = false;
-	if (ops && ops->stats_snapshot)
+	if (started && ops && ops->stats_snapshot)
 		ops->stats_snapshot(ops->priv, leg->line, leg->slot);
 	if (ops && ops->stop)
 		ops->stop(ops->priv, leg->line, leg->slot);
@@ -298,6 +362,49 @@ static void leg_release(struct xcall *leg)
 		xv.env.cb->ended(line, slot, &info);
 
 	memset(leg, 0, sizeof(*leg));
+	slot_gens[line][slot]++;
+}
+
+/**
+ * leg_end() - report how a leg ends, then release it
+ * @leg: the leg
+ * @how: the report
+ *
+ * The report comes first, as sip/call.c leg_fail() makes it: the shell and
+ * the desk read the reason of the end from it, and the ended record behind
+ * it closes a call they already classified.
+ */
+static void leg_end(struct xcall *leg, enum xcall_end how)
+{
+	const struct call_cb *cb = xv.env.cb;
+	unsigned int line = leg->line, slot = leg->slot;
+
+	leg->ending = true;
+
+	switch (how) {
+	case XCALL_END_FAILED:
+		if (cb && cb->failed)
+			cb->failed(line, slot, leg->fail_class);
+		break;
+	case XCALL_END_BYE:
+		if (cb && cb->remote_bye)
+			cb->remote_bye(line, slot);
+		break;
+	case XCALL_END_ELSEWHERE:
+		if (cb && cb->answered_elsewhere)
+			cb->answered_elsewhere(line, slot);
+		else if (cb && cb->remote_cancel)
+			cb->remote_cancel(line, slot);
+		break;
+	case XCALL_END_CANCEL:
+		if (cb && cb->remote_cancel)
+			cb->remote_cancel(line, slot);
+		break;
+	case XCALL_END_SILENT:
+		break;
+	}
+
+	leg_release(leg);
 }
 
 /**
@@ -317,25 +424,10 @@ static void leg_clear(struct xcall *leg)
  */
 static void leg_fail(struct xcall *leg, enum proto_fail_class cls)
 {
-	unsigned int line = leg->line, slot = leg->slot;
-
 	leg->failed = true;
 	leg->fail_class = cls;
 	XCALL_TRACE(leg, "failed with %s", proto_fail_name(cls));
-	leg_release(leg);
-
-	if (xv.env.cb && xv.env.cb->failed)
-		xv.env.cb->failed(line, slot, cls);
-}
-
-static void leg_bye(struct xcall *leg)
-{
-	unsigned int line = leg->line, slot = leg->slot;
-
-	leg_release(leg);
-
-	if (xv.env.cb && xv.env.cb->remote_bye)
-		xv.env.cb->remote_bye(line, slot);
+	leg_end(leg, XCALL_END_FAILED);
 }
 
 /* ------------------------------------------------------------------- wire */
@@ -397,7 +489,7 @@ static bool jmi_send(struct xcall *leg, enum jmi_kind kind, const char *to)
 
 /**
  * iq_reply() - the answer to a session-initiate or a session-accept
- * @priv: the leg
+ * @priv: the tag of the leg (iq_tag())
  * @ok: whether the peer answered with a result
  * @reply: the answer, NULL for none
  *
@@ -405,9 +497,9 @@ static bool jmi_send(struct xcall *leg, enum jmi_kind kind, const char *to)
  */
 static void iq_reply(void *priv, bool ok, const struct xml_doc *reply)
 {
-	struct xcall *leg = priv;
+	struct xcall *leg = iq_leg(priv);
 
-	if (!leg->in_use || ok)
+	if (!leg || ok)
 		return;
 
 	XCALL_TRACE(leg, "the peer refused the session iq in %s",
@@ -444,13 +536,18 @@ static bool jingle_send(struct xcall *leg, struct xml_w *writer,
 		return false;
 
 	return xv.env.iq_send(xv.env.priv, leg->line, writer->mem, len, id,
-			      leg->peer, cb, leg) == 0;
+			      leg->peer, cb, iq_tag(leg)) == 0;
 }
 
 /**
  * terminate_send() - a session-terminate to the peer device
  * @leg: the leg
  * @reason: the reason
+ *
+ * The session ends when the terminate leaves (XEP-0166 section 6.7), and
+ * every caller releases the leg at once. So the terminate waits for no
+ * answer and holds no slot of the iq table, which a peer that never answers
+ * could otherwise fill.
  */
 static void terminate_send(struct xcall *leg, enum jingle_reason reason)
 {
@@ -468,7 +565,7 @@ static void terminate_send(struct xcall *leg, enum jingle_reason reason)
 	jingle_reason_write(&writer, reason, NULL);
 	jingle_close(&writer);
 	XCALL_TRACE(leg, "terminate %s", jingle_reason_name(reason));
-	jingle_send(leg, &writer, id, iq_ignore);
+	text_send(leg, &writer);
 }
 
 /**
@@ -517,7 +614,7 @@ static void payload_fill(enum sdp_codec_id codec, uint8_t pt,
 /**
  * dtmf_fill() - the telephone-event payload type
  * @pt: its payload type
- * @clock: the clock of the audio it rides
+ * @clock: the clock of its audio codec
  * @out: receives the element
  */
 static void dtmf_fill(uint8_t pt, uint32_t clock, struct jingle_payload *out)
@@ -604,13 +701,55 @@ static enum sdp_codec_id codec_of_payload(const struct jingle_payload *payload)
 }
 
 /**
+ * payload_same() - whether an answer payload keeps the offered numbers
+ * @offered: the offered payload
+ * @answer: the answer payload of the same codec
+ *
+ * A static payload type can omit its clock, which RFC 3551 fixes at 8000,
+ * and every payload can omit the channel count, which is then one.
+ *
+ * Return: true when the number, the clock and the channels match.
+ */
+static bool payload_same(const struct jingle_payload *offered,
+			 const struct jingle_payload *answer)
+{
+	uint32_t clock = answer->clockrate;
+	uint8_t offered_channels = offered->channels ? offered->channels : 1;
+	uint8_t answer_channels = answer->channels ? answer->channels : 1;
+
+	if (!clock && answer->id < XCALL_PT_DYNAMIC)
+		clock = XCALL_G711_CLOCK;
+
+	return answer->id == offered->id && clock == offered->clockrate &&
+	       answer_channels == offered_channels;
+}
+
+/**
+ * payload_fits() - whether a payload of the peer runs a codec as this leg does
+ * @codec: the codec the payload names
+ * @payload: the payload of the peer
+ *
+ * Return: true when its clock and channels are those this leg would offer.
+ */
+static bool payload_fits(enum sdp_codec_id codec,
+			 const struct jingle_payload *payload)
+{
+	struct jingle_payload own;
+
+	payload_fill(codec, payload->id, &own);
+
+	return payload_same(&own, payload);
+}
+
+/**
  * payload_select() - the codec of the session, from the peer's list
  * @leg: the leg
  * @content: the peer's content
  *
- * The first payload type of the peer that this leg offers wins, which is
- * the answer rule of RFC 3264 section 6.1. The telephone-event on the clock
- * of that codec, when the peer named one, carries the digits.
+ * The first payload type of the peer that this leg offers, with the clock
+ * and channels this leg runs it at, wins, which is the answer rule of
+ * RFC 3264 section 6.1. The telephone-event on the clock of that codec,
+ * when the peer named one, sends the digits.
  *
  * Return: true when a codec was found.
  */
@@ -628,7 +767,8 @@ static bool payload_select(struct xcall *leg,
 	for (i = 0; i < content->payloads && leg->codec == SDP_CODEC_NONE;
 	     i++) {
 		id = codec_of_payload(&content->payload[i]);
-		if (id == SDP_CODEC_NONE)
+		if (id == SDP_CODEC_NONE ||
+		    !payload_fits(id, &content->payload[i]))
 			continue;
 		for (j = 0; j < leg->loc.codecs; j++) {
 			if (leg->loc.codec[j].id != id ||
@@ -653,6 +793,80 @@ static bool payload_select(struct xcall *leg,
 	}
 
 	return true;
+}
+
+/**
+ * payload_offered() - the payload of the offer an answer payload names
+ * @local: the offer this leg sent
+ * @answer: a payload of the answer
+ *
+ * Return: the offered payload of the same codec, or NULL.
+ */
+static const struct jingle_payload *
+payload_offered(const struct jingle_local *local,
+		const struct jingle_payload *answer)
+{
+	bool dtmf = !strcasecmp(answer->name, XCALL_DTMF_NAME);
+	enum sdp_codec_id id = codec_of_payload(answer);
+	const struct jingle_payload *offered;
+	unsigned int i;
+
+	for (i = 0; i < local->payloads && i < JINGLE_PAYLOADS_MAX; i++) {
+		offered = &local->payload[i];
+		if (dtmf && !strcasecmp(offered->name, XCALL_DTMF_NAME))
+			return offered;
+		if (!dtmf && id != SDP_CODEC_NONE &&
+		    codec_of_payload(offered) == id)
+			return offered;
+	}
+
+	return NULL;
+}
+
+/**
+ * answer_select() - the codec of the session, from the answer of the peer
+ * @leg: the leg, whose offer is in leg->local
+ * @content: the content of the session-accept
+ *
+ * The answer must name the offered content and audio, and keep rtcp-mux,
+ * because the transport runs RTP and RTCP on one component. A payload of an
+ * offered codec must keep its offered numbers (RFC 3264 section 6.1). A
+ * payload of a codec this leg did not offer is ignored. The first offered
+ * codec of the answer selects the codec of the session.
+ *
+ * Return: true when the answer fits the offer.
+ */
+static bool answer_select(struct xcall *leg,
+			  const struct jingle_content *content)
+{
+	const struct jingle_payload *answer, *offered;
+	unsigned int i;
+
+	leg->codec = SDP_CODEC_NONE;
+	leg->dtmf_pt = -1;
+
+	if (strcmp(content->name, leg->local.content_name) || !content->audio ||
+	    !content->rtcp_mux)
+		return false;
+
+	for (i = 0; i < content->payloads; i++) {
+		answer = &content->payload[i];
+		offered = payload_offered(&leg->local, answer);
+		if (!offered)
+			continue;
+		if (!payload_same(offered, answer))
+			return false;
+		if (!strcasecmp(answer->name, XCALL_DTMF_NAME)) {
+			leg->dtmf_pt = answer->id;
+			continue;
+		}
+		if (leg->codec != SDP_CODEC_NONE)
+			continue;
+		leg->codec = codec_of_payload(answer);
+		leg->codec_pt = answer->id;
+	}
+
+	return leg->codec != SDP_CODEC_NONE;
 }
 
 /**
@@ -816,6 +1030,7 @@ static bool media_program(struct xcall *leg, bool start)
 		leg->media = media;
 		leg->media_configured = true;
 	}
+	leg->remote_ready = leg->remote.known;
 
 	if (start && !leg->media_started && ops->start) {
 		st = ops->start(ops->priv, leg->line, leg->slot);
@@ -861,15 +1076,22 @@ static bool ice_local_take(struct xcall *leg)
  * remote_take() - the credentials of the peer, from a content
  * @leg: the leg
  * @content: the content
+ * @answer: whether the content answers an offer of this leg
  *
- * Return: true when the content named ICE credentials and a fingerprint.
+ * An offer may name any setup role. An answer must pick one, active or
+ * passive, as RFC 5763 section 5 asks of the answerer.
+ *
+ * Return: true when the content named ICE credentials, a fingerprint and a
+ * valid setup role.
  */
-static bool remote_take(struct xcall *leg, const struct jingle_content *content)
+static bool remote_take(struct xcall *leg, const struct jingle_content *content,
+			bool answer)
 {
 	const struct jingle_transport *ice = &content->ice;
 
 	if (!content->transport || !ice->ufrag[0] || !ice->pwd[0] ||
-	    !ice->fp_present)
+	    !ice->fp_present || ice->setup == JINGLE_SETUP_NONE ||
+	    (answer && ice->setup == JINGLE_SETUP_ACTPASS))
 		return false;
 
 	str_copy(leg->remote.ufrag, sizeof(leg->remote.ufrag), ice->ufrag);
@@ -885,44 +1107,64 @@ static bool remote_take(struct xcall *leg, const struct jingle_content *content)
  * remote_candidates_push() - hand the waiting candidates of the peer down
  * @leg: the leg
  *
- * The backend takes a candidate only once its transport exists, which the
- * first description makes, so the candidates wait until then.
+ * The backend pairs a candidate only against the remote credentials, so the
+ * candidates wait until a description that holds them was taken.
+ *
+ * Return: false when the backend refused a candidate.
  */
-static void remote_candidates_push(struct xcall *leg)
+static bool remote_candidates_push(struct xcall *leg)
 {
 	const struct call_media_ops *ops = xv.env.media;
 	unsigned int i;
 
-	if (!leg->media_configured || !ops || !ops->candidate_add)
-		return;
+	if (!leg->remote_ready)
+		return true;
 
 	for (i = 0; i < leg->pendings; i++) {
-		if (ops->candidate_add(ops->priv, leg->line, leg->slot,
-				       leg->pending[i].sdp) != HAL_OK)
+		if (!ops || !ops->candidate_add ||
+		    ops->candidate_add(ops->priv, leg->line, leg->slot,
+				       leg->pending[i].sdp) != HAL_OK) {
 			XCALL_TRACE(leg, "the backend refused a candidate");
+			leg->pendings = 0;
+			return false;
+		}
 	}
 	leg->pendings = 0;
+
+	return true;
 }
 
 /**
  * remote_candidates_add() - take the candidates of a content
  * @leg: the leg
  * @content: the content
+ *
+ * The first candidates that fit the queue go on. ICE pairs the ones it has,
+ * so a peer that names more candidates than fit still gets a call.
+ *
+ * Return: false when the backend refused a candidate.
  */
-static void remote_candidates_add(struct xcall *leg,
+static bool remote_candidates_add(struct xcall *leg,
 				  const struct jingle_content *content)
 {
+	unsigned int dropped = content->ice.candidates_dropped;
 	unsigned int i;
 
 	for (i = 0; i < content->ice.candidates; i++) {
-		if (leg->pendings >= JINGLE_CANDIDATES_MAX) {
-			XCALL_TRACE(leg, "a candidate of the peer was dropped");
-			break;
-		}
-		leg->pending[leg->pendings++] = content->ice.candidate[i];
+		if (leg->pendings >= JINGLE_CANDIDATES_MAX)
+			dropped++;
+		else
+			leg->pending[leg->pendings++] =
+				content->ice.candidate[i];
 	}
 
-	remote_candidates_push(leg);
+	if (dropped) {
+		leg->candidates_dropped += dropped;
+		XCALL_TRACE(leg, "remote candidates dropped: %u, in the call: %u",
+			    dropped, leg->candidates_dropped);
+	}
+
+	return remote_candidates_push(leg);
 }
 
 /**
@@ -1017,7 +1259,7 @@ static bool session_send(struct xcall *leg, enum jingle_action action)
 }
 
 /**
- * session_fail() - end a session that cannot carry media
+ * session_fail() - end a session that cannot pass media
  * @leg: the leg
  * @reason: what the peer is told
  * @cls: what the shell is told
@@ -1082,12 +1324,12 @@ static void accept_take(struct xcall *leg, const struct jingle_msg *msg,
 
 	xv.env.reply_result(xv.env.priv, line, iq);
 
-	if (!msg->content.description || !payload_select(leg, &msg->content)) {
+	if (!answer_select(leg, &msg->content)) {
 		session_fail(leg, JINGLE_REASON_FAILED_APPLICATION,
 			     PROTO_FAIL_CONGESTION);
 		return;
 	}
-	if (!remote_take(leg, &msg->content)) {
+	if (!remote_take(leg, &msg->content, true)) {
 		session_fail(leg, JINGLE_REASON_SECURITY_ERROR,
 			     PROTO_FAIL_CONGESTION);
 		return;
@@ -1098,7 +1340,11 @@ static void accept_take(struct xcall *leg, const struct jingle_msg *msg,
 			     PROTO_FAIL_CONGESTION);
 		return;
 	}
-	remote_candidates_add(leg, &msg->content);
+	if (!remote_candidates_add(leg, &msg->content)) {
+		session_fail(leg, JINGLE_REASON_FAILED_TRANSPORT,
+			     PROTO_FAIL_CONGESTION);
+		return;
+	}
 
 	leg->state = XCALL_ACTIVE;
 	leg->answered = true;
@@ -1124,7 +1370,11 @@ static void accept_send(struct xcall *leg)
 			     PROTO_FAIL_CONGESTION);
 		return;
 	}
-	remote_candidates_push(leg);
+	if (!remote_candidates_push(leg)) {
+		session_fail(leg, JINGLE_REASON_FAILED_TRANSPORT,
+			     PROTO_FAIL_CONGESTION);
+		return;
+	}
 
 	if (!session_send(leg, JINGLE_SESSION_ACCEPT)) {
 		leg_fail(leg, PROTO_FAIL_CONGESTION);
@@ -1159,22 +1409,129 @@ static void offer_announce(struct xcall *leg)
 }
 
 /**
- * initiate_take() - the session-initiate of a caller
+ * jid_device() - whether a sender names one device
+ * @text: the from of a stanza, NULL when it had none
+ *
+ * jid_parse() refuses a part that does not fit struct jid, so a JID that
+ * passes also fits the peer fields of a leg.
+ *
+ * Return: true for a well formed full JID.
+ */
+static bool jid_device(const char *text)
+{
+	struct jid jid;
+
+	return text && jid_parse(text, &jid) && jid.resource[0];
+}
+
+/**
+ * admission_refused() - whether the line takes a new inbound call now
+ * @line: the line
+ *
+ * Every check runs before this phone answers ringing, in this order: the
+ * DSP, the ICE feature of the backend, the service state of the line,
+ * whether the line drives these legs, and do-not-disturb. Any JID may call,
+ * as on a SIP line.
+ *
+ * Return: JINGLE_REASON_NONE to admit, otherwise the reason of the refusal.
+ */
+static enum jingle_reason admission_refused(unsigned int line)
+{
+	const struct proto_host *host = xv.env.host;
+	enum jingle_reason reason = JINGLE_REASON_GENERAL_ERROR;
+	const char *why = NULL;
+
+	if (!host || !host->hal_ready || !host->hal_ready(host->ctx)) {
+		why = "the DSP is not ready";
+	} else if (!(xv.hal_features & HAL_FEAT_ICE_DTLS)) {
+		why = "the backend has no ICE";
+	} else if (!host->line_in_service ||
+		   !host->line_in_service(host->ctx, line)) {
+		why = "the line is out of service";
+	} else if (!xv.env.legs_held ||
+		   !xv.env.legs_held(xv.env.priv, line)) {
+		why = "a call of the other account type is up";
+		reason = JINGLE_REASON_BUSY;
+	} else if (xv.env.dnd && xv.env.dnd(xv.env.priv, line)) {
+		why = "do not disturb";
+		reason = JINGLE_REASON_BUSY;
+	}
+
+	if (!why)
+		return JINGLE_REASON_NONE;
+
+	if (host)
+		PROTO_TRACE(host, TRACE_XMPP, "xcall line %u: call refused, %s",
+			    line, why);
+
+	return reason;
+}
+
+/**
+ * offer_fail_class() - the class a session fails with
+ * @leg: the leg
+ *
+ * An inbound call nobody picked up ends without a sound. Every other call
+ * hears the congestion tone.
+ *
+ * Return: the class.
+ */
+static enum proto_fail_class offer_fail_class(const struct xcall *leg)
+{
+	if (leg->inbound &&
+	    (leg->state == XCALL_FREE || leg->state == XCALL_OFFERED))
+		return PROTO_FAIL_QUIET;
+
+	return PROTO_FAIL_CONGESTION;
+}
+
+/**
+ * initiate_refuse() - decline a session-initiate that has no leg
  * @line: the line
  * @msg: the parsed jingle
  * @iq: the stanza, answered here
  * @from: the sender
+ * @reason: what the caller is told
+ */
+static void initiate_refuse(unsigned int line, const struct jingle_msg *msg,
+			    const struct xml_doc *iq, const char *from,
+			    enum jingle_reason reason)
+{
+	struct xcall refusal;
+
+	xv.env.reply_result(xv.env.priv, line, iq);
+
+	memset(&refusal, 0, sizeof(refusal));
+	refusal.line = line;
+	str_copy(refusal.sid, sizeof(refusal.sid), msg->sid);
+	str_copy(refusal.peer, sizeof(refusal.peer), from);
+	terminate_send(&refusal, reason);
+}
+
+/**
+ * initiate_take() - the session-initiate of a caller
+ * @line: the line
+ * @msg: the parsed jingle
+ * @iq: the stanza, answered here
+ * @from: the sender, a full JID
  *
- * A session behind a proceed is accepted at once. A session nobody proposed
- * is a direct Jingle call: it rings here like a propose does.
+ * A session behind a proceed is accepted at once, from the device the
+ * proceed went to alone. A session nobody proposed is a direct Jingle call:
+ * it rings here like a propose does.
  */
 static void initiate_take(unsigned int line, const struct jingle_msg *msg,
 			  const struct xml_doc *iq, const char *from)
 {
 	struct xcall *leg = leg_find_sid(line, msg->sid);
+	enum jingle_reason refused;
 	unsigned int slot;
 	bool direct = false;
 
+	if (leg && strcmp(leg->peer, from)) {
+		xv.env.reply_error(xv.env.priv, line, iq, "cancel",
+				   "item-not-found");
+		return;
+	}
 	if (leg && leg->state != XCALL_PROCEEDED) {
 		xv.env.reply_error(xv.env.priv, line, iq, "cancel",
 				   "unexpected-request");
@@ -1182,6 +1539,11 @@ static void initiate_take(unsigned int line, const struct jingle_msg *msg,
 	}
 
 	if (!leg) {
+		refused = admission_refused(line);
+		if (refused != JINGLE_REASON_NONE) {
+			initiate_refuse(line, msg, iq, from, refused);
+			return;
+		}
 		if (!xcall_slot_free(line, &slot) ||
 		    !(leg = leg_alloc(line, slot, true))) {
 			xv.env.reply_error(xv.env.priv, line, iq, "wait",
@@ -1194,28 +1556,40 @@ static void initiate_take(unsigned int line, const struct jingle_msg *msg,
 		jid_text_bare(from, leg->peer_bare, sizeof(leg->peer_bare));
 	}
 
-	xv.env.reply_result(xv.env.priv, line, iq);
-
-	if (!local_offer_build(leg) || !msg->content.description ||
-	    !payload_select(leg, &msg->content)) {
-		session_fail(leg, JINGLE_REASON_FAILED_APPLICATION,
-			     direct ? PROTO_FAIL_QUIET : PROTO_FAIL_CONGESTION);
+	/* A caller that never got the result would see a timeout, not a call. */
+	if (xv.env.reply_result(xv.env.priv, line, iq)) {
+		XCALL_TRACE(leg, "the result of the initiate did not leave");
+		leg_fail(leg, offer_fail_class(leg));
 		return;
 	}
-	if (!remote_take(leg, &msg->content)) {
+
+	if (!local_offer_build(leg) || !msg->content.audio ||
+	    !msg->content.rtcp_mux || !payload_select(leg, &msg->content)) {
+		session_fail(leg, JINGLE_REASON_FAILED_APPLICATION,
+			     offer_fail_class(leg));
+		return;
+	}
+	if (!remote_take(leg, &msg->content, false)) {
 		session_fail(leg, JINGLE_REASON_SECURITY_ERROR,
-			     direct ? PROTO_FAIL_QUIET : PROTO_FAIL_CONGESTION);
+			     offer_fail_class(leg));
 		return;
 	}
 	local_answer_build(leg, &msg->content);
-	remote_candidates_add(leg, &msg->content);
+	if (!remote_candidates_add(leg, &msg->content)) {
+		session_fail(leg, JINGLE_REASON_FAILED_TRANSPORT,
+			     offer_fail_class(leg));
+		return;
+	}
 
 	if (!direct) {
 		accept_send(leg);
 		return;
 	}
 
-	info_send(leg, JINGLE_INFO_RINGING);
+	if (!info_send(leg, JINGLE_INFO_RINGING)) {
+		leg_fail(leg, PROTO_FAIL_QUIET);
+		return;
+	}
 	offer_announce(leg);
 }
 
@@ -1226,7 +1600,6 @@ static void initiate_take(unsigned int line, const struct jingle_msg *msg,
  */
 static void terminate_take(struct xcall *leg, const struct jingle_msg *msg)
 {
-	unsigned int line = leg->line, slot = leg->slot;
 	enum proto_fail_class cls;
 
 	XCALL_TRACE(leg, "the peer ended the session: %s",
@@ -1234,14 +1607,12 @@ static void terminate_take(struct xcall *leg, const struct jingle_msg *msg)
 	leg_clear(leg);
 
 	if (leg->answered) {
-		leg_bye(leg);
+		leg_end(leg, XCALL_END_BYE);
 		return;
 	}
 
 	if (leg->inbound) {
-		leg_release(leg);
-		if (xv.env.cb && xv.env.cb->remote_cancel)
-			xv.env.cb->remote_cancel(line, slot);
+		leg_end(leg, XCALL_END_CANCEL);
 		return;
 	}
 
@@ -1300,16 +1671,20 @@ bool xcall_jingle_rx(unsigned int line, const struct xml_doc *iq)
 	    !xv.env.reply_error)
 		return false;
 
-	if (!from)
-		from = "";
+	if (!jid_device(from)) {
+		xv.env.reply_error(xv.env.priv, line, iq, "modify",
+				   "bad-request");
+		return true;
+	}
 
 	if (msg.action == JINGLE_SESSION_INITIATE) {
 		initiate_take(line, &msg, iq, from);
 		return true;
 	}
 
+	/* An outbound leg learns the device of the callee from the proceed. */
 	leg = leg_find_sid(line, msg.sid);
-	if (!leg || (leg->peer[0] && strcmp(leg->peer, from))) {
+	if (!leg || !leg->peer[0] || strcmp(leg->peer, from)) {
 		xv.env.reply_error(xv.env.priv, line, iq, "cancel",
 				   "item-not-found");
 		return true;
@@ -1329,7 +1704,9 @@ bool xcall_jingle_rx(unsigned int line, const struct xml_doc *iq)
 		return true;
 	case JINGLE_TRANSPORT_INFO:
 		xv.env.reply_result(xv.env.priv, line, iq);
-		remote_candidates_add(leg, &msg.content);
+		if (!remote_candidates_add(leg, &msg.content))
+			session_fail(leg, JINGLE_REASON_FAILED_TRANSPORT,
+				     offer_fail_class(leg));
 		return true;
 	default:
 		xv.env.reply_error(xv.env.priv, line, iq, "cancel",
@@ -1356,26 +1733,60 @@ static void self_bare(unsigned int line, char *out, size_t len)
 }
 
 /**
+ * carbon_own() - whether a carbons copy comes from this account
+ * @msg: the parsed message
+ * @self: the bare JID of this account
+ *
+ * XEP-0280 section 11: the server of the account sends each copy from the
+ * bare JID of the account, and any other wrapper is a forgery.
+ *
+ * Return: true when the wrapper came from @self.
+ */
+static bool carbon_own(const struct jmi_msg *msg, const char *self)
+{
+	struct jid wrapper;
+
+	return self[0] && jid_parse(msg->wrapper_from, &wrapper) &&
+	       !wrapper.resource[0] && jid_text_bare_eq(msg->wrapper_from, self);
+}
+
+/**
+ * propose_refuse() - reject a propose that gets no leg
+ * @line: the line
+ * @msg: the parsed message
+ */
+static void propose_refuse(unsigned int line, const struct jmi_msg *msg)
+{
+	struct xcall refusal;
+
+	memset(&refusal, 0, sizeof(refusal));
+	refusal.line = line;
+	str_copy(refusal.sid, sizeof(refusal.sid), msg->id);
+	jmi_send(&refusal, JMI_REJECT, msg->from);
+}
+
+/**
  * propose_take() - a caller rings this account
  * @line: the line
  * @msg: the parsed message
+ *
+ * A received carbon rings too: the server copies a propose another device
+ * of this account got to this one. A copy of a propose another device of
+ * this account sent is a call it places, and a second copy of a propose
+ * finds the leg of the first.
  */
 static void propose_take(unsigned int line, const struct jmi_msg *msg)
 {
 	struct xcall *leg = leg_find_sid(line, msg->id);
 	unsigned int slot;
 
-	if (leg || !msg->audio || msg->carbon)
+	if (leg || !msg->audio || msg->carbon_sent || !jid_device(msg->from))
 		return;
 
-	if (!xcall_slot_free(line, &slot) ||
+	if (admission_refused(line) != JINGLE_REASON_NONE ||
+	    !xcall_slot_free(line, &slot) ||
 	    !(leg = leg_alloc(line, slot, true))) {
-		struct xcall refusal;
-
-		memset(&refusal, 0, sizeof(refusal));
-		refusal.line = line;
-		str_copy(refusal.sid, sizeof(refusal.sid), msg->id);
-		jmi_send(&refusal, JMI_REJECT, msg->from);
+		propose_refuse(line, msg);
 		return;
 	}
 
@@ -1397,18 +1808,9 @@ static void propose_take(unsigned int line, const struct jmi_msg *msg)
  */
 static void elsewhere_take(struct xcall *leg)
 {
-	unsigned int line = leg->line, slot = leg->slot;
-
 	XCALL_TRACE(leg, "answered elsewhere");
 	leg_clear(leg);
-	leg_release(leg);
-
-	if (!xv.env.cb)
-		return;
-	if (xv.env.cb->answered_elsewhere)
-		xv.env.cb->answered_elsewhere(line, slot);
-	else if (xv.env.cb->remote_cancel)
-		xv.env.cb->remote_cancel(line, slot);
+	leg_end(leg, XCALL_END_ELSEWHERE);
 }
 
 /**
@@ -1417,12 +1819,8 @@ static void elsewhere_take(struct xcall *leg)
  */
 static void retract_take(struct xcall *leg)
 {
-	unsigned int line = leg->line, slot = leg->slot;
-
 	leg_clear(leg);
-	leg_release(leg);
-	if (xv.env.cb && xv.env.cb->remote_cancel)
-		xv.env.cb->remote_cancel(line, slot);
+	leg_end(leg, XCALL_END_CANCEL);
 }
 
 /**
@@ -1440,6 +1838,8 @@ static void callee_take(struct xcall *leg, const struct jmi_msg *msg)
 			xv.env.cb->proceeding(line, slot, false);
 		return;
 	case JMI_PROCEED:
+		if (!jid_device(msg->from))
+			return;
 		str_copy(leg->peer, sizeof(leg->peer), msg->from);
 		initiate_start(leg);
 		return;
@@ -1461,6 +1861,10 @@ bool xcall_jmi_rx(unsigned int line, const struct xml_doc *message)
 	if (!jmi_parse(message, &msg))
 		return false;
 
+	self_bare(line, self, sizeof(self));
+	if (msg.carbon && !carbon_own(&msg, self))
+		return true;
+
 	if (msg.kind == JMI_PROPOSE) {
 		propose_take(line, &msg);
 		return true;
@@ -1470,7 +1874,6 @@ bool xcall_jmi_rx(unsigned int line, const struct xml_doc *message)
 	if (!leg)
 		return true;
 
-	self_bare(line, self, sizeof(self));
 	own = msg.carbon_sent ||
 	      (self[0] && jid_text_bare_eq(msg.from, self));
 
@@ -1480,7 +1883,7 @@ bool xcall_jmi_rx(unsigned int line, const struct xml_doc *message)
 		if (own && (msg.kind == JMI_PROCEED || msg.kind == JMI_ACCEPT ||
 			    msg.kind == JMI_REJECT))
 			elsewhere_take(leg);
-		else if (!own && msg.kind == JMI_RETRACT)
+		else if (msg.kind == JMI_RETRACT && !strcmp(msg.from, leg->peer))
 			retract_take(leg);
 		return true;
 	}
@@ -1545,7 +1948,7 @@ void xcall_transport_event(unsigned int line, unsigned int stream,
 static void guard_fire(struct proto_timer *timer)
 {
 	struct xcall *leg = timer->owner;
-	unsigned int line = leg->line, slot = leg->slot;
+	unsigned int line = leg->line;
 
 	if (!leg->in_use)
 		return;
@@ -1559,9 +1962,7 @@ static void guard_fire(struct proto_timer *timer)
 		return;
 	case XCALL_OFFERED:
 		leg_clear(leg);
-		leg_release(leg);
-		if (xv.env.cb && xv.env.cb->remote_cancel)
-			xv.env.cb->remote_cancel(line, slot);
+		leg_end(leg, XCALL_END_CANCEL);
 		return;
 	case XCALL_PROCEEDED:
 		leg_fail(leg, PROTO_FAIL_CONGESTION);
@@ -1573,7 +1974,7 @@ static void guard_fire(struct proto_timer *timer)
 		if (leg->dtls_closed) {
 			leg_clear(leg);
 			terminate_send(leg, JINGLE_REASON_SUCCESS);
-			leg_bye(leg);
+			leg_end(leg, XCALL_END_BYE);
 			return;
 		}
 		if (leg->dtls_up)
@@ -1609,7 +2010,11 @@ bool xcall_slot_free(unsigned int line, unsigned int *slot)
 
 unsigned int xcall_slot_stream(unsigned int line, unsigned int ui_slot)
 {
-	return leg_get(line, ui_slot) ? ui_slot : CALL_SLOTS;
+	if (line >= CFG_CHANNEL_MAX || ui_slot >= CALL_SLOTS ||
+	    !legs[line][ui_slot].in_use)
+		return CALL_SLOTS;
+
+	return ui_slot;
 }
 
 bool xcall_line_dial_ready(unsigned int line)
@@ -1619,7 +2024,7 @@ bool xcall_line_dial_ready(unsigned int line)
 }
 
 /**
- * target_resolve() - the JID a dialled string names
+ * target_resolve() - the JID a dialed string names
  * @line: the line
  * @target: the string
  * @out: receives the JID
@@ -1871,8 +2276,8 @@ static void line_end_all(unsigned int line, bool terminate,
 		return;
 
 	for (slot = 0; slot < CALL_SLOTS; slot++) {
-		leg = &legs[line][slot];
-		if (!leg->in_use)
+		leg = leg_get(line, slot);
+		if (!leg)
 			continue;
 		if (terminate && leg->state == XCALL_PROPOSED)
 			jmi_send(leg, JMI_RETRACT, leg->target);
@@ -1945,3 +2350,34 @@ void xcalls_status_dump(struct blob_buf *b, unsigned int line)
 	}
 	blobmsg_close_array(b, arr);
 }
+
+/**
+ * xcall_dial_op() - the dial entry of the leg table
+ * @line: the line
+ * @slot: the free slot
+ * @number: the target
+ * @cid_present: unused, Jingle has no withheld caller identity
+ *
+ * Return: what xcall_dial() returns.
+ */
+static bool xcall_dial_op(unsigned int line, unsigned int slot,
+			  const char *number, bool cid_present)
+{
+	return xcall_dial(line, slot, number);
+}
+
+const struct call_leg_ops xcalls_leg_ops = {
+	.slot_free = xcall_slot_free,
+	.slot_stream = xcall_slot_stream,
+	.dial_ready = xcall_line_dial_ready,
+	.dial = xcall_dial_op,
+	.ring = xcall_ring,
+	.answer = xcall_answer,
+	.reject = xcall_reject,
+	.hangup = xcall_hangup,
+	.hold = xcall_hold,
+	.resume = xcall_resume,
+	.dtmf = xcall_dtmf,
+	.line_end = xcalls_line_teardown,
+	.line_teardown = xcalls_line_teardown,
+};

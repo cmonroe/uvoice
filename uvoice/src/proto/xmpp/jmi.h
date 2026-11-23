@@ -48,13 +48,15 @@ enum jmi_kind {
  * the element, the inner one for a carbon. audio says a propose named an
  * RTP description of media audio. carbon says the message arrived inside a
  * carbons copy, carbon_sent that the copy was of a message this account
- * sent.
+ * sent, and wrapper_from is the from of the outer message of the copy, ""
+ * when it had none.
  */
 struct jmi_msg {
 	enum jmi_kind kind;
 	char id[JINGLE_SID_MAX];
 	char from[JID_MAX];
 	char to[JID_MAX];
+	char wrapper_from[JID_MAX];
 	bool audio;
 	bool carbon;
 	bool carbon_sent;
@@ -72,6 +74,9 @@ const char *jmi_kind_name(enum jmi_kind kind);
  * jmi_parse() - read a message of the family
  * @message: the message stanza
  * @out: receives the values, cleared first
+ *
+ * A session id, a from or a to that does not fit its field refuses the
+ * message, so two sessions never share a cut id.
  *
  * Return: true when the message, or the message a carbon wrapped, carries
  * one element of the family with an id.

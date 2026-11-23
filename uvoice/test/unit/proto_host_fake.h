@@ -217,6 +217,7 @@ struct phf_rec {
 	unsigned int config_set_fail;
 	unsigned int start_fail;
 	unsigned int stop_fail;
+	unsigned int candidate_add_fail;
 	/*
 	 * The digits toward the phone, as line/line.c holds them: one active
 	 * digit that plays at once on an idle line, and a queue of at most
