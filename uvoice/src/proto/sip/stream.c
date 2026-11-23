@@ -70,9 +70,10 @@
  * Read passes taken per readable event, for the same reason: uvoiced runs one
  * uloop_run(), so a peer that keeps its socket fed would otherwise hold the
  * tick, every transaction timer and every other connection inside this loop.
- * The socket is level triggered, so what the bound leaves behind is collected
- * on the next pass round the loop, and a full 16 KB TLS record needs two
- * passes out of the eight.
+ * The socket is level triggered, so bytes the bound leaves in the socket come
+ * back on the next pass round the loop. Plaintext the bound leaves inside TLS
+ * makes no event, so conn_rx() arms rx_more for it. A full 16 KB TLS record
+ * needs two passes out of the eight.
  */
 #define SIP_STREAM_RX_BURST	8
 
@@ -423,11 +424,14 @@ static void conn_teardown(struct sip_conn *c)
 	if (c->ufd.fd >= 0)
 		close(c->ufd.fd);
 
+	uloop_timeout_cancel(&c->rx_more);
+
 	memset(&c->local, 0, sizeof(c->local));
 	c->ufd.cb = NULL;
 	c->ufd.fd = -1;
 	c->tx_len = 0;
 	c->tx_off = 0;
+	c->tx_span = 0;
 	c->deadline_ms = 0;
 	c->tos_cur = SIP_TOS_UNSET;
 	c->state = SIP_CONN_FREE;
@@ -528,8 +532,9 @@ static int tcp_write(struct sip_conn *c, const char *buf, size_t len, size_t *do
  *   - SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER lets the retry present the payload
  *     from another address;
  *   - the staging buffer is append only between retries (tx_stage() compacts
- *     only what was already written), so a retry always presents the identical
- *     prefix of the identical logical stream.
+ *     only what was already written), and tx_span keeps the length of the
+ *     write that blocked, so a retry presents the same bytes with the same
+ *     length while tx_stage() appends behind them.
  *
  * test_sip_tls.c checks the three OpenSSL modes through a getter.
  * A read taken while a write is blocked on SIP_TLS_WANT_READ is directionally
@@ -571,21 +576,25 @@ static unsigned int tx_drain(struct sip_conn *c)
 	struct sip_stream *st = c->st;
 	unsigned int want;
 	size_t done;
+	size_t len;
 
 	while (c->tx_off < c->tx_len) {
 		done = 0;
 		want = 0;
+		len = c->tx_span ? c->tx_span : c->tx_len - c->tx_off;
 
-		if (conn_write(c, c->tx + c->tx_off, c->tx_len - c->tx_off, &done,
-			       &want) < 0) {
+		if (conn_write(c, c->tx + c->tx_off, len, &done, &want) < 0) {
 			st->stat.tx_err++;
 			conn_drop(c);
 			return 0;
 		}
 
+		if (!done && c->key.kind == SIP_STREAM_TLS)
+			c->tx_span = len;
 		if (!done)
 			return want == ULOOP_READ ? 0 : ULOOP_WRITE;
 
+		c->tx_span = 0;
 		c->tx_off += done;
 	}
 
@@ -894,8 +903,11 @@ static void rx_pump(struct sip_stream *st, uint32_t handle)
  * passes, because dispatching a message can close the connection.
  *
  * SIP_STREAM_RX_BURST bounds the passes for the reason the accept burst is
- * bounded: what the bound leaves is collected on the next turn of a level
- * triggered loop, and holding the loop is what nothing else can recover from.
+ * bounded: holding the loop is what nothing else can recover from. Bytes the
+ * bound leaves in the socket come back on the next turn of a level triggered
+ * loop. Plaintext it leaves inside OpenSSL does not, so a burst that ends
+ * with plaintext pending arms rx_more, a zero delay timer that runs one more
+ * burst after the other work of this turn.
  *
  * The answer is the mask the last pass asked for, and 0 for none.
  */
@@ -943,6 +955,9 @@ static unsigned int conn_rx(struct sip_conn *c)
 		if (!c)
 			return 0;
 	}
+
+	if (sip_tls_conn_pending(&c->tls))
+		uloop_timeout_set(&c->rx_more, 0);
 
 	return want;
 }
@@ -1114,6 +1129,13 @@ static void conn_io(struct uloop_fd *ufd, unsigned int events)
 	}
 }
 
+static void conn_rx_more(struct uloop_timeout *t)
+{
+	struct sip_conn *c = container_of(t, struct sip_conn, rx_more);
+
+	conn_io(&c->ufd, ULOOP_READ);
+}
+
 /* ------------------------------------------------------------------ slots */
 
 /*
@@ -1239,6 +1261,7 @@ static void conn_take(struct sip_conn *c, const struct sip_stream_key *key, cons
 	memset(&c->tls, 0, sizeof(c->tls));
 	c->tx_len = 0;
 	c->tx_off = 0;
+	c->tx_span = 0;
 	c->frames = 0;
 	c->tos_cur = SIP_TOS_UNSET;
 	c->used_ms = now;
@@ -1271,6 +1294,9 @@ static int conn_connect(struct sip_conn *c)
 		goto fail;
 
 	sock_keepalive(fd);
+	if (sock_nodelay_set(fd) < 0)
+		SIP_WIRE_TRACE("stream: connection %u: TCP_NODELAY refused: %s",
+			       c->index, strerror(errno));
 
 	if (connect(fd, (const struct sockaddr *)&dst->sa, dst->sa_len) < 0 &&
 	    errno != EINPROGRESS && errno != EINTR)
@@ -1507,6 +1533,9 @@ static void conn_accept(struct sip_listener *l, int fd, const struct sockaddr *s
 	c->ufd.cb = conn_io;
 	conn_local_set(c);
 	sock_keepalive(fd);
+	if (sock_nodelay_set(fd) < 0)
+		SIP_WIRE_TRACE("stream: connection %u: TCP_NODELAY refused: %s",
+			       c->index, strerror(errno));
 	st->stat.accepts++;
 
 	SIP_WIRE_TRACE("stream: connection %u accepted on port %u", c->index, l->port);
@@ -1901,6 +1930,7 @@ void sip_stream_init(struct sip_stream *st, const struct sip_stream_cb *cb, void
 		c->index = i;
 		c->gen = 1;
 		c->ufd.fd = -1;
+		c->rx_more.cb = conn_rx_more;
 		c->tos_cur = SIP_TOS_UNSET;
 		frame_init(&c->fr, c->rx, sizeof(c->rx));
 	}

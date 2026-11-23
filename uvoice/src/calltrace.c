@@ -385,41 +385,25 @@ static int ct_timer_ms(unsigned int seconds)
 }
 
 /*
- * A cadence and the environment variable that shrinks it. The value is read
- * once, so a case that moves the variable after the first read gets what the
- * daemon already holds, which is what a production daemon gets too.
+ * The cadences are read once, so a case that moves a variable after the first
+ * read gets what the daemon already holds, which is what a production daemon
+ * gets too.
  */
-static unsigned int ct_ms_env(const char *name, unsigned int def)
-{
-	const char *val = getenv(name);
-	unsigned long ms;
-	char *end;
-
-	if (!val || !*val)
-		return def;
-
-	ms = strtoul(val, &end, 10);
-	if (*end || !ms || ms > 3600000)
-		return def;
-
-	return (unsigned int)ms;
-}
-
 static void ct_cadences_load(void)
 {
 	if (ct_snapshot_ms)
 		return;
 
-	ct_snapshot_ms = ct_ms_env("UVOICE_CALLTRACE_SNAPSHOT_MS",
-				   CT_SNAPSHOT_MS);
-	ct_export_ms = ct_ms_env("UVOICE_CALLTRACE_EXPORT_MS", CT_EXPORT_MS);
-	ct_export_lec_ms = ct_ms_env("UVOICE_CALLTRACE_EXPORT_LEC_MS",
-				     CT_EXPORT_LEC_MS);
-	ct_wire_poll_ms = ct_ms_env("UVOICE_CALLTRACE_WIRE_POLL_MS",
-				    CT_WIRE_POLL_MS);
-	ct_kill_ms = ct_ms_env("UVOICE_CALLTRACE_KILL_MS", CT_KILL_MS);
-	ct_finish_ms = ct_ms_env("UVOICE_CALLTRACE_FINISH_MS",
-				 CT_FINISH_BUDGET_MS);
+	ct_snapshot_ms = env_ms_get("UVOICE_CALLTRACE_SNAPSHOT_MS",
+				    CT_SNAPSHOT_MS);
+	ct_export_ms = env_ms_get("UVOICE_CALLTRACE_EXPORT_MS", CT_EXPORT_MS);
+	ct_export_lec_ms = env_ms_get("UVOICE_CALLTRACE_EXPORT_LEC_MS",
+				      CT_EXPORT_LEC_MS);
+	ct_wire_poll_ms = env_ms_get("UVOICE_CALLTRACE_WIRE_POLL_MS",
+				     CT_WIRE_POLL_MS);
+	ct_kill_ms = env_ms_get("UVOICE_CALLTRACE_KILL_MS", CT_KILL_MS);
+	ct_finish_ms = env_ms_get("UVOICE_CALLTRACE_FINISH_MS",
+				  CT_FINISH_BUDGET_MS);
 }
 
 static void ct_word_set(char *dst, const char *src)

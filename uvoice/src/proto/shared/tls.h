@@ -173,6 +173,7 @@ struct sip_tls_conn {
 	struct ssl_st *ssl;
 	struct sip_tls *t;
 	char err[SIP_TLS_ERR_MAX];
+	size_t write_want;		/* the length a write retry must have */
 	bool server;
 	bool up;			/* the handshake finished */
 };
@@ -243,10 +244,29 @@ enum sip_tls_io sip_tls_conn_io(struct sip_tls_conn *c);
  * Move application data. *done receives the byte count and is 0 for anything
  * but SIP_TLS_OK. A read that returns SIP_TLS_OK with *done == 0 is the clean
  * shutdown of the peer, which closes the connection without an error.
+ *
+ * A write that answered SIP_TLS_WANT_* holds a record that only part of the
+ * socket took. OpenSSL requires the retry with the same bytes and the same
+ * length, so the caller keeps that span apart from what it stages later. A
+ * retry with another length is SIP_TLS_ERR.
  */
 enum sip_tls_io sip_tls_conn_read(struct sip_tls_conn *c, void *buf, size_t len, size_t *done);
 enum sip_tls_io sip_tls_conn_write(struct sip_tls_conn *c, const void *buf, size_t len,
 				   size_t *done);
+
+/*
+ * Whether plaintext waits inside the record layer, where no epoll event
+ * reports it. A read loop that stops on its own bound asks this before it
+ * leaves the rest to the next readable event.
+ */
+bool sip_tls_conn_pending(const struct sip_tls_conn *c);
+
+/*
+ * Whether the handshake verified the peer: the chain passed against the trust
+ * store and the certificate matches the host given to sip_tls_conn_connect().
+ * A connection without a host is never verified.
+ */
+bool sip_tls_conn_verified(const struct sip_tls_conn *c);
 
 /*
  * Release the SSL object. It sends a close_notify when the handshake finished

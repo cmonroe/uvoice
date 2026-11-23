@@ -6,11 +6,11 @@
  *
  * Licensed under GPL-2.0-only with the linking exception stated in LICENSE.
  *
- * Small helpers over the POSIX clock and socket calls. They are a 64-bit
- * monotonic clock in milliseconds, its 32-bit stamp form, the delay of a retry
- * ladder, the sockaddr steps of the SIP transports, the device bind and the
- * TOS mark. The core, every signaling protocol and the HAL backends share
- * them (proto/proto.h, the include rule).
+ * Small helpers over the POSIX clock, environment and socket calls. They are a
+ * 64-bit monotonic clock in milliseconds, its 32-bit stamp form, the delay of a
+ * retry ladder, a cadence from the environment, the sockaddr steps of the SIP
+ * transports, the device bind and the TOS mark. The core, every signaling
+ * protocol and the HAL backends share them (proto/proto.h, the include rule).
  *
  * The header carries only libc includes. The SIP object libraries do not
  * include uvoice.h, which pulls libubox and the daemon state. A file in sip/
@@ -21,9 +21,11 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -76,6 +78,26 @@ static inline unsigned int retry_delay_ms(unsigned int fails, unsigned int base,
 	ms = base << (fails < 5 ? fails - 1 : 4);
 
 	return ms > max ? max : ms;
+}
+
+/*
+ * A cadence in milliseconds that a test shrinks through the environment
+ * variable name. Only a decimal from 1 to 3600000 replaces def.
+ */
+static inline unsigned int env_ms_get(const char *name, unsigned int def)
+{
+	const char *val = getenv(name);
+	unsigned long ms;
+	char *end;
+
+	if (!val || !*val)
+		return def;
+
+	ms = strtoul(val, &end, 10);
+	if (*end || !ms || ms > 3600000UL)
+		return def;
+
+	return (unsigned int)ms;
 }
 
 static inline socklen_t sa_len_of(int family)
@@ -174,6 +196,17 @@ static inline int sock_tos_set(int fd, int family, int tos)
 	int opt = family == AF_INET6 ? IPV6_TCLASS : IP_TOS;
 
 	return setsockopt(fd, level, opt, &tos, sizeof(tos));
+}
+
+/*
+ * A signaling stream writes one small message and waits for its answer, so
+ * Nagle must not hold the message for the acknowledgment of the last one.
+ */
+static inline int sock_nodelay_set(int fd)
+{
+	int on = 1;
+
+	return setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
 }
 
 #endif

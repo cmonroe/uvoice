@@ -7,6 +7,8 @@
  */
 #include <stddef.h>
 
+#include <libubox/utils.h>
+
 #include "proto/xmpp/xml.h"
 #include "test_util.h"
 
@@ -35,15 +37,24 @@
 #define T_NS_URI_LONG	120U
 #define T_ATTRS_SLICED	1200U
 #define T_WRITER_MAX	512U
+#define T_TAG_OPEN	(100U * 1024U)
+#define T_BODY_HALF	40000U
+#define T_BODY_OVER	(XML_STANZA_MAX + 4096U)
+#define T_ATTRS_TEXT	700U
 
 struct tctx {
 	struct xml_doc header;
 	struct xml_doc stanza;
+	struct xml_doc dropped;
+	struct xml_stream *xs;
+	const char *stop_name;
 	unsigned int opens;
 	unsigned int stanzas;
+	unsigned int discards;
 	unsigned int closes;
 	unsigned int errors;
 	const char *reason;
+	const char *discard_reason;
 };
 
 static char t_big[T_BIG_MAX];
@@ -97,6 +108,19 @@ static void on_stanza(void *user, const struct xml_doc *stanza)
 
 	ctx->stanzas++;
 	doc_copy(&ctx->stanza, stanza);
+	if (ctx->stop_name && xml_node_is(stanza, 0, ctx->stop_name, NULL))
+		xml_stream_stop(ctx->xs);
+}
+
+/* Record a stanza that the parser dropped over a tree bound. */
+static void on_discard(void *user, const struct xml_doc *stanza,
+		       const char *reason)
+{
+	struct tctx *ctx = user;
+
+	ctx->discards++;
+	ctx->discard_reason = reason;
+	doc_copy(&ctx->dropped, stanza);
 }
 
 /**
@@ -126,6 +150,7 @@ static void on_error(void *user, const char *reason)
 static const struct xml_stream_cb t_cb = {
 	.stream_open = on_open,
 	.stanza = on_stanza,
+	.discard = on_discard,
 	.stream_close = on_close,
 	.error = on_error,
 };
@@ -141,6 +166,7 @@ static bool stream_open(struct xml_stream *xs, struct tctx *ctx)
 {
 	memset(xs, 0, sizeof(*xs));
 	memset(ctx, 0, sizeof(*ctx));
+	ctx->xs = xs;
 	if (xml_stream_init(xs, &t_cb, ctx))
 		return false;
 	if (xml_stream_feed(xs, T_HEADER, strlen(T_HEADER)))
@@ -166,16 +192,18 @@ static int feed_str(struct xml_stream *xs, const char *text)
  * @xs: the stream
  * @text: the string
  * @len: its length
+ * @step: the size of a slice
  *
- * Return: the first failing feed result, or 0.
+ * Return: the first non-zero feed result, or 0.
  */
-static int feed_sliced(struct xml_stream *xs, const char *text, size_t len)
+static int feed_sliced(struct xml_stream *xs, const char *text, size_t len,
+		       size_t step)
 {
 	size_t slice;
 	int ret;
 
 	while (len) {
-		slice = len > T_SLICE ? T_SLICE : len;
+		slice = len > step ? step : len;
 		ret = xml_stream_feed(xs, text, slice);
 		if (ret)
 			return ret;
@@ -266,6 +294,75 @@ static size_t nested_make(unsigned int depth)
 		len += (size_t)sprintf(t_big + len, "</a>");
 
 	return len;
+}
+
+/**
+ * deep_inner_make() - build a stanza deeper than XML_DEPTH_MAX around a text
+ * @inner: the elements below the depth bound
+ *
+ * Return: the length of t_big.
+ */
+static size_t deep_inner_make(const char *inner)
+{
+	size_t len = 0;
+	unsigned int i;
+
+	for (i = 0; i <= XML_DEPTH_MAX; i++)
+		len += (size_t)sprintf(t_big + len, "<a>");
+	len += (size_t)sprintf(t_big + len, "%s", inner);
+	for (i = 0; i <= XML_DEPTH_MAX; i++)
+		len += (size_t)sprintf(t_big + len, "</a>");
+
+	return len;
+}
+
+/* A message of a wire size whose body is one run of text. */
+static size_t body_make(char *dst, const char *id, size_t wire)
+{
+	const char *tail = "</body></message>";
+	size_t len = (size_t)sprintf(dst, "<message id='%s'><body>", id);
+	size_t fill = wire - len - strlen(tail);
+
+	memset(dst + len, 'x', fill);
+	len += fill;
+	len += (size_t)sprintf(dst + len, "%s", tail);
+
+	return len;
+}
+
+/* A start tag that stays open: a name, one attribute and its value. */
+static size_t tag_open_make(const char *head, size_t wire)
+{
+	size_t len = (size_t)sprintf(t_big, "%s<message a='", head);
+
+	memset(t_big + len, 'x', wire - len);
+
+	return wire;
+}
+
+/*
+ * The dropped tree holds one element with no child and no text. It keeps the
+ * named attributes, and the next stanza on the stream arrives whole.
+ */
+static bool dropped_check(struct xml_stream *xs, struct tctx *ctx,
+			  const char *name, const char *reason)
+{
+	const struct xml_doc *doc = &ctx->dropped;
+	unsigned int stanzas = ctx->stanzas;
+	bool ok;
+
+	ok = ctx->discards == 1 && str_is(ctx->discard_reason, reason);
+	ok = ok && ctx->errors == 0 && doc->nodes == 1;
+	ok = ok && xml_node_is(doc, 0, name, NULL);
+	ok = ok && doc->node[0].first_child == XML_NONE;
+	ok = ok && str_is(xml_text_get(doc, 0), "");
+	ok = ok && feed_str(xs, "<message xmlns:q='urn:q' id='next'>"
+				"<q:x/></message>") == 0;
+	ok = ok && ctx->stanzas == stanzas + 1 && ctx->errors == 0;
+	ok = ok && str_is(xml_attr_get(&ctx->stanza, 0, "id"), "next");
+
+	return ok &&
+	       xml_child(&ctx->stanza, XML_NONE, "x", "urn:q") != XML_NONE;
 }
 
 /**
@@ -520,72 +617,95 @@ static void bound_tests(void)
 	unsigned int i;
 
 	CASE("a stanza XML_DEPTH_MAX deep passes");
-	SUITE_CHECK(stream_open(&xs, &ctx));
+	CHECK(stream_open(&xs, &ctx));
 	len = nested_make(XML_DEPTH_MAX);
 	CHECK(xml_stream_feed(&xs, t_big, len) == 0);
 	CHECK_UINT(ctx.stanzas, 1);
 	CHECK_UINT(ctx.stanza.nodes, XML_DEPTH_MAX);
 	CHECK_UINT(ctx.errors, 0);
 
-	CASE("a stanza deeper than XML_DEPTH_MAX fails");
+	CASE("a stanza deeper than XML_DEPTH_MAX is dropped, the stream stays "
+	     "up");
 	len = nested_make(XML_DEPTH_MAX + 1);
-	CHECK(xml_stream_feed(&xs, t_big, len) == -EPROTO);
-	CHECK_UINT(ctx.errors, 1);
-	CHECK(str_is(ctx.reason, "stanza too deep"));
+	CHECK(xml_stream_feed(&xs, t_big, len) == 0);
 	CHECK_UINT(ctx.stanzas, 1);
+	CHECK(dropped_check(&xs, &ctx, "a", "stanza too deep"));
+
+	CASE("a stanza 1000 elements deep is dropped, the stream stays up");
+	len = nested_make(1000);
+	CHECK(xml_stream_feed(&xs, t_big, len) == 0);
+	CHECK_UINT(ctx.discards, 2);
+	CHECK_UINT(ctx.stanzas, 2);
+	CHECK(feed_str(&xs, "<presence/>") == 0);
+	CHECK_UINT(ctx.stanzas, 3);
+	CHECK_UINT(ctx.errors, 0);
 	xml_stream_done(&xs);
 
 	CASE("a stanza under XML_STANZA_MAX passes, twice in a row");
-	SUITE_CHECK(stream_open(&xs, &ctx));
+	CHECK(stream_open(&xs, &ctx));
 	len = big_stanza_make(XML_STANZA_MAX - T_SLICE);
-	CHECK(feed_sliced(&xs, t_big, len) == 0);
-	CHECK(feed_sliced(&xs, t_big, len) == 0);
+	CHECK(feed_sliced(&xs, t_big, len, T_SLICE) == 0);
+	CHECK(feed_sliced(&xs, t_big, len, T_SLICE) == 0);
 	CHECK_UINT(ctx.stanzas, 2);
 	CHECK_UINT(ctx.errors, 0);
 
 	CASE("a stanza longer than XML_STANZA_MAX fails");
 	len = big_stanza_make(XML_STANZA_MAX + 4 * T_SLICE);
-	CHECK(feed_sliced(&xs, t_big, len) == -EPROTO);
+	CHECK(feed_sliced(&xs, t_big, len, T_SLICE) == -EPROTO);
 	CHECK_UINT(ctx.errors, 1);
 	CHECK(str_is(ctx.reason, "stanza too long"));
 	CHECK_UINT(ctx.stanzas, 2);
 	xml_stream_done(&xs);
 
-	CASE("a stanza with more than XML_NODES_MAX elements fails");
-	SUITE_CHECK(stream_open(&xs, &ctx));
-	len = (size_t)sprintf(t_big, "<message>");
+	CASE("a stanza with more than XML_NODES_MAX elements is dropped");
+	CHECK(stream_open(&xs, &ctx));
+	len = (size_t)sprintf(t_big, "<message id='m1' type='chat'"
+			      " from='a@b/c' to='d@e' lang='x'>");
 	for (i = 0; i < XML_NODES_MAX; i++)
-		len += (size_t)sprintf(t_big + len, "<x/>");
+		len += (size_t)sprintf(t_big + len, "<x>t</x>");
 	len += (size_t)sprintf(t_big + len, "</message>");
-	CHECK(xml_stream_feed(&xs, t_big, len) == -EPROTO);
-	CHECK(str_is(ctx.reason, "too many elements"));
+	CHECK(xml_stream_feed(&xs, t_big, len) == 0);
+	CHECK_UINT(ctx.stanzas, 0);
+	CHECK_UINT(ctx.dropped.attrs, 5);
+	CHECK(str_is(xml_attr_get(&ctx.dropped, 0, "id"), "m1"));
+	CHECK(str_is(xml_attr_get(&ctx.dropped, 0, "from"), "a@b/c"));
+	CHECK(dropped_check(&xs, &ctx, "message", "too many elements"));
 	xml_stream_done(&xs);
 
 	CASE("a start tag over many slices arrives without more input");
-	SUITE_CHECK(stream_open(&xs, &ctx));
+	CHECK(stream_open(&xs, &ctx));
 	len = (size_t)sprintf(t_big, "<message");
 	for (i = 0; i < T_ATTRS_SLICED; i++)
 		len += (size_t)sprintf(t_big + len, " a%u='v'", i);
 	len += (size_t)sprintf(t_big + len, "/>");
 	CHECK(len > 8 * T_SLICE);
-	CHECK(feed_sliced(&xs, t_big, len) == 0);
+	CHECK(feed_sliced(&xs, t_big, len, T_SLICE) == 0);
 	CHECK_UINT(ctx.stanzas, 1);
 	CHECK_UINT(ctx.stanza.attrs, T_ATTRS_SLICED);
 	CHECK_UINT(ctx.errors, 0);
 	xml_stream_done(&xs);
 
-	CASE("a stanza with more than XML_ATTRS_MAX attributes fails");
-	SUITE_CHECK(stream_open(&xs, &ctx));
-	len = (size_t)sprintf(t_big, "<message");
+	CASE("a stanza element with too many attributes keeps id, type, from, "
+	     "to");
+	CHECK(stream_open(&xs, &ctx));
+	len = (size_t)sprintf(t_big, "<iq id='q1' type='get' from='a@b/c'"
+			      " to='d@e'");
 	for (i = 0; i <= XML_ATTRS_MAX; i++)
 		len += (size_t)sprintf(t_big + len, " a%u='v'", i);
-	len += (size_t)sprintf(t_big + len, "/>");
-	CHECK(xml_stream_feed(&xs, t_big, len) == -EPROTO);
-	CHECK(str_is(ctx.reason, "too many attributes"));
+	len += (size_t)sprintf(t_big + len, "><query xmlns='urn:q'/></iq>");
+	CHECK(xml_stream_feed(&xs, t_big, len) == 0);
+	CHECK_UINT(ctx.stanzas, 0);
+	CHECK(xml_node_is(&ctx.dropped, 0, "iq", XMPP_NS_CLIENT));
+	CHECK_UINT(ctx.dropped.attrs, 4);
+	CHECK(str_is(xml_attr_get(&ctx.dropped, 0, "id"), "q1"));
+	CHECK(str_is(xml_attr_get(&ctx.dropped, 0, "type"), "get"));
+	CHECK(str_is(xml_attr_get(&ctx.dropped, 0, "from"), "a@b/c"));
+	CHECK(str_is(xml_attr_get(&ctx.dropped, 0, "to"), "d@e"));
+	CHECK(dropped_check(&xs, &ctx, "iq", "too many attributes"));
 	xml_stream_done(&xs);
 
-	CASE("a stanza with more than XML_TEXT_MAX bytes of text fails");
-	SUITE_CHECK(stream_open(&xs, &ctx));
+	CASE("attributes past XML_TEXT_MAX bytes of text drop the stanza");
+	CHECK(stream_open(&xs, &ctx));
 	len = (size_t)sprintf(t_big, "<message xmlns:p='urn:");
 	memset(t_big + len, 'x', T_NS_URI_LONG);
 	len += T_NS_URI_LONG;
@@ -594,19 +714,276 @@ static void bound_tests(void)
 		len += (size_t)sprintf(t_big + len, " p:a%u='v'", i);
 	len += (size_t)sprintf(t_big + len, "/>");
 	CHECK(len < XML_STANZA_MAX);
-	CHECK(feed_sliced(&xs, t_big, len) == -EPROTO);
-	CHECK(str_is(ctx.reason, "stanza text too long"));
+	CHECK(feed_sliced(&xs, t_big, len, T_SLICE) == 0);
+	CHECK(dropped_check(&xs, &ctx, "message", "stanza text too long"));
 	xml_stream_done(&xs);
 
-	CASE("more than XML_NS_MAX declarations in scope fail");
-	SUITE_CHECK(stream_open(&xs, &ctx));
+	CASE("character data past XML_TEXT_MAX bytes of text drops the stanza");
+	CHECK(stream_open(&xs, &ctx));
+	len = (size_t)sprintf(t_big, "<message><x xmlns:p='urn:");
+	memset(t_big + len, 'x', T_NS_URI_LONG);
+	len += T_NS_URI_LONG;
+	len += (size_t)sprintf(t_big + len, "'");
+	for (i = 0; i < T_ATTRS_TEXT; i++)
+		len += (size_t)sprintf(t_big + len, " p:a%u='v'", i);
+	len += (size_t)sprintf(t_big + len, "/><body>");
+	memset(t_big + len, 'y', T_BODY_HALF);
+	len += T_BODY_HALF;
+	len += (size_t)sprintf(t_big + len, "</body></message>");
+	CHECK(len < XML_STANZA_MAX);
+	CHECK(feed_sliced(&xs, t_big, len, T_SLICE) == 0);
+	CHECK(dropped_check(&xs, &ctx, "message", "stanza text too long"));
+	xml_stream_done(&xs);
+
+	CASE("more than XML_NS_MAX declarations drop the stanza and its scope");
+	CHECK(stream_open(&xs, &ctx));
+	len = (size_t)sprintf(t_big, "<p:message");
+	for (i = 0; i < XML_NS_MAX; i++)
+		len += (size_t)sprintf(t_big + len, " xmlns:p%u='urn:%u'",
+				       i, i);
+	len += (size_t)sprintf(t_big + len, " xmlns:p='urn:p' id='n1'/>");
+	CHECK(xml_stream_feed(&xs, t_big, len) == 0);
+	CHECK(xml_node_is(&ctx.dropped, 0, "message", "urn:p"));
+	CHECK(str_is(xml_attr_get(&ctx.dropped, 0, "id"), "n1"));
+	CHECK(dropped_check(&xs, &ctx, "message",
+			    "too many namespace declarations"));
+	xml_stream_done(&xs);
+
+	CASE("the tag that loses a declaration still binds its own prefixes");
+	CHECK(stream_open(&xs, &ctx));
 	len = (size_t)sprintf(t_big, "<message");
 	for (i = 0; i < XML_NS_MAX; i++)
 		len += (size_t)sprintf(t_big + len, " xmlns:p%u='urn:%u'",
 				       i, i);
-	len += (size_t)sprintf(t_big + len, "/>");
+	len += (size_t)sprintf(t_big + len, " xmlns:p='urn:p' p:a='x'/>");
+	CHECK(xml_stream_feed(&xs, t_big, len) == 0);
+	CHECK(dropped_check(&xs, &ctx, "message",
+			    "too many namespace declarations"));
+	xml_stream_done(&xs);
+
+	CASE("an undeclared prefix on the tag that loses a declaration fails "
+	     "the stream");
+	len = (size_t)sprintf(t_big, "<message");
+	for (i = 0; i < XML_NS_MAX; i++)
+		len += (size_t)sprintf(t_big + len, " xmlns:p%u='urn:%u'",
+				       i, i);
+	len += (size_t)sprintf(t_big + len, " xmlns:p='urn:p' z:a='x'/>");
+	CHECK(fail_check(t_big, "unbound namespace prefix"));
+	len = (size_t)sprintf(t_big, "<message><z:x");
+	for (i = 0; i <= XML_NS_MAX; i++)
+		len += (size_t)sprintf(t_big + len, " xmlns:p%u='urn:%u'",
+				       i, i);
+	len += (size_t)sprintf(t_big + len, "/></message>");
+	CHECK(fail_check(t_big, "unbound namespace prefix"));
+
+	CASE("an unbound prefix past a tree bound fails the stream");
+	len = deep_inner_make("<p:b/>");
+	CHECK(fail_check(t_big, "unbound namespace prefix"));
+	len = deep_inner_make("<b p:c='x'/>");
+	CHECK(fail_check(t_big, "unbound namespace prefix"));
+
+	CASE("a prefix declared past a tree bound drops the stanza only");
+	CHECK(stream_open(&xs, &ctx));
+	len = deep_inner_make("<p:b xmlns:p='urn:p'><p:c p:d='x'/></p:b>");
+	CHECK(xml_stream_feed(&xs, t_big, len) == 0);
+	CHECK(dropped_check(&xs, &ctx, "a", "stanza too deep"));
+	xml_stream_done(&xs);
+
+	CASE("a prefix of a stanza element over a bound binds in its children");
+	CHECK(stream_open(&xs, &ctx));
+	len = (size_t)sprintf(t_big, "<iq id='q2' xmlns:q='urn:q'");
+	for (i = 0; i <= XML_ATTRS_MAX; i++)
+		len += (size_t)sprintf(t_big + len, " a%u='v'", i);
+	len += (size_t)sprintf(t_big + len, "><q:query/></iq>");
+	CHECK(xml_stream_feed(&xs, t_big, len) == 0);
+	CHECK(dropped_check(&xs, &ctx, "iq", "too many attributes"));
+	xml_stream_done(&xs);
+
+	CASE("a prefix past a declaration that did not fit drops the stanza "
+	     "only");
+	CHECK(stream_open(&xs, &ctx));
+	len = (size_t)sprintf(t_big, "<message");
+	for (i = 0; i < XML_NS_MAX; i++)
+		len += (size_t)sprintf(t_big + len, " xmlns:p%u='urn:%u'",
+				       i, i);
+	len += (size_t)sprintf(t_big + len, " xmlns:p='urn:p'><x><p:y/></x>"
+			       "</message>");
+	CHECK(xml_stream_feed(&xs, t_big, len) == 0);
+	CHECK(dropped_check(&xs, &ctx, "message",
+			    "too many namespace declarations"));
+	xml_stream_done(&xs);
+
+	CASE("a stream header over a tree bound fails the stream");
+	memset(&xs, 0, sizeof(xs));
+	memset(&ctx, 0, sizeof(ctx));
+	CHECK(xml_stream_init(&xs, &t_cb, &ctx) == 0);
+	len = (size_t)sprintf(t_big, "<stream:stream xmlns='jabber:client'"
+			      " xmlns:stream='"
+			      "http://etherx.jabber.org/streams'");
+	for (i = 0; i < XML_NS_MAX; i++)
+		len += (size_t)sprintf(t_big + len, " xmlns:p%u='urn:%u'",
+				       i, i);
+	len += (size_t)sprintf(t_big + len, ">");
 	CHECK(xml_stream_feed(&xs, t_big, len) == -EPROTO);
 	CHECK(str_is(ctx.reason, "too many namespace declarations"));
+	CHECK_UINT(ctx.opens, 0);
+	CHECK_UINT(ctx.discards, 0);
+	xml_stream_done(&xs);
+}
+
+/* The byte bounds: one stanza, and the bytes between two parser events. */
+static void byte_tests(void)
+{
+	static const struct {
+		size_t step;
+		const char *name;
+	} steps[] = {
+		{ 1, "a stream fed one byte at a time parses whole" },
+		{ 7, "a stream fed in steps of 7 bytes parses whole" },
+		{ 4096, "a stream fed in steps of 4096 bytes parses whole" },
+	};
+	struct xml_stream xs;
+	struct tctx ctx;
+	unsigned int node;
+	unsigned int i;
+	size_t len;
+	size_t half;
+
+	for (i = 0; i < ARRAY_SIZE(steps); i++) {
+		CASE(steps[i].name);
+		memset(&xs, 0, sizeof(xs));
+		memset(&ctx, 0, sizeof(ctx));
+		CHECK(xml_stream_init(&xs, &t_cb, &ctx) == 0);
+		len = (size_t)sprintf(t_big, "%s<presence/>", T_HEADER);
+		len += body_make(t_big + len, "b1", T_BODY_HALF);
+		len += (size_t)sprintf(t_big + len, "<iq type='get' id='p1'>"
+				       "<ping xmlns='urn:xmpp:ping'/></iq>");
+		CHECK(feed_sliced(&xs, t_big, len, steps[i].step) == 0);
+		CHECK_UINT(ctx.opens, 1);
+		CHECK_UINT(ctx.stanzas, 3);
+		CHECK_UINT(ctx.errors, 0);
+		CHECK(xml_node_is(&ctx.stanza, 0, "iq", XMPP_NS_CLIENT));
+		CHECK(xml_child(&ctx.stanza, XML_NONE, "ping",
+				"urn:xmpp:ping") != XML_NONE);
+		xml_stream_done(&xs);
+	}
+
+	CASE("the body of a stanza fed a byte at a time arrives whole");
+	CHECK(stream_open(&xs, &ctx));
+	len = body_make(t_big, "b2", T_BODY_HALF);
+	CHECK(feed_sliced(&xs, t_big, len, 1) == 0);
+	node = xml_child(&ctx.stanza, XML_NONE, "body", NULL);
+	CHECK_UINT(strlen(xml_text_get(&ctx.stanza, node)),
+		   T_BODY_HALF - strlen("<message id='b2'><body>") -
+		   strlen("</body></message>"));
+	xml_stream_done(&xs);
+
+	CASE("an empty element stanza passes");
+	CHECK(stream_open(&xs, &ctx));
+	CHECK(feed_str(&xs, "<presence/>") == 0);
+	CHECK(feed_str(&xs, "<message><x/></message>") == 0);
+	CHECK_UINT(ctx.stanzas, 2);
+	CHECK_UINT(ctx.errors, 0);
+	xml_stream_done(&xs);
+
+	CASE("a read with two stanzas counts each stanza alone");
+	CHECK(stream_open(&xs, &ctx));
+	len = body_make(t_big, "s1", T_BODY_HALF);
+	len += body_make(t_big + len, "s2", T_BODY_HALF);
+	half = 100;
+	CHECK(xml_stream_feed(&xs, t_big, half) == 0);
+	CHECK(xml_stream_feed(&xs, t_big + half, len - half) == 0);
+	CHECK_UINT(ctx.stanzas, 2);
+	CHECK_UINT(ctx.errors, 0);
+	CHECK(str_is(xml_attr_get(&ctx.stanza, 0, "id"), "s2"));
+	xml_stream_done(&xs);
+
+	CASE("a stanza over XML_STANZA_MAX in one read fails");
+	CHECK(stream_open(&xs, &ctx));
+	len = body_make(t_big, "s3", T_BODY_OVER);
+	CHECK(xml_stream_feed(&xs, t_big, len) == -EPROTO);
+	CHECK(str_is(ctx.reason, "stanza too long"));
+	CHECK_UINT(ctx.stanzas, 0);
+	xml_stream_done(&xs);
+
+	CASE("an open start tag of 100 KiB at depth 0 fails the stream");
+	memset(&xs, 0, sizeof(xs));
+	memset(&ctx, 0, sizeof(ctx));
+	CHECK(xml_stream_init(&xs, &t_cb, &ctx) == 0);
+	len = tag_open_make("<?xml version='1.0'?>", T_TAG_OPEN);
+	CHECK(feed_sliced(&xs, t_big, len, 4096) == -EPROTO);
+	CHECK(str_is(ctx.reason, "token too long"));
+	CHECK_UINT(ctx.opens, 0);
+	xml_stream_done(&xs);
+
+	CASE("an open start tag of 100 KiB at depth 1 fails the stream");
+	CHECK(stream_open(&xs, &ctx));
+	len = tag_open_make("", T_TAG_OPEN);
+	CHECK(feed_sliced(&xs, t_big, len, 4096) == -EPROTO);
+	CHECK(str_is(ctx.reason, "token too long"));
+	CHECK_UINT(ctx.stanzas, 0);
+	xml_stream_done(&xs);
+
+	CASE("whitespace past XML_STANZA_MAX between stanzas passes");
+	CHECK(stream_open(&xs, &ctx));
+	memset(t_big, ' ', T_TAG_OPEN);
+	CHECK(feed_sliced(&xs, t_big, T_TAG_OPEN, 4096) == 0);
+	CHECK(feed_str(&xs, "<presence/>") == 0);
+	CHECK_UINT(ctx.stanzas, 1);
+	CHECK_UINT(ctx.errors, 0);
+	xml_stream_done(&xs);
+}
+
+/* A stop at the stanza after which the peer waits for this side. */
+static void stop_tests(void)
+{
+	struct xml_stream xs;
+	struct tctx ctx;
+
+	CASE("a stop at a stanza ends the feed with XML_FEED_STOPPED");
+	CHECK(stream_open(&xs, &ctx));
+	ctx.stop_name = "proceed";
+	CHECK(feed_str(&xs, "<proceed xmlns='" NS_TLS "'/>") ==
+	      XML_FEED_STOPPED);
+	CHECK_UINT(ctx.stanzas, 1);
+	CHECK_UINT(ctx.errors, 0);
+
+	CASE("a feed after the stop fails the stream");
+	CHECK(feed_str(&xs, " ") == -EPROTO);
+	CHECK(str_is(ctx.reason, "data after the end of the document"));
+
+	CASE("a reset after a stop accepts the next document");
+	CHECK(xml_stream_reset(&xs) == 0);
+	CHECK(feed_str(&xs, T_HEADER) == 0);
+	CHECK(feed_str(&xs, "<message/>") == 0);
+	CHECK_UINT(ctx.opens, 2);
+	CHECK_UINT(ctx.stanzas, 2);
+	xml_stream_done(&xs);
+
+	CASE("a stanza after the stop in the same read fails the stream");
+	CHECK(stream_open(&xs, &ctx));
+	ctx.stop_name = "proceed";
+	CHECK(feed_str(&xs, "<proceed xmlns='" NS_TLS "'/>"
+			    "<iq type='get' id='x1'/>") == -EPROTO);
+	CHECK(str_is(ctx.reason, "data after the end of the document"));
+	CHECK_UINT(ctx.stanzas, 1);
+	xml_stream_done(&xs);
+
+	CASE("one space after the stop in the same read fails the stream");
+	CHECK(stream_open(&xs, &ctx));
+	ctx.stop_name = "success";
+	CHECK(feed_str(&xs, "<success xmlns='" NS_SASL "'>dj1h</success> ") ==
+	      -EPROTO);
+	CHECK_UINT(ctx.errors, 1);
+	xml_stream_done(&xs);
+
+	CASE("a stopping stanza split over two reads stops at its end");
+	CHECK(stream_open(&xs, &ctx));
+	ctx.stop_name = "success";
+	CHECK(feed_str(&xs, "<success xmlns='" NS_SASL "'>dj") == 0);
+	CHECK(feed_str(&xs, "1h</success>") == XML_FEED_STOPPED);
+	CHECK(str_is(xml_text_get(&ctx.stanza, 0), "dj1h"));
+	CHECK_UINT(ctx.errors, 0);
 	xml_stream_done(&xs);
 }
 
@@ -619,7 +996,7 @@ static void reset_tests(void)
 	struct tctx ctx;
 
 	CASE("xml_stream_reset accepts a new header afterwards");
-	SUITE_CHECK(stream_open(&xs, &ctx));
+	CHECK(stream_open(&xs, &ctx));
 	CHECK(feed_str(&xs, "<message/>") == 0);
 	CHECK_UINT(ctx.stanzas, 1);
 	CHECK(xml_stream_reset(&xs) == 0);
@@ -811,6 +1188,8 @@ int main(void)
 	stanza_tests();
 	forbidden_tests();
 	bound_tests();
+	byte_tests();
+	stop_tests();
 	reset_tests();
 	writer_tests();
 	round_trip_tests();

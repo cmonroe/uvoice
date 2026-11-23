@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include <expat.h>
+#include <libubox/utils.h>
 
 #include "proto/xmpp/xml.h"
 
@@ -19,6 +20,15 @@
 #define XML_PREFIX_XML		"xml"
 #define XML_PREFIX_XML_LEN	(sizeof(XML_PREFIX_XML) - 1)
 #define XML_UINT_TEXT_MAX	16U
+
+/* Expat 2.9 marks the two position calls deprecated and names 64-bit forms. */
+#if XML_MAJOR_VERSION > 2 || (XML_MAJOR_VERSION == 2 && XML_MINOR_VERSION >= 9)
+#define XML_BYTE_INDEX(parser)	XML_GetCurrentByteIndex64(parser)
+#define XML_BYTE_COUNT(parser)	XML_GetCurrentByteCount64(parser)
+#else
+#define XML_BYTE_INDEX(parser)	XML_GetCurrentByteIndex(parser)
+#define XML_BYTE_COUNT(parser)	XML_GetCurrentByteCount(parser)
+#endif
 
 /**
  * doc_reset() - empty the arena of a tree, keeping its shared empty string
@@ -111,27 +121,42 @@ static void stream_fail(struct xml_stream *xs, const char *reason)
 		xs->cb.error(xs->user, reason);
 }
 
+/*
+ * A tree bound fails the stream header and drops a stanza. The first bound a
+ * stanza hits names the reason.
+ */
+static bool limit_hit(struct xml_stream *xs, const char *reason)
+{
+	if (!xs->depth) {
+		stream_fail(xs, reason);
+		return false;
+	}
+
+	if (!xs->discard) {
+		xs->discard = true;
+		xs->discard_reason = reason;
+	}
+
+	return false;
+}
+
 /**
  * ns_push() - declare a namespace for the element that opens
  * @xs: the stream
  * @prefix: the prefix, "" for the default namespace
  * @uri: the namespace URI
  *
- * Return: false when the declaration does not fit, with the stream failed.
+ * Return: false when the declaration does not fit, through limit_hit().
  */
 static bool ns_push(struct xml_stream *xs, const char *prefix, const char *uri)
 {
 	struct xml_ns_decl *decl;
 
-	if (xs->ns_count >= XML_NS_MAX) {
-		stream_fail(xs, "too many namespace declarations");
-		return false;
-	}
+	if (xs->ns_count >= XML_NS_MAX)
+		return limit_hit(xs, "too many namespace declarations");
 
-	if (strlen(prefix) >= XML_NAME_MAX || strlen(uri) >= XML_NS_URI_MAX) {
-		stream_fail(xs, "namespace declaration too long");
-		return false;
-	}
+	if (strlen(prefix) >= XML_NAME_MAX || strlen(uri) >= XML_NS_URI_MAX)
+		return limit_hit(xs, "namespace declaration too long");
 
 	decl = &xs->ns[xs->ns_count++];
 	strcpy(decl->prefix, prefix);
@@ -224,9 +249,9 @@ static bool attr_is_xmlns(const char *qname, const char **prefix)
  * @xs: the stream
  * @atts: the attribute pairs as expat reports them
  *
- * Return: false when a declaration does not fit, with the stream failed.
+ * A declaration that does not fit sets ns_lost, through limit_hit().
  */
-static bool ns_declare(struct xml_stream *xs, const char **atts)
+static void ns_declare(struct xml_stream *xs, const char **atts)
 {
 	const char *prefix;
 	unsigned int i;
@@ -234,24 +259,70 @@ static bool ns_declare(struct xml_stream *xs, const char **atts)
 	for (i = 0; atts[i]; i += 2) {
 		if (!attr_is_xmlns(atts[i], &prefix))
 			continue;
-		if (!ns_push(xs, prefix, atts[i + 1]))
-			return false;
+		if (!ns_push(xs, prefix, atts[i + 1]) && !xs->ns_lost)
+			xs->ns_lost = xs->depth;
+	}
+}
+
+/**
+ * decl_find() - the namespace an element declares for a prefix
+ * @atts: the attribute pairs as expat reports them
+ * @prefix: the prefix bytes
+ * @prefix_len: their count, 0 for the default namespace
+ *
+ * Return: the URI, or NULL when the element declares none for @prefix.
+ */
+static const char *decl_find(const char **atts, const char *prefix,
+			     size_t prefix_len)
+{
+	const char *declared;
+	unsigned int i;
+
+	for (i = 0; atts[i]; i += 2) {
+		if (!attr_is_xmlns(atts[i], &declared))
+			continue;
+		if (strlen(declared) == prefix_len &&
+		    !memcmp(declared, prefix, prefix_len))
+			return atts[i + 1];
 	}
 
-	return true;
+	return NULL;
+}
+
+/**
+ * prefix_resolve() - the namespace URI of a prefix on an element that opens
+ * @xs: the stream
+ * @atts: the attribute pairs of the element
+ * @prefix: the prefix bytes
+ * @prefix_len: their count, 0 for the default namespace
+ *
+ * The declarations of the element come first, because one of them may not
+ * fit the scope.
+ *
+ * Return: as ns_resolve().
+ */
+static const char *prefix_resolve(const struct xml_stream *xs,
+				  const char **atts, const char *prefix,
+				  size_t prefix_len)
+{
+	const char *ns = decl_find(atts, prefix, prefix_len);
+
+	return ns ? ns : ns_resolve(xs, prefix, prefix_len);
 }
 
 /**
  * attr_resolve() - the local name and the namespace of an attribute
  * @xs: the stream
+ * @atts: the attribute pairs of its element
  * @qname: the attribute name
  * @local: receives the local name
  * @ns: receives the namespace URI, NULL for an unprefixed attribute
  *
  * Return: false for an unbound prefix, with the stream failed.
  */
-static bool attr_resolve(struct xml_stream *xs, const char *qname,
-			 const char **local, const char **ns)
+static bool attr_resolve(struct xml_stream *xs, const char **atts,
+			 const char *qname, const char **local,
+			 const char **ns)
 {
 	size_t prefix_len;
 
@@ -267,13 +338,59 @@ static bool attr_resolve(struct xml_stream *xs, const char *qname,
 		return true;
 	}
 
-	*ns = ns_resolve(xs, qname, prefix_len);
+	*ns = prefix_resolve(xs, atts, qname, prefix_len);
 	if (*ns)
 		return true;
 
 	stream_fail(xs, "unbound namespace prefix");
 
 	return false;
+}
+
+/**
+ * ns_check() - declare the namespaces of an element and check its prefixes
+ * @xs: the stream
+ * @qname: the element name with its prefix
+ * @atts: the attribute pairs as expat reports them
+ *
+ * The check runs for a dropped stanza too, because the tree bounds do not
+ * apply to well-formed namespaces. Below an ancestor whose declaration did
+ * not fit, a prefix can be bound by it, so no prefix fails there. The
+ * element whose own declaration did not fit still holds all of its
+ * declarations in @atts, so its prefixes are checked.
+ *
+ * Return: false with the stream failed.
+ */
+static bool ns_check(struct xml_stream *xs, const char *qname,
+		     const char **atts)
+{
+	unsigned int lost = xs->ns_lost;
+	const char *prefix;
+	const char *local;
+	const char *ns;
+	size_t prefix_len;
+	unsigned int i;
+
+	ns_declare(xs, atts);
+	if (xs->failed)
+		return false;
+	if (lost)
+		return true;
+
+	qname_split(qname, &prefix_len);
+	if (!prefix_resolve(xs, atts, qname, prefix_len)) {
+		stream_fail(xs, "unbound namespace prefix");
+		return false;
+	}
+
+	for (i = 0; atts[i]; i += 2) {
+		if (attr_is_xmlns(atts[i], &prefix))
+			continue;
+		if (!attr_resolve(xs, atts, atts[i], &local, &ns))
+			return false;
+	}
+
+	return true;
 }
 
 /**
@@ -300,8 +417,8 @@ static void node_link(struct xml_doc *doc, unsigned int parent,
  * @name: the local name
  * @ns: the namespace URI
  *
- * Return: the node index, or XML_NONE when the tree is full, with the
- * stream failed.
+ * Return: the node index, or XML_NONE when the tree is full, through
+ * limit_hit().
  */
 static unsigned int node_add(struct xml_stream *xs, unsigned int parent,
 			     const char *name, const char *ns)
@@ -311,7 +428,7 @@ static unsigned int node_add(struct xml_stream *xs, unsigned int parent,
 	unsigned int idx = doc->nodes;
 
 	if (idx >= XML_NODES_MAX) {
-		stream_fail(xs, "too many elements");
+		limit_hit(xs, "too many elements");
 		return XML_NONE;
 	}
 
@@ -319,7 +436,7 @@ static unsigned int node_add(struct xml_stream *xs, unsigned int parent,
 	node->name = text_append(doc, name, strlen(name));
 	node->ns = text_append(doc, ns, strlen(ns));
 	if (!node->name || !node->ns) {
-		stream_fail(xs, "stanza text too long");
+		limit_hit(xs, "stanza text too long");
 		return XML_NONE;
 	}
 
@@ -344,7 +461,7 @@ static unsigned int node_add(struct xml_stream *xs, unsigned int parent,
  * @ns: the namespace URI, NULL for an unprefixed attribute
  * @value: the value
  *
- * Return: false when the tree is full, with the stream failed.
+ * Return: false when the tree is full, through limit_hit().
  */
 static bool attr_add(struct xml_stream *xs, unsigned int idx, const char *name,
 		     const char *ns, const char *value)
@@ -353,19 +470,15 @@ static bool attr_add(struct xml_stream *xs, unsigned int idx, const char *name,
 	struct xml_node *node = &doc->node[idx];
 	struct xml_attr *attr;
 
-	if (doc->attrs >= XML_ATTRS_MAX) {
-		stream_fail(xs, "too many attributes");
-		return false;
-	}
+	if (doc->attrs >= XML_ATTRS_MAX)
+		return limit_hit(xs, "too many attributes");
 
 	attr = &doc->attr[doc->attrs];
 	attr->name = text_append(doc, name, strlen(name));
 	attr->value = text_append(doc, value, strlen(value));
 	attr->ns = ns ? text_append(doc, ns, strlen(ns)) : NULL;
-	if (!attr->name || !attr->value || (ns && !attr->ns)) {
-		stream_fail(xs, "stanza text too long");
-		return false;
-	}
+	if (!attr->name || !attr->value || (ns && !attr->ns))
+		return limit_hit(xs, "stanza text too long");
 
 	if (node->attr_first == XML_NONE)
 		node->attr_first = (uint16_t)doc->attrs;
@@ -381,8 +494,8 @@ static bool attr_add(struct xml_stream *xs, unsigned int idx, const char *name,
  * @idx: the node
  * @atts: the attribute pairs as expat reports them
  *
- * Return: false when an attribute does not fit or carries an unbound
- * prefix, with the stream failed.
+ * Return: false when an attribute does not fit, through limit_hit(), or
+ * holds an unbound prefix, with the stream failed.
  */
 static bool attrs_add(struct xml_stream *xs, unsigned int idx,
 		      const char **atts)
@@ -395,7 +508,7 @@ static bool attrs_add(struct xml_stream *xs, unsigned int idx,
 	for (i = 0; atts[i]; i += 2) {
 		if (attr_is_xmlns(atts[i], &prefix))
 			continue;
-		if (!attr_resolve(xs, atts[i], &local, &ns))
+		if (!attr_resolve(xs, atts, atts[i], &local, &ns))
 			return false;
 		if (!attr_add(xs, idx, local, ns, atts[i + 1]))
 			return false;
@@ -428,6 +541,165 @@ static void stanza_emit(struct xml_stream *xs)
 }
 
 /**
+ * discard_emit() - hand up the element of a stanza over a tree bound
+ * @xs: the stream
+ */
+static void discard_emit(struct xml_stream *xs)
+{
+	struct xml_doc *doc = &xs->doc;
+	struct xml_node *top = &doc->node[0];
+
+	doc->nodes = 1;
+	doc->attrs = top->attr_count;
+	top->first_child = XML_NONE;
+	top->text = doc->text;
+	if (xs->cb.discard)
+		xs->cb.discard(xs->user, doc, xs->discard_reason);
+	doc_reset(doc);
+	xs->discard = false;
+}
+
+/*
+ * Expat holds an unfinished token and parses it again at every feed, so the
+ * bytes since the end of the last event bound that work. A stanza counts from
+ * the first byte of its start tag to the end of the current event.
+ */
+static bool event_mark(struct xml_stream *xs)
+{
+	int64_t at = XML_BYTE_INDEX(xs->parser);
+	uint64_t end;
+
+	if (at < 0)
+		return true;
+
+	end = (uint64_t)at + (uint64_t)XML_BYTE_COUNT(xs->parser);
+	if (xs->depth >= 2 && end - xs->stanza_start > XML_STANZA_MAX) {
+		stream_fail(xs, "stanza too long");
+		return false;
+	}
+
+	if (end > xs->mark && end - xs->mark > XML_STANZA_MAX) {
+		stream_fail(xs, "token too long");
+		return false;
+	}
+
+	if (end > xs->mark)
+		xs->mark = end;
+
+	return true;
+}
+
+/**
+ * stanza_begin() - start the count and the bounds of a stanza
+ * @xs: the stream
+ */
+static void stanza_begin(struct xml_stream *xs)
+{
+	int64_t at = XML_BYTE_INDEX(xs->parser);
+
+	xs->stanza_start = at < 0 ? xs->mark : (uint64_t)at;
+	xs->discard = false;
+	xs->discard_reason = NULL;
+}
+
+/**
+ * element_store() - add an element and its attributes to the tree
+ * @xs: the stream
+ * @qname: the element name with its prefix
+ * @atts: the attribute pairs as expat reports them
+ *
+ * Context: ns_check() declared the namespaces of the element.
+ * Return: false when the element does not fit, through limit_hit(), or
+ * holds an unbound prefix, with the stream failed.
+ */
+static bool element_store(struct xml_stream *xs, const char *qname,
+			  const char **atts)
+{
+	unsigned int parent = XML_NONE;
+	unsigned int idx;
+	const char *local;
+	const char *ns;
+	size_t prefix_len;
+
+	if (xs->depth > XML_DEPTH_MAX)
+		return limit_hit(xs, "stanza too deep");
+
+	if (xs->depth >= 2)
+		parent = xs->open[xs->depth - 2];
+
+	local = qname_split(qname, &prefix_len);
+	ns = ns_resolve(xs, qname, prefix_len);
+	if (!ns) {
+		stream_fail(xs, "unbound namespace prefix");
+		return false;
+	}
+
+	idx = node_add(xs, parent, local, ns);
+	if (idx == XML_NONE || !attrs_add(xs, idx, atts))
+		return false;
+
+	if (xs->depth)
+		xs->open[xs->depth - 1] = (uint16_t)idx;
+
+	return true;
+}
+
+/**
+ * attr_find() - the value of an unprefixed attribute as expat reports it
+ * @atts: the attribute pairs
+ * @name: the attribute name
+ *
+ * Return: the value, or NULL.
+ */
+static const char *attr_find(const char **atts, const char *name)
+{
+	unsigned int i;
+
+	for (i = 0; atts[i]; i += 2) {
+		if (!strcmp(atts[i], name))
+			return atts[i + 1];
+	}
+
+	return NULL;
+}
+
+/*
+ * A stanza element over a bound keeps the attributes an error reply needs.
+ * Its own declarations may not fit, so its name resolves against them first.
+ */
+static bool top_keep(struct xml_stream *xs, const char *qname,
+		     const char **atts)
+{
+	static const char *const keep[] = { "id", "type", "from", "to" };
+	const char *value;
+	const char *local;
+	const char *ns;
+	size_t prefix_len;
+	unsigned int i;
+	bool ok;
+
+	doc_reset(&xs->doc);
+	local = qname_split(qname, &prefix_len);
+	ns = prefix_resolve(xs, atts, qname, prefix_len);
+	if (!ns) {
+		stream_fail(xs, "unbound namespace prefix");
+		return false;
+	}
+
+	ok = node_add(xs, XML_NONE, local, ns) != XML_NONE;
+	for (i = 0; ok && i < ARRAY_SIZE(keep); i++) {
+		value = attr_find(atts, keep[i]);
+		if (value)
+			ok = attr_add(xs, 0, keep[i], NULL, value);
+	}
+
+	if (!ok)
+		stream_fail(xs, xs->discard_reason);
+
+	return ok;
+}
+
+/**
  * on_element_start() - expat reports a start tag
  * @user: the stream
  * @qname: the element name with its prefix
@@ -437,37 +709,21 @@ static void XMLCALL on_element_start(void *user, const XML_Char *qname,
 				     const XML_Char **atts)
 {
 	struct xml_stream *xs = user;
-	unsigned int parent = XML_NONE;
-	unsigned int idx;
-	const char *local;
-	const char *ns;
-	size_t prefix_len;
 
-	if (xs->failed)
+	if (xs->failed || xs->stopped || !event_mark(xs))
 		return;
-
-	if (xs->depth > XML_DEPTH_MAX) {
-		stream_fail(xs, "stanza too deep");
-		return;
-	}
 
 	if (xs->depth == 1)
-		xs->stanza_bytes = 0;
-	if (xs->depth >= 2)
-		parent = xs->open[xs->depth - 2];
+		stanza_begin(xs);
 
-	if (!ns_declare(xs, atts))
+	if (!ns_check(xs, qname, atts))
 		return;
-
-	local = qname_split(qname, &prefix_len);
-	ns = ns_resolve(xs, qname, prefix_len);
-	if (!ns) {
-		stream_fail(xs, "unbound namespace prefix");
+	if (!xs->discard)
+		element_store(xs, qname, atts);
+	if (xs->failed)
 		return;
-	}
-
-	idx = node_add(xs, parent, local, ns);
-	if (idx == XML_NONE || !attrs_add(xs, idx, atts))
+	/* stanza_begin() cleared the discard, so this element set it. */
+	if (xs->depth == 1 && xs->discard && !top_keep(xs, qname, atts))
 		return;
 
 	if (xs->depth == 0) {
@@ -476,7 +732,6 @@ static void XMLCALL on_element_start(void *user, const XML_Char *qname,
 		return;
 	}
 
-	xs->open[xs->depth - 1] = (uint16_t)idx;
 	xs->depth++;
 }
 
@@ -489,13 +744,20 @@ static void XMLCALL on_element_end(void *user, const XML_Char *qname)
 {
 	struct xml_stream *xs = user;
 
-	if (xs->failed)
+	if (xs->failed || xs->stopped || !event_mark(xs))
 		return;
 
 	xs->depth--;
 	ns_pop(xs, xs->depth);
+	if (xs->ns_lost >= xs->depth)
+		xs->ns_lost = 0;
 	if (xs->depth > 1)
 		return;
+
+	if (xs->depth == 1 && xs->discard) {
+		discard_emit(xs);
+		return;
+	}
 
 	if (xs->depth == 1) {
 		stanza_emit(xs);
@@ -518,12 +780,15 @@ static void XMLCALL on_text(void *user, const XML_Char *data, int len)
 	struct xml_stream *xs = user;
 	unsigned int idx;
 
-	if (xs->failed || xs->depth < 2)
+	if (xs->failed || xs->stopped || !event_mark(xs))
+		return;
+
+	if (xs->depth < 2 || xs->discard)
 		return;
 
 	idx = xs->open[xs->depth - 2];
 	if (!node_text_add(&xs->doc, &xs->doc.node[idx], data, (size_t)len))
-		stream_fail(xs, "stanza text too long");
+		limit_hit(xs, "stanza text too long");
 }
 
 /**
@@ -623,11 +888,17 @@ static void handlers_set(struct xml_stream *xs)
 static void state_clear(struct xml_stream *xs)
 {
 	xs->ns_count = 0;
+	xs->ns_lost = 0;
 	xs->depth = 0;
 	xs->failed = false;
+	xs->stopped = false;
+	xs->discard = false;
 	xs->header_seen = false;
 	xs->root_closed = false;
-	xs->stanza_bytes = 0;
+	xs->discard_reason = NULL;
+	xs->fed = 0;
+	xs->mark = 0;
+	xs->stanza_start = 0;
 	doc_reset(&xs->doc);
 }
 
@@ -656,7 +927,30 @@ int xml_stream_init(struct xml_stream *xs, const struct xml_stream_cb *cb,
 }
 
 /**
- * slice_feed() - count a slice against the open stanza, then parse it
+ * bytes_check() - apply the byte bounds to what expat holds after a feed
+ * @xs: the stream
+ *
+ * The stanza bound goes first: an open stanza holds the unfinished token.
+ *
+ * Return: false when a bound failed the stream.
+ */
+static bool bytes_check(struct xml_stream *xs)
+{
+	if (xs->depth >= 2 && xs->fed - xs->stanza_start > XML_STANZA_MAX) {
+		stream_fail(xs, "stanza too long");
+		return false;
+	}
+
+	if (xs->fed - xs->mark > XML_STANZA_MAX) {
+		stream_fail(xs, "token too long");
+		return false;
+	}
+
+	return true;
+}
+
+/**
+ * slice_feed() - parse a slice and apply the byte bounds
  * @xs: the stream
  * @buf: the bytes
  * @len: their count, which fits an expat length
@@ -665,23 +959,35 @@ int xml_stream_init(struct xml_stream *xs, const struct xml_stream_cb *cb,
  */
 static bool slice_feed(struct xml_stream *xs, const char *buf, int len)
 {
+	enum XML_Status status;
+
 	if (xs->failed)
 		return false;
 
-	if (xs->depth >= 2) {
-		xs->stanza_bytes += (size_t)len;
-		if (xs->stanza_bytes > XML_STANZA_MAX) {
-			stream_fail(xs, "stanza too long");
-			return false;
-		}
+	if (xs->stopped) {
+		stream_fail(xs, "data after the end of the document");
+		return false;
 	}
 
-	if (XML_Parse(xs->parser, buf, len, XML_FALSE) == XML_STATUS_OK)
+	xs->fed += (uint64_t)len;
+	status = XML_Parse(xs->parser, buf, len, XML_FALSE);
+	if (xs->failed)
+		return false;
+
+	if (xs->stopped && xs->fed > xs->mark) {
+		stream_fail(xs, "data after the end of the document");
+		return false;
+	}
+
+	if (xs->stopped)
 		return true;
 
-	stream_fail(xs, XML_ErrorString(XML_GetErrorCode(xs->parser)));
+	if (status != XML_STATUS_OK) {
+		stream_fail(xs, XML_ErrorString(XML_GetErrorCode(xs->parser)));
+		return false;
+	}
 
-	return false;
+	return bytes_check(xs);
 }
 
 /**
@@ -693,7 +999,8 @@ static bool slice_feed(struct xml_stream *xs, const char *buf, int len)
  * The callbacks run from inside this call. After an error the stream is
  * failed and every later feed is refused.
  *
- * Return: 0, or -EPROTO once the stream failed.
+ * Return: 0, XML_FEED_STOPPED when a callback called xml_stream_stop() and
+ * no byte followed the stanza, or -EPROTO once the stream failed.
  */
 int xml_stream_feed(struct xml_stream *xs, const char *buf, size_t len)
 {
@@ -707,7 +1014,26 @@ int xml_stream_feed(struct xml_stream *xs, const char *buf, size_t len)
 		len -= (size_t)slice;
 	}
 
-	return xs->failed ? -EPROTO : 0;
+	if (xs->failed)
+		return -EPROTO;
+
+	return xs->stopped ? XML_FEED_STOPPED : 0;
+}
+
+/**
+ * xml_stream_stop() - end the document at the stanza a callback has
+ * @xs: the stream
+ *
+ * The feed in progress returns XML_FEED_STOPPED, and the next document starts
+ * with xml_stream_reset().
+ */
+void xml_stream_stop(struct xml_stream *xs)
+{
+	if (xs->failed || xs->stopped)
+		return;
+
+	xs->stopped = true;
+	XML_StopParser(xs->parser, XML_FALSE);
 }
 
 /**
@@ -1109,7 +1435,7 @@ void xml_w_end(struct xml_w *writer)
 /**
  * xml_w_raw() - append text as it is
  * @writer: the writer
- * @text: the text, which the caller already escaped or serialised
+ * @text: the text, which the caller already escaped or serialized
  */
 void xml_w_raw(struct xml_w *writer, const char *text)
 {

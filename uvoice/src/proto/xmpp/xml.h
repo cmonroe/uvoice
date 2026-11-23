@@ -12,8 +12,16 @@
  * The parser hands the stream header up as the depth 0 element, every
  * complete depth 1 element up as one stanza tree, and the end of the root
  * element up as the stream close. The tree lives in fixed arenas inside
- * struct xml_doc: no allocation, a bounded size, and a stanza that outgrows
- * a bound fails the stream (RFC 6120 section 13.12).
+ * struct xml_doc: no allocation and a bounded size.
+ *
+ * Two kinds of bound (RFC 6120 section 13.12). Any sender can address a
+ * stanza to this account, so a stanza over a tree bound (depth, elements,
+ * attributes, text, namespace declarations) does not end the stream. The
+ * parser keeps the stanza element with its id, type, from and to, stores
+ * nothing more of the stanza and hands it up through the discard callback.
+ * The byte bounds end the stream: a stanza longer than XML_STANZA_MAX, and
+ * more than XML_STANZA_MAX bytes between two parser events, which bounds an
+ * unfinished tag and the work expat repeats on it at every feed.
  *
  * Namespaces are resolved here. The feed's expat carries no namespace mode,
  * so the parser keeps the xmlns declarations of every open element and maps
@@ -94,13 +102,18 @@ struct xml_doc {
  *
  *   stream_open   the root element with its attributes (id, from, version)
  *   stanza        one complete depth 1 element
+ *   discard       one complete depth 1 element over a tree bound. The tree
+ *                 holds the element alone, with no child and no text, and
+ *                 reason is static text
  *   stream_close  the end tag of the root element
  *   error         the stream is broken: a parse error, a forbidden construct
- *                 or a stanza outside the bounds; reason is static text
+ *                 or a byte bound; reason is static text
  */
 struct xml_stream_cb {
 	void (*stream_open)(void *user, const struct xml_doc *header);
 	void (*stanza)(void *user, const struct xml_doc *stanza);
+	void (*discard)(void *user, const struct xml_doc *stanza,
+			const char *reason);
 	void (*stream_close)(void *user);
 	void (*error)(void *user, const char *reason);
 };
@@ -111,6 +124,11 @@ struct xml_ns_decl {
 	unsigned int depth;		/* the element that declared it */
 };
 
+/*
+ * The byte positions count from the start of the document, as expat does:
+ * fed is what the feeds handed over, mark the end of the last parser event
+ * and stanza_start the first byte of the open stanza.
+ */
 struct xml_stream {
 	void *parser;			/* the expat parser */
 	struct xml_stream_cb cb;
@@ -118,13 +136,22 @@ struct xml_stream {
 	struct xml_doc doc;
 	struct xml_ns_decl ns[XML_NS_MAX];
 	unsigned int ns_count;
+	unsigned int ns_lost;		/* depth of a declaration that did not fit */
 	unsigned int depth;
 	uint16_t open[XML_DEPTH_MAX];	/* the node of each open element */
 	bool failed;
+	bool stopped;			/* xml_stream_stop() ended it */
+	bool discard;			/* the open stanza is over a bound */
 	bool header_seen;
 	bool root_closed;
-	size_t stanza_bytes;
+	const char *discard_reason;
+	uint64_t fed;
+	uint64_t mark;
+	uint64_t stanza_start;
 };
+
+/* The xml_stream_feed() result of a document that xml_stream_stop() ended. */
+#define XML_FEED_STOPPED	1
 
 /**
  * xml_stream_init() - make the parser of one stream
@@ -146,9 +173,22 @@ int xml_stream_init(struct xml_stream *xs, const struct xml_stream_cb *cb,
  * The callbacks run from inside this call. After an error the stream is
  * failed and every later feed is refused.
  *
- * Return: 0, or -EPROTO once the stream failed.
+ * Return: 0, XML_FEED_STOPPED when a callback called xml_stream_stop() and
+ * no byte followed the stanza, or -EPROTO once the stream failed. A byte
+ * after the stanza that stopped the document fails the stream.
  */
 int xml_stream_feed(struct xml_stream *xs, const char *buf, size_t len);
+
+/**
+ * xml_stream_stop() - end the document at the stanza a callback has
+ * @xs: the stream
+ *
+ * The stanza callback calls it for the element after which the peer must
+ * wait for this side: <proceed/> of STARTTLS and <success/> of SASL. The
+ * feed returns XML_FEED_STOPPED, and the next document starts with
+ * xml_stream_reset().
+ */
+void xml_stream_stop(struct xml_stream *xs);
 
 /**
  * xml_stream_reset() - start a new XML document on the same stream
@@ -287,7 +327,7 @@ void xml_w_end(struct xml_w *w);
 /**
  * xml_w_raw() - append text as it is
  * @w: the writer
- * @text: the text, which the caller already escaped or serialised
+ * @text: the text, which the caller already escaped or serialized
  */
 void xml_w_raw(struct xml_w *w, const char *text);
 

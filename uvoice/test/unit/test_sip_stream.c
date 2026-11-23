@@ -206,6 +206,16 @@ static struct sip_conn *conn_of(struct sip_stream *st, const struct sip_stream_k
 	return sip_stream_conn_find(st, key, sni);
 }
 
+/* Whether the socket of a connection holds TCP_NODELAY. */
+static bool nodelay_on(const struct sip_conn *c)
+{
+	socklen_t vlen = sizeof(int);
+	int val = 0;
+
+	return c && getsockopt(c->ufd.fd, IPPROTO_TCP, TCP_NODELAY, &val,
+			       &vlen) == 0 && val;
+}
+
 static bool wait_up(struct sip_stream *st, const struct sip_stream_key *key, const char *sni,
 		    unsigned int ms)
 {
@@ -540,7 +550,8 @@ struct tls_peer {
 	int fd;
 };
 
-static bool tls_peer_open(struct tls_peer *p, uint16_t port)
+/* tiny shrinks the socket before the connect, so it offers a small window */
+static bool tls_peer_open_buf(struct tls_peer *p, uint16_t port, bool tiny)
 {
 	struct sockaddr_in sa;
 
@@ -548,6 +559,9 @@ static bool tls_peer_open(struct tls_peer *p, uint16_t port)
 	p->fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 	if (p->fd < 0)
 		return false;
+
+	if (tiny)
+		sock_buf_shrink(p->fd);
 
 	memset(&sa, 0, sizeof(sa));
 	sa.sin_family = AF_INET;
@@ -571,6 +585,11 @@ static bool tls_peer_open(struct tls_peer *p, uint16_t port)
 	SSL_set_connect_state(p->ssl);
 
 	return true;
+}
+
+static bool tls_peer_open(struct tls_peer *p, uint16_t port)
+{
+	return tls_peer_open_buf(p, port, false);
 }
 
 static void tls_peer_close(struct tls_peer *p)
@@ -611,6 +630,89 @@ static bool tls_peer_record(struct tls_peer *p, const void *buf, size_t len)
 		return false;
 
 	return done == len;
+}
+
+/* read exactly len bytes of plaintext, with loop turns so the pool can write */
+static bool tls_peer_read(struct tls_peer *p, char *buf, size_t len,
+			  unsigned int ms)
+{
+	unsigned int spent;
+	size_t done = 0;
+	size_t n;
+	int ret;
+
+	for (spent = 0; spent < ms && done < len; spent += SLICE_MS) {
+		n = 0;
+		ret = SSL_read_ex(p->ssl, buf + done, len - done, &n);
+		if (ret == 1) {
+			done += n;
+			continue;
+		}
+
+		if (SSL_get_error(p->ssl, ret) != SSL_ERROR_WANT_READ)
+			return false;
+
+		loop_pump(SLICE_MS);
+	}
+
+	return done == len;
+}
+
+/* the accepted leg of the pool that serves the peer, if it is up */
+static struct sip_conn *tls_peer_find(struct sip_stream *st,
+				      const struct tls_peer *p)
+{
+	struct sockaddr_storage sa;
+	socklen_t len = sizeof(sa);
+	struct sip_conn *c;
+	unsigned int i;
+
+	if (getsockname(p->fd, (struct sockaddr *)&sa, &len))
+		return NULL;
+
+	for (i = 0; i < SIP_STREAM_CONN_MAX; i++) {
+		c = &st->conn[i];
+		if (c->in_use && c->state == SIP_CONN_UP &&
+		    sa_port_of(&c->key.peer.sa) == sa_port_of(&sa))
+			return c;
+	}
+
+	return NULL;
+}
+
+static struct sip_conn *tls_peer_leg(struct sip_stream *st,
+				     const struct tls_peer *p, unsigned int ms)
+{
+	struct sip_conn *c = tls_peer_find(st, p);
+	unsigned int spent;
+
+	for (spent = 0; spent < ms && !c; spent += SLICE_MS) {
+		loop_pump(SLICE_MS);
+		c = tls_peer_find(st, p);
+	}
+
+	return c;
+}
+
+/* an OPTIONS of exactly len bytes, with fill as its body */
+#define OPTIONS_FMT							\
+	"OPTIONS sip:%s SIP/2.0\r\n"					\
+	"Via: SIP/2.0/TLS 127.0.0.1:5060;branch=z9hG4bK-big%u\r\n"	\
+	"CSeq: %u OPTIONS\r\n"						\
+	"Content-Length: %05zu\r\n\r\n"
+
+static bool options_make(char *buf, size_t len, const char *uri,
+			 unsigned int seq, char fill)
+{
+	int head = snprintf(buf, len, OPTIONS_FMT, uri, seq, seq, (size_t)0);
+
+	if (head <= 0 || (size_t)head >= len)
+		return false;
+
+	snprintf(buf, len, OPTIONS_FMT, uri, seq, seq, len - (size_t)head);
+	memset(buf + head, fill, len - (size_t)head);
+
+	return true;
 }
 
 /* ---------------------------------------------------------- keys and wire */
@@ -1357,6 +1459,10 @@ static void t_roundtrip(void)
 				      &vlen) == 0);
 		CHECK_UINT(val, SIP_STREAM_KA_CNT);
 	}
+
+	CASE("tcp: TCP_NODELAY is on the outbound and the accepted socket");
+	CHECK(nodelay_on(conn_of(&cli, &key, NULL)));
+	CHECK(nodelay_on(conn_of(&srv, &back, NULL)));
 
 	CASE("tcp: a handle resolves its connection and nothing else");
 	c = conn_of(&cli, &key, NULL);
@@ -2231,6 +2337,114 @@ static void t_backpressure(void)
 
 /* ------------------------------------------------------------------- tls */
 
+/* the passes of one read burst, SIP_STREAM_RX_BURST in stream.c */
+#define RX_BURST	8
+
+/* bytes of plaintext in the framer until it holds this count */
+static bool framed_wait(const struct sip_conn *c, size_t want, unsigned int ms)
+{
+	unsigned int spent;
+
+	for (spent = 0; spent < ms && c->fr.len < want; spent += SLICE_MS)
+		loop_pump(SLICE_MS);
+
+	return c->fr.len == want;
+}
+
+/*
+ * A burst reads one record per pass. The framer first holds most of a large
+ * message, so seven short records fit and the eighth pass fills the framer
+ * with part of one record. The rest of that record stays in OpenSSL when the
+ * burst ends, and the peer sends nothing after it.
+ */
+static void tls_burst_case(uint16_t port)
+{
+	static char wire[69000];
+	size_t first = 60000;
+	size_t held = 46000;
+	size_t fill = 11500;
+	size_t small = 1000;
+	struct tls_peer peer;
+	struct sip_conn *sc;
+	size_t off;
+
+	CASE("tls: plaintext that a full read burst left in the record layer "
+	     "is collected");
+	CHECK(options_make(wire, first, "one", 1, 'a'));
+	CHECK(options_make(wire + first, sizeof(wire) - first, "two", 2, 'b'));
+	CHECK(tls_peer_open(&peer, port));
+	CHECK(tls_peer_up(&peer, WAIT_MS));
+	sc = tls_peer_leg(&srv, &peer, WAIT_MS);
+	CHECK(sc != NULL);
+	if (!sc) {
+		tls_peer_close(&peer);
+		return;
+	}
+
+	log_reset(&srv_log, 2);
+	for (off = 0; off < held; off += fill) {
+		CHECK(tls_peer_record(&peer, wire + off, fill));
+		CHECK(framed_wait(sc, off + fill, WAIT_MS));
+	}
+
+	for (off = held; off < held + (RX_BURST - 1) * small; off += small)
+		CHECK(tls_peer_record(&peer, wire + off, small));
+	CHECK(SIP_STREAM_RX_MAX - off < sizeof(wire) - off);
+	CHECK(tls_peer_record(&peer, wire + off, sizeof(wire) - off));
+
+	wait_msgs(&srv_log, 2, WAIT_MS);
+	CHECK_UINT(srv_log.msgs, 2);
+	CHECK_UINT(srv_log.len[0], first);
+	CHECK_UINT(srv_log.len[1], sizeof(wire) - first);
+	tls_peer_close(&peer);
+	loop_pump(SLICE_MS);
+}
+
+/*
+ * The peer reads nothing, so the first message blocks inside one TLS record.
+ * The second message is staged behind it before the socket drains. OpenSSL
+ * requires the retry of the first write with its own length.
+ */
+static void tls_retry_case(uint16_t port)
+{
+	static char first[12000];
+	static char second[3000];
+	static char got[sizeof(first) + sizeof(second)];
+	struct sip_stream_key back;
+	struct tls_peer peer;
+	struct sip_conn *sc;
+	uint64_t errs = srv.stat.tx_err;
+
+	CASE("tls: a message staged behind a blocked write leaves after it");
+	memset(first, 'c', sizeof(first));
+	memset(second, 'd', sizeof(second));
+	CHECK(tls_peer_open_buf(&peer, port, true));
+	CHECK(tls_peer_up(&peer, WAIT_MS));
+	sc = tls_peer_leg(&srv, &peer, WAIT_MS);
+	CHECK(sc != NULL);
+	if (!sc) {
+		tls_peer_close(&peer);
+		return;
+	}
+
+	sock_buf_shrink(sc->ufd.fd);
+	back = sc->key;
+	CHECK_UINT(sip_stream_send(&srv, &back, 0, first, sizeof(first)),
+		   sizeof(first));
+	CHECK_UINT(sip_stream_conn_queued(sc), sizeof(first));
+	CHECK_UINT(sip_stream_send(&srv, &back, 0, second, sizeof(second)),
+		   sizeof(second));
+	CHECK_UINT(sip_stream_conn_queued(sc), sizeof(got));
+
+	CHECK(tls_peer_read(&peer, got, sizeof(got), WAIT_MS));
+	CHECK(!memcmp(got, first, sizeof(first)));
+	CHECK(!memcmp(got + sizeof(first), second, sizeof(second)));
+	CHECK_UINT(srv.stat.tx_err, errs);
+	CHECK(tls_peer_find(&srv, &peer) == sc);
+	tls_peer_close(&peer);
+	loop_pump(SLICE_MS);
+}
+
 static void t_tls(void)
 {
 	struct sip_tls_cfg tcfg;
@@ -2317,6 +2531,10 @@ static void t_tls(void)
 	CHECK_UINT(cli_log.msgs, 1);
 	CHECK_UINT(cli_log.status[0], 200);
 	CHECK_UINT(srv.stat.connects, 0);
+
+	CASE("tls: TCP_NODELAY is on the outbound and the accepted leg");
+	CHECK(nodelay_on(conn_of(&cli, &key, "sip.example.test")));
+	CHECK(nodelay_on(conn_of(&srv, &back, NULL)));
 
 	/*
 	 * The account that answers carries its own server_name, and the
@@ -2540,33 +2758,9 @@ static void t_tls(void)
 		struct tls_peer peer;
 		size_t held = 50546;
 		size_t chunk = 16382;
-		int h1, h2;
 
-		h1 = snprintf(wire1, sizeof(wire1),
-			      "OPTIONS sip:one SIP/2.0\r\n"
-			      "Via: SIP/2.0/TLS 127.0.0.1:5060;branch=z9hG4bK-big1\r\n"
-			      "CSeq: 1 OPTIONS\r\n"
-			      "Content-Length: %05zu\r\n\r\n", (size_t)0);
-		CHECK(h1 > 0);
-		snprintf(wire1, sizeof(wire1),
-			 "OPTIONS sip:one SIP/2.0\r\n"
-			 "Via: SIP/2.0/TLS 127.0.0.1:5060;branch=z9hG4bK-big1\r\n"
-			 "CSeq: 1 OPTIONS\r\n"
-			 "Content-Length: %05zu\r\n\r\n", sizeof(wire1) - (size_t)h1);
-		memset(wire1 + h1, 'a', sizeof(wire1) - (size_t)h1);
-
-		h2 = snprintf(wire2, sizeof(wire2),
-			      "OPTIONS sip:two SIP/2.0\r\n"
-			      "Via: SIP/2.0/TLS 127.0.0.1:5060;branch=z9hG4bK-big2\r\n"
-			      "CSeq: 2 OPTIONS\r\n"
-			      "Content-Length: %05zu\r\n\r\n", (size_t)0);
-		CHECK(h2 > 0);
-		snprintf(wire2, sizeof(wire2),
-			 "OPTIONS sip:two SIP/2.0\r\n"
-			 "Via: SIP/2.0/TLS 127.0.0.1:5060;branch=z9hG4bK-big2\r\n"
-			 "CSeq: 2 OPTIONS\r\n"
-			 "Content-Length: %05zu\r\n\r\n", sizeof(wire2) - (size_t)h2);
-		memset(wire2 + h2, 'b', sizeof(wire2) - (size_t)h2);
+		CHECK(options_make(wire1, sizeof(wire1), "one", 1, 'a'));
+		CHECK(options_make(wire2, sizeof(wire2), "two", 2, 'b'));
 
 		/* the tail the last record has to overflow */
 		CHECK(SIP_STREAM_RX_MAX - held < sizeof(flush));
@@ -2597,6 +2791,9 @@ static void t_tls(void)
 		tls_peer_close(&peer);
 		loop_pump(SLICE_MS);
 	}
+
+	tls_burst_case(port);
+	tls_retry_case(port);
 
 	CASE("tls: a TLS key with no loaded context is refused before any socket");
 	pair_close();

@@ -34,12 +34,24 @@
  * or set that the owner did not handle, which RFC 6120 section 8.2.3 says
  * must get an error. Every other stanza reaches the owner through the stanza
  * callback. An iq of type result or error reaches the callback the owner
- * registered with xmpp_stream_iq_send(), or nobody when no id matches.
+ * registered with xmpp_stream_iq_send(), or nobody when no request matches
+ * its id and its sender.
  *
  * Liveness. Every XMPP_PING_S seconds of silence the stream sends an <r/>
  * when stream management is on, or an iq ping otherwise. Any element that
  * arrives counts as the answer. XMPP_PONG_MS without one ends the
  * connection, which starts the reconnect.
+ *
+ * Test cadences. UVOICE_XMPP_TICK_MS, UVOICE_XMPP_PING_MS and
+ * UVOICE_XMPP_BACKOFF_MS replace XMPP_TICK_MS, the ping period and
+ * XMPP_BACKOFF_MS in milliseconds. xmpp_stream_init() reads them, and a
+ * value that is empty, 0, not a number or over one hour keeps the default.
+ *
+ * A broken connection. The stream closes the socket at once and refuses
+ * every send from then on. The pending iq callbacks and the state callback
+ * run later from a timer, so no callback runs inside the call that failed.
+ * The first reason is the one the state callback and xmpp_stream_reason()
+ * report.
  *
  * Resumption of stream management is not used. The phone sits on a wired
  * network where a connection that drops is a rare event, so a new session
@@ -187,8 +199,10 @@ struct xmpp_stream_env {
  *              0 takes XMPP_PORT, or XMPP_PORT_TLS with direct_tls.
  * direct_tls   XEP-0368 instead of STARTTLS.
  * tls_verify   check the peer certificate against the domain.
- * allow_plain  take PLAIN when the server offers no SCRAM.
- * ping_s       the liveness period, 0 takes XMPP_PING_S.
+ * allow_plain  take PLAIN when the server offers no SCRAM, and only over a
+ *              connection whose certificate tls_verify checked.
+ * ping_s       the liveness period, 0 takes XMPP_PING_S or
+ *              UVOICE_XMPP_PING_MS.
  * random       the entropy source of the nonces and the ids, NULL takes
  *              sip_os_random().
  */
@@ -204,8 +218,10 @@ struct xmpp_stream_cfg {
 	void (*random)(void *buf, size_t len);
 };
 
+/* peer is the full JID that must answer, an empty domain for the server. */
 struct xmpp_iq_pending {
 	char id[XMPP_ID_MAX];
+	struct jid peer;
 	xmpp_iq_cb cb;
 	void *priv;
 	uint64_t deadline_ms;
@@ -228,7 +244,9 @@ struct xmpp_stream_stat {
 	uint64_t rx_stanzas;
 	uint64_t tx_stanzas;
 	uint64_t tx_refused;		/* the staging buffer was full */
-	uint64_t iq_unmatched;		/* results that matched no request */
+	uint64_t reply_dropped;		/* an iq answer over its buffer */
+	uint64_t iq_unmatched;		/* results that matched no request, or
+					 * came from another sender */
 	uint64_t iq_timeouts;
 	uint64_t pings;
 };
@@ -241,6 +259,8 @@ struct xmpp_stream {
 
 	struct uloop_fd ufd;
 	struct uloop_timeout tick;
+	struct uloop_timeout rx_more;	/* reads what TLS holds past a burst */
+	struct uloop_timeout fail_report; /* reports a broken connection */
 	struct sip_tls_conn tls;
 	struct xml_stream parser;
 	struct sasl_client sasl;
@@ -264,6 +284,7 @@ struct xmpp_stream {
 	enum xmpp_pending pending;
 	bool carbons;			/* the server enabled XEP-0280 */
 	bool stopping;
+	bool fail_pending;		/* fail_report has not run yet */
 	struct xmpp_sm sm;
 
 	uint64_t deadline_ms;
@@ -273,11 +294,16 @@ struct xmpp_stream {
 	unsigned int fails;
 	uint32_t id_seq;
 	unsigned int gen;		/* grows on every connection close */
+	unsigned int tick_ms;
+	unsigned int ping_ms;
+	unsigned int backoff_ms;
 
 	struct xmpp_iq_pending iq[XMPP_IQ_MAX];
 
+	size_t rx_untraced;		/* bytes of the read the trace owes */
 	size_t tx_len;
 	size_t tx_off;
+	size_t tx_span;			/* the TLS write a retry must repeat */
 	char tx[XMPP_TX_MAX];
 
 	struct xmpp_stream_stat stat;
@@ -370,7 +396,7 @@ void xmpp_stream_id_next(struct xmpp_stream *xs, char *out, size_t len);
 /**
  * xmpp_stream_send() - send one stanza
  * @xs: the stream
- * @text: the serialised stanza
+ * @text: the serialized stanza
  * @len: its length
  *
  * Return: 0, -ENOTCONN outside XMPP_ST_READY, -ENOSPC when it does not fit.
@@ -380,16 +406,23 @@ int xmpp_stream_send(struct xmpp_stream *xs, const char *text, size_t len);
 /**
  * xmpp_stream_iq_send() - send an iq of type get or set and await its answer
  * @xs: the stream
- * @text: the serialised iq
+ * @text: the serialized iq
  * @len: its length
  * @id: the id the iq carries
+ * @peer: the full JID that must answer, NULL for the server of the account
  * @cb: runs once with the answer, or with NULL on a timeout or a close
  * @priv: handed to @cb
  *
- * Return: 0, -ENOTCONN, -ENOSPC, or -EBUSY when XMPP_IQ_MAX requests wait.
+ * The server answers with no from, from the domain, from the bare JID of the
+ * account or from its bound full JID. An answer from another sender leaves
+ * the request pending and counts in iq_unmatched.
+ *
+ * Return: 0, -ENOTCONN, -ENOSPC, -EINVAL for a peer that does not parse, or
+ * -EBUSY when XMPP_IQ_MAX requests wait.
  */
 int xmpp_stream_iq_send(struct xmpp_stream *xs, const char *text, size_t len,
-			const char *id, xmpp_iq_cb cb, void *priv);
+			const char *id, const char *peer, xmpp_iq_cb cb,
+			void *priv);
 
 /**
  * xmpp_stream_iq_result() - answer an iq with an empty result

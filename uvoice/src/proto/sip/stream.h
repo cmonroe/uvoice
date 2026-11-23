@@ -306,6 +306,7 @@ struct sip_listener {
  */
 struct sip_conn {
 	struct uloop_fd ufd;
+	struct uloop_timeout rx_more;	/* reads what TLS holds past a burst */
 	struct sip_stream *st;
 
 	struct sip_stream_key key;
@@ -325,6 +326,7 @@ struct sip_conn {
 
 	size_t tx_len;			/* staged bytes */
 	size_t tx_off;			/* staged bytes already written */
+	size_t tx_span;			/* the TLS write a retry must repeat */
 
 	unsigned int index;
 	uint16_t gen;

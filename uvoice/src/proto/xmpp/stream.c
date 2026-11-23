@@ -11,10 +11,11 @@
  * the connection, so every callback checks that the socket is still there
  * before it acts. The read loop checks the connection generation after
  * every feed. A restart of the XML document, which RFC 6120 asks for after
- * SASL, never happens inside a callback: the callback marks it, then the read
- * loop performs it once the parser returned. The TLS handshake after
- * <proceed/> takes the same path, because its first step may already finish
- * a document.
+ * SASL, never happens inside a callback: the callback marks it and stops the
+ * document, then the read loop performs it once the parser returned. The TLS
+ * handshake after <proceed/> takes the same path, because its first step may
+ * already finish a document. The peer must wait for this side after both
+ * elements, so a byte behind them in the same read fails the stream.
  */
 #include <errno.h>
 #include <netinet/in.h>
@@ -36,9 +37,8 @@
 
 #define XMPP_TRACE_TEXT_MAX	400
 #define XMPP_HEADER_MAX		(XMPP_STREAM_ID_MAX + 4 * JID_MAX)
-#define XMPP_REPLY_MAX		2048U
+#define XMPP_REQUEST_MAX	2048U
 #define XMPP_SASL_B64_MAX	B64_ENCODE_LEN(SASL_MSG_MAX)
-#define XMPP_MECHS_MAX		16U
 #define XMPP_KA_IDLE_S		120
 #define XMPP_KA_INTVL_S		30
 #define XMPP_KA_CNT		3
@@ -147,7 +147,20 @@ static void tick_arm(struct xmpp_stream *xs)
 	if (xs->state == XMPP_ST_IDLE)
 		return;
 
-	uloop_timeout_set(&xs->tick, XMPP_TICK_MS);
+	uloop_timeout_set(&xs->tick, (int)xs->tick_ms);
+}
+
+/**
+ * ping_rearm() - count an element that arrived as a sign of life
+ * @xs: the stream
+ */
+static void ping_rearm(struct xmpp_stream *xs)
+{
+	uint64_t period = xs->cfg.ping_s ? (uint64_t)xs->cfg.ping_s * 1000 :
+					   xs->ping_ms;
+
+	xs->ping_waiting = false;
+	xs->ping_due_ms = mono_ms() + period;
 }
 
 /**
@@ -195,6 +208,59 @@ static struct xmpp_iq_pending *iq_slot_find(struct xmpp_stream *xs,
 	}
 
 	return NULL;
+}
+
+/**
+ * iq_from_server() - whether an answer comes from the server of the account
+ * @xs: the stream
+ * @from: the parsed from attribute
+ *
+ * The server assigns the full JID in the bind answer, so before it no full
+ * JID is the account's own.
+ *
+ * Return: true for the domain, the bare JID or the bound full JID of the
+ * account.
+ */
+static bool iq_from_server(const struct xmpp_stream *xs, const struct jid *from)
+{
+	const struct jid *self = xs->bound.domain[0] ? &xs->bound : &xs->jid;
+
+	if (!from->local[0] && !from->resource[0])
+		return !strcmp(from->domain, xs->jid.domain);
+
+	if (!jid_bare_eq(from, self))
+		return false;
+
+	if (!from->resource[0])
+		return true;
+
+	return xs->bound.domain[0] && !strcmp(from->resource, self->resource);
+}
+
+/**
+ * iq_sender_ok() - whether an answer comes from the sender a request expects
+ * @xs: the stream
+ * @slot: the pending request
+ * @from: the from attribute of the answer, NULL when it has none
+ *
+ * Return: true when the answer may complete the request.
+ */
+static bool iq_sender_ok(const struct xmpp_stream *xs,
+			 const struct xmpp_iq_pending *slot, const char *from)
+{
+	struct jid sender;
+
+	if (!from)
+		return !slot->peer.domain[0];
+
+	if (!jid_parse(from, &sender))
+		return false;
+
+	if (!slot->peer.domain[0])
+		return iq_from_server(xs, &sender);
+
+	return jid_bare_eq(&sender, &slot->peer) &&
+	       !strcmp(sender.resource, slot->peer.resource);
 }
 
 /**
@@ -276,6 +342,7 @@ static void fd_drop(struct xmpp_stream *xs)
 	if (xs->ufd.fd < 0)
 		return;
 
+	uloop_timeout_cancel(&xs->rx_more);
 	uloop_fd_delete(&xs->ufd);
 	sip_tls_conn_close(&xs->tls);
 	close(xs->ufd.fd);
@@ -286,8 +353,8 @@ static void fd_drop(struct xmpp_stream *xs)
  * conn_close() - end the connection and clear everything it carried
  * @xs: the stream
  *
- * The pending requests are answered with nothing after the socket is gone,
- * so a callback that sends finds the stream closed.
+ * It runs no callback. The pending requests stay for the caller, which
+ * answers them after the state leaves the negotiation steps.
  */
 static void conn_close(struct xmpp_stream *xs)
 {
@@ -308,19 +375,24 @@ static void conn_close(struct xmpp_stream *xs)
 	memset(&xs->bound, 0, sizeof(xs->bound));
 	xs->tx_len = 0;
 	xs->tx_off = 0;
+	xs->tx_span = 0;
 	sasl_client_wipe(&xs->sasl);
-
-	iq_pending_flush(xs);
 }
 
 /**
  * stream_fail() - end the connection and schedule the reconnect
  * @xs: the stream
  * @reason: why, copied before the connection goes
+ *
+ * The state moves to XMPP_ST_BACKOFF without a callback, so a pending
+ * negotiation step finds its own state gone. fail_fire() reports it.
  */
 static void stream_fail(struct xmpp_stream *xs, const char *reason)
 {
 	unsigned int delay;
+
+	if (xs->fail_pending)
+		return;
 
 	str_copy(xs->reason, sizeof(xs->reason), reason);
 	xs->stat.failures++;
@@ -331,8 +403,30 @@ static void stream_fail(struct xmpp_stream *xs, const char *reason)
 		return;
 
 	xs->fails++;
-	delay = retry_delay_ms(xs->fails, XMPP_BACKOFF_MS, XMPP_BACKOFF_MAX_MS);
+	delay = retry_delay_ms(xs->fails, xs->backoff_ms, XMPP_BACKOFF_MAX_MS);
 	xs->backoff_until = mono_ms() + delay;
+	xs->state = XMPP_ST_BACKOFF;
+	xs->fail_pending = true;
+	uloop_timeout_set(&xs->fail_report, 0);
+}
+
+/**
+ * fail_fire() - answer the pending requests, then report the failure
+ * @timeout: the timer
+ *
+ * A callback may stop the stream, and may start it again.
+ */
+static void fail_fire(struct uloop_timeout *timeout)
+{
+	struct xmpp_stream *xs = container_of(timeout, struct xmpp_stream,
+					      fail_report);
+
+	iq_pending_flush(xs);
+	if (!xs->fail_pending)
+		return;
+
+	xs->fail_pending = false;
+	uloop_timeout_cancel(&xs->fail_report);
 	state_set(xs, XMPP_ST_BACKOFF, xs->reason);
 	tick_arm(xs);
 }
@@ -373,6 +467,8 @@ static int connect_start(struct xmpp_stream *xs,
 		return -1;
 
 	sock_keepalive(fd);
+	if (sock_nodelay_set(fd) < 0)
+		XMPP_TRACE(xs, "TCP_NODELAY refused: %s", strerror(errno));
 
 	if (connect(fd, (const struct sockaddr *)&dst->sa, dst->sa_len) < 0 &&
 	    errno != EINPROGRESS && errno != EINTR) {
@@ -551,6 +647,9 @@ static int conn_write(struct xmpp_stream *xs, const char *buf, size_t len,
  * tx_drain() - write what is staged
  * @xs: the stream
  *
+ * A TLS write that did not finish is retried with the same span, whatever
+ * tx_stage() appended since.
+ *
  * It may end the connection, so the caller checks the generation after it.
  *
  * Return: ULOOP_WRITE when the socket is full, 0 otherwise.
@@ -560,10 +659,12 @@ static unsigned int tx_drain(struct xmpp_stream *xs)
 	char reason[XMPP_REASON_MAX];
 	unsigned int want;
 	size_t done;
+	size_t len;
 
 	while (xs->tx_off < xs->tx_len) {
-		if (conn_write(xs, xs->tx + xs->tx_off, xs->tx_len - xs->tx_off,
-			       &done, &want) < 0) {
+		len = xs->tx_span ? xs->tx_span : xs->tx_len - xs->tx_off;
+		if (conn_write(xs, xs->tx + xs->tx_off, len, &done,
+			       &want) < 0) {
 			snprintf(reason, sizeof(reason), "write: %s",
 				 xs->tls_up ? sip_tls_conn_error(&xs->tls) :
 					      strerror(errno));
@@ -571,9 +672,12 @@ static unsigned int tx_drain(struct xmpp_stream *xs)
 			return 0;
 		}
 
+		if (!done && xs->tls_up)
+			xs->tx_span = len;
 		if (!done)
 			return want == ULOOP_READ ? 0 : ULOOP_WRITE;
 
+		xs->tx_span = 0;
 		xs->tx_off += done;
 	}
 
@@ -624,7 +728,7 @@ static int tx_put(struct xmpp_stream *xs, const char *text, size_t len,
 /**
  * stanza_put() - send one stanza and count it
  * @xs: the stream
- * @text: the serialised stanza
+ * @text: the serialized stanza
  * @len: its length
  *
  * Return: the tx_put() verdict.
@@ -646,22 +750,28 @@ static int stanza_put(struct xmpp_stream *xs, const char *text, size_t len)
 /**
  * iq_send() - send an iq and remember who waits for its answer
  * @xs: the stream
- * @text: the serialised iq
+ * @text: the serialized iq
  * @len: its length
  * @id: its id
+ * @peer: the full JID that must answer, NULL for the server
  * @cb: the callback
  * @priv: handed to the callback
  *
- * Return: 0, -EBUSY when no slot is free, or the stanza_put() error.
+ * Return: 0, -EBUSY when no slot is free, -EINVAL for a peer that does not
+ * parse, or the stanza_put() error.
  */
 static int iq_send(struct xmpp_stream *xs, const char *text, size_t len,
-		   const char *id, xmpp_iq_cb cb, void *priv)
+		   const char *id, const char *peer, xmpp_iq_cb cb, void *priv)
 {
 	struct xmpp_iq_pending *slot = iq_slot_take(xs);
 	int ret;
 
 	if (!slot)
 		return -EBUSY;
+
+	memset(&slot->peer, 0, sizeof(slot->peer));
+	if (peer && !jid_parse(peer, &slot->peer))
+		return -EINVAL;
 
 	str_copy(slot->id, sizeof(slot->id), id);
 	slot->cb = cb;
@@ -869,11 +979,12 @@ static void sasl_element_send(struct xmpp_stream *xs, const char *name,
  */
 static void sasl_start(struct xmpp_stream *xs, const struct xml_doc *features)
 {
-	const char *names[XMPP_MECHS_MAX];
 	uint8_t nonce[SASL_NONCE_BYTES];
 	char clear[SASL_MSG_MAX];
-	unsigned int list, node, count = 0;
-	enum sasl_mech mech;
+	unsigned int list, node;
+	enum sasl_mech mech = SASL_MECH_NONE, offered;
+	const char *name;
+	bool plain_ok;
 	int len;
 
 	list = xml_child(features, XML_NONE, "mechanisms", XMPP_NS_SASL);
@@ -882,13 +993,19 @@ static void sasl_start(struct xmpp_stream *xs, const struct xml_doc *features)
 		return;
 	}
 
+	/* PLAIN hands the password to whoever holds the certificate. */
+	plain_ok = xs->cfg.allow_plain && xs->cfg.tls_verify &&
+		   sip_tls_conn_verified(&xs->tls);
+
 	node = xml_child(features, list, "mechanism", XMPP_NS_SASL);
-	while (node != XML_NONE && count < XMPP_MECHS_MAX) {
-		names[count++] = xml_text_get(features, node);
+	while (node != XML_NONE) {
+		name = xml_text_get(features, node);
+		offered = sasl_mech_pick(&name, 1, plain_ok);
+		if (offered > mech)
+			mech = offered;
 		node = xml_next(features, node, "mechanism", XMPP_NS_SASL);
 	}
 
-	mech = sasl_mech_pick(names, count, xs->cfg.allow_plain);
 	if (mech == SASL_MECH_NONE) {
 		stream_fail(xs, "sasl: no usable mechanism");
 		return;
@@ -991,6 +1108,7 @@ static void sasl_success_rx(struct xmpp_stream *xs, const struct xml_doc *doc)
 	sasl_client_wipe(&xs->sasl);
 	XMPP_TRACE(xs, "authenticated");
 	xs->pending = XMPP_PENDING_RESTART;
+	xml_stream_stop(&xs->parser);
 }
 
 /**
@@ -1040,10 +1158,13 @@ static void tls_rx(struct xmpp_stream *xs, const struct xml_doc *doc)
 	if (xs->state != XMPP_ST_STARTTLS)
 		return;
 
-	if (!strcmp(doc->node[0].name, "proceed"))
-		xs->pending = XMPP_PENDING_TLS;
-	else
+	if (strcmp(doc->node[0].name, "proceed")) {
 		stream_fail(xs, "starttls refused");
+		return;
+	}
+
+	xs->pending = XMPP_PENDING_TLS;
+	xml_stream_stop(&xs->parser);
 }
 
 /**
@@ -1093,7 +1214,7 @@ static void bind_start(struct xmpp_stream *xs, const struct xml_doc *features)
 	const char *resource = xs->jid.resource[0] ? xs->jid.resource :
 						     XMPP_RESOURCE_DEFAULT;
 	char id[XMPP_ID_MAX];
-	char mem[XMPP_REPLY_MAX];
+	char mem[XMPP_REQUEST_MAX];
 	struct xml_w writer;
 	unsigned int session;
 
@@ -1126,7 +1247,7 @@ static void bind_start(struct xmpp_stream *xs, const struct xml_doc *features)
 	deadline_set(xs);
 
 	if (!xml_w_finish(&writer) ||
-	    iq_send(xs, mem, writer.used, id, bind_done, NULL))
+	    iq_send(xs, mem, writer.used, id, NULL, bind_done, NULL))
 		stream_fail(xs, "bind: send refused");
 }
 
@@ -1157,7 +1278,7 @@ static void session_done(struct xmpp_stream *xs, const struct xml_doc *reply,
 static void session_send(struct xmpp_stream *xs)
 {
 	char id[XMPP_ID_MAX];
-	char mem[XMPP_REPLY_MAX];
+	char mem[XMPP_REQUEST_MAX];
 	struct xml_w writer;
 
 	xmpp_stream_id_next(xs, id, sizeof(id));
@@ -1174,7 +1295,7 @@ static void session_send(struct xmpp_stream *xs)
 	deadline_set(xs);
 
 	if (!xml_w_finish(&writer) ||
-	    iq_send(xs, mem, writer.used, id, session_done, NULL))
+	    iq_send(xs, mem, writer.used, id, NULL, session_done, NULL))
 		stream_fail(xs, "session: send refused");
 }
 
@@ -1218,7 +1339,7 @@ static void carbons_done(struct xmpp_stream *xs, const struct xml_doc *reply,
 static void carbons_send(struct xmpp_stream *xs)
 {
 	char id[XMPP_ID_MAX];
-	char mem[XMPP_REPLY_MAX];
+	char mem[XMPP_REQUEST_MAX];
 	struct xml_w writer;
 
 	xmpp_stream_id_next(xs, id, sizeof(id));
@@ -1235,7 +1356,7 @@ static void carbons_send(struct xmpp_stream *xs)
 	deadline_set(xs);
 
 	if (!xml_w_finish(&writer) ||
-	    iq_send(xs, mem, writer.used, id, carbons_done, NULL))
+	    iq_send(xs, mem, writer.used, id, NULL, carbons_done, NULL))
 		stream_fail(xs, "carbons: send refused");
 }
 
@@ -1245,12 +1366,9 @@ static void carbons_send(struct xmpp_stream *xs)
  */
 static void ready(struct xmpp_stream *xs)
 {
-	unsigned int ping_s = xs->cfg.ping_s ? xs->cfg.ping_s : XMPP_PING_S;
-
 	xs->fails = 0;
 	xs->deadline_ms = 0;
-	xs->ping_waiting = false;
-	xs->ping_due_ms = mono_ms() + (uint64_t)ping_s * 1000;
+	ping_rearm(xs);
 	state_set(xs, XMPP_ST_READY, "");
 }
 
@@ -1409,6 +1527,10 @@ static void reply_open(struct xml_w *writer, char *mem, size_t len,
  * @xs: the stream
  * @writer: the writer with the open iq
  *
+ * The writer holds what the transmit buffer can hold. A delivered stanza
+ * can hold an id or a from up to XML_STANZA_MAX bytes, whose answer cannot
+ * leave. Such a request gets no answer, and the stream stays up.
+ *
  * Return: the stanza_put() verdict, or -EINVAL when the writer failed.
  */
 static int reply_close(struct xmpp_stream *xs, struct xml_w *writer)
@@ -1417,15 +1539,19 @@ static int reply_close(struct xmpp_stream *xs, struct xml_w *writer)
 
 	xml_w_end(writer);
 	len = xml_w_finish(writer);
-	if (!len)
+	if (!len) {
+		xs->stat.reply_dropped++;
+		XMPP_TRACE(xs, "tx: an iq answer over %u bytes dropped",
+			   XMPP_TX_MAX);
 		return -EINVAL;
+	}
 
 	return stanza_put(xs, writer->mem, len);
 }
 
 int xmpp_stream_iq_result(struct xmpp_stream *xs, const struct xml_doc *iq)
 {
-	char mem[XMPP_REPLY_MAX];
+	char mem[XMPP_TX_MAX];
 	struct xml_w writer;
 
 	reply_open(&writer, mem, sizeof(mem), iq, "result");
@@ -1436,7 +1562,7 @@ int xmpp_stream_iq_result(struct xmpp_stream *xs, const struct xml_doc *iq)
 int xmpp_stream_iq_error(struct xmpp_stream *xs, const struct xml_doc *iq,
 			 const char *type, const char *condition)
 {
-	char mem[XMPP_REPLY_MAX];
+	char mem[XMPP_TX_MAX];
 	struct xml_w writer;
 
 	reply_open(&writer, mem, sizeof(mem), iq, "error");
@@ -1459,7 +1585,7 @@ int xmpp_stream_iq_error(struct xmpp_stream *xs, const struct xml_doc *iq,
 static void disco_reply(struct xmpp_stream *xs, const struct xml_doc *iq,
 			unsigned int query)
 {
-	char mem[XMPP_REPLY_MAX];
+	char mem[XMPP_TX_MAX];
 	struct xml_w writer;
 
 	reply_open(&writer, mem, sizeof(mem), iq, "result");
@@ -1477,7 +1603,7 @@ static void iq_reply_rx(struct xmpp_stream *xs, const struct xml_doc *doc)
 	struct xmpp_iq_pending *slot;
 
 	slot = iq_slot_find(xs, xml_attr_get(doc, 0, "id"));
-	if (!slot) {
+	if (!slot || !iq_sender_ok(xs, slot, xml_attr_get(doc, 0, "from"))) {
 		xs->stat.iq_unmatched++;
 		return;
 	}
@@ -1556,10 +1682,8 @@ static void stanza_rx(struct xmpp_stream *xs, const struct xml_doc *doc)
 static void element_rx(struct xmpp_stream *xs, const struct xml_doc *doc)
 {
 	const struct xml_node *root = &doc->node[0];
-	unsigned int ping_s = xs->cfg.ping_s ? xs->cfg.ping_s : XMPP_PING_S;
 
-	xs->ping_waiting = false;
-	xs->ping_due_ms = mono_ms() + (uint64_t)ping_s * 1000;
+	ping_rearm(xs);
 
 	if (!strcmp(root->ns, XMPP_NS_STREAM)) {
 		if (!strcmp(root->name, "features"))
@@ -1594,6 +1718,24 @@ static void element_rx(struct xmpp_stream *xs, const struct xml_doc *doc)
 
 /* ------------------------------------------------------------------ parser */
 
+/*
+ * One line per read with its size and its first element. The bytes stay out
+ * of the trace: a SASL exchange or a TURN reply holds a credential.
+ */
+static void rx_trace(struct xmpp_stream *xs, const char *name)
+{
+	if (!xs->rx_untraced)
+		return;
+
+	if (name)
+		XMPP_TRACE(xs, "rx %zu bytes, first element %.64s",
+			   xs->rx_untraced, name);
+	else
+		XMPP_TRACE(xs, "rx %zu bytes", xs->rx_untraced);
+
+	xs->rx_untraced = 0;
+}
+
 /**
  * parser_open() - the server's stream header
  * @user: the stream
@@ -1607,6 +1749,7 @@ static void parser_open(void *user, const struct xml_doc *header)
 	if (xs->ufd.fd < 0)
 		return;
 
+	rx_trace(xs, header->node[0].name);
 	str_copy(xs->stream_id, sizeof(xs->stream_id), id ? id : "");
 	XMPP_TRACE(xs, "stream open, id %s", xs->stream_id);
 }
@@ -1623,7 +1766,44 @@ static void parser_stanza(void *user, const struct xml_doc *doc)
 	if (xs->ufd.fd < 0)
 		return;
 
+	rx_trace(xs, doc->node[0].name);
 	element_rx(xs, doc);
+}
+
+/*
+ * A stanza over a tree bound of the parser. It counts for stream management
+ * like any other, and an iq that asks for an answer gets an error, so its
+ * sender stops to wait.
+ */
+static void parser_discard(void *user, const struct xml_doc *doc,
+			   const char *reason)
+{
+	struct xmpp_stream *xs = user;
+	const char *name = doc->node[0].name;
+	const char *type = xml_attr_get(doc, 0, "type");
+	char text[XMPP_REASON_MAX];
+
+	if (xs->ufd.fd < 0)
+		return;
+
+	rx_trace(xs, name);
+	ping_rearm(xs);
+	snprintf(text, sizeof(text), "stanza dropped: %s", reason);
+	log_line(xs, LOG_NOTICE, text);
+	XMPP_TRACE(xs, "rx: %.64s dropped: %s", name, reason);
+
+	if (strcmp(doc->node[0].ns, XMPP_NS_CLIENT))
+		return;
+
+	xs->stat.rx_stanzas++;
+	if (xs->sm.enabled)
+		xs->sm.in++;
+
+	if (strcmp(name, "iq") || !type ||
+	    (strcmp(type, "get") && strcmp(type, "set")))
+		return;
+
+	xmpp_stream_iq_error(xs, doc, "wait", "resource-constraint");
 }
 
 /**
@@ -1660,6 +1840,7 @@ static void parser_error(void *user, const char *reason)
 static const struct xml_stream_cb parser_cb = {
 	.stream_open = parser_open,
 	.stanza = parser_stanza,
+	.discard = parser_discard,
 	.stream_close = parser_close,
 	.error = parser_error,
 };
@@ -1717,33 +1898,35 @@ static enum rx_step conn_read(struct xmpp_stream *xs, char *buf, size_t len,
  * @chunk: the bytes
  * @got: their count
  *
- * Return: true while the connection is the same one.
+ * The bytes after <proceed/> belong to the TLS handshake, so the read loop
+ * stops there and leaves them in the socket.
+ *
+ * Return: true while the read loop may read more on the same connection.
  */
 static bool rx_feed(struct xmpp_stream *xs, const char *chunk, size_t got)
 {
 	unsigned int gen = xs->gen;
+	int ret;
 
 	xs->stat.rx_bytes += got;
-	XMPP_TRACE(xs, "rx %.*s",
-		   (int)(got > XMPP_TRACE_TEXT_MAX ? XMPP_TRACE_TEXT_MAX : got),
-		   chunk);
+	xs->rx_untraced = got;
 
-	xml_stream_feed(&xs->parser, chunk, got);
+	ret = xml_stream_feed(&xs->parser, chunk, got);
+	rx_trace(xs, NULL);
 	if (xs->gen != gen)
 		return false;
 
-	switch (xs->pending) {
-	case XMPP_PENDING_TLS:
+	if (ret != XML_FEED_STOPPED)
+		return true;
+
+	if (xs->pending == XMPP_PENDING_TLS) {
 		xs->pending = XMPP_PENDING_NONE;
 		tls_start(xs);
-		break;
-	case XMPP_PENDING_RESTART:
-		xs->pending = XMPP_PENDING_NONE;
-		header_send(xs);
-		break;
-	case XMPP_PENDING_NONE:
-		break;
+		return false;
 	}
+
+	xs->pending = XMPP_PENDING_NONE;
+	header_send(xs);
 
 	return xs->gen == gen;
 }
@@ -1751,6 +1934,9 @@ static bool rx_feed(struct xmpp_stream *xs, const char *chunk, size_t got)
 /**
  * rx_pump() - read until the socket is empty or the burst is spent
  * @xs: the stream
+ *
+ * A burst that ends with plaintext left inside TLS reads again from a timer:
+ * no socket event reports those bytes.
  *
  * Return: ULOOP_WRITE when the record layer needs it, 0 otherwise.
  */
@@ -1781,12 +1967,17 @@ static unsigned int rx_pump(struct xmpp_stream *xs)
 		}
 	}
 
+	if (sip_tls_conn_pending(&xs->tls))
+		uloop_timeout_set(&xs->rx_more, 0);
+
 	return 0;
 }
 
 /**
  * up_io() - a socket event of a connection that speaks XML
  * @xs: the stream
+ *
+ * A handshake that started in the read loop owns the uloop mask.
  */
 static void up_io(struct xmpp_stream *xs)
 {
@@ -1794,7 +1985,7 @@ static void up_io(struct xmpp_stream *xs)
 	unsigned int mask = ULOOP_READ;
 
 	mask |= rx_pump(xs);
-	if (xs->gen != gen)
+	if (xs->gen != gen || xs->state == XMPP_ST_TLS)
 		return;
 
 	mask |= tx_drain(xs);
@@ -1833,6 +2024,18 @@ static void fd_io(struct uloop_fd *ufd, unsigned int events)
 	default:
 		return;
 	}
+}
+
+/**
+ * rx_more_fire() - read on after a burst that left plaintext inside TLS
+ * @timeout: the timer
+ */
+static void rx_more_fire(struct uloop_timeout *timeout)
+{
+	struct xmpp_stream *xs = container_of(timeout, struct xmpp_stream,
+					      rx_more);
+
+	fd_io(&xs->ufd, ULOOP_READ);
 }
 
 /* -------------------------------------------------------------------- tick */
@@ -1878,7 +2081,7 @@ static void ping_send(struct xmpp_stream *xs)
 	xml_w_end(&writer);
 
 	if (xml_w_finish(&writer))
-		iq_send(xs, mem, writer.used, id, ping_done, NULL);
+		iq_send(xs, mem, writer.used, id, NULL, ping_done, NULL);
 }
 
 /**
@@ -1942,7 +2145,7 @@ static void tick_fire(struct uloop_timeout *timeout)
 	case XMPP_ST_IDLE:
 		return;
 	case XMPP_ST_BACKOFF:
-		if (now >= xs->backoff_until)
+		if (!xs->fail_pending && now >= xs->backoff_until)
 			resolve_start(xs);
 		break;
 	case XMPP_ST_READY:
@@ -1967,7 +2170,12 @@ void xmpp_stream_init(struct xmpp_stream *xs, const struct xmpp_stream_cb *cb,
 	xs->env = *env;
 	xs->ufd.fd = -1;
 	xs->tick.cb = tick_fire;
+	xs->rx_more.cb = rx_more_fire;
+	xs->fail_report.cb = fail_fire;
 	xs->dns_query = SIP_HANDLE_NONE;
+	xs->tick_ms = env_ms_get("UVOICE_XMPP_TICK_MS", XMPP_TICK_MS);
+	xs->ping_ms = env_ms_get("UVOICE_XMPP_PING_MS", XMPP_PING_S * 1000);
+	xs->backoff_ms = env_ms_get("UVOICE_XMPP_BACKOFF_MS", XMPP_BACKOFF_MS);
 }
 
 int xmpp_stream_start(struct xmpp_stream *xs, const struct xmpp_stream_cfg *cfg)
@@ -2028,11 +2236,18 @@ void xmpp_stream_stop(struct xmpp_stream *xs)
 	if (header_sent(xs))
 		tx_put(xs, close_tag, sizeof(close_tag) - 1, false);
 
+	uloop_timeout_cancel(&xs->fail_report);
+	xs->fail_pending = false;
 	conn_close(xs);
 	uloop_timeout_cancel(&xs->tick);
 	xs->fails = 0;
 	xs->stopping = false;
-	state_set(xs, XMPP_ST_IDLE, "stopped");
+	xs->state = XMPP_ST_IDLE;
+
+	/* A callback may start the stream again, which then owns the state. */
+	iq_pending_flush(xs);
+	if (xs->state == XMPP_ST_IDLE)
+		state_set(xs, XMPP_ST_IDLE, "stopped");
 }
 
 void xmpp_stream_done(struct xmpp_stream *xs)
@@ -2083,12 +2298,13 @@ int xmpp_stream_send(struct xmpp_stream *xs, const char *text, size_t len)
 }
 
 int xmpp_stream_iq_send(struct xmpp_stream *xs, const char *text, size_t len,
-			const char *id, xmpp_iq_cb cb, void *priv)
+			const char *id, const char *peer, xmpp_iq_cb cb,
+			void *priv)
 {
 	if (xs->state != XMPP_ST_READY)
 		return -ENOTCONN;
 
-	return iq_send(xs, text, len, id, cb, priv);
+	return iq_send(xs, text, len, id, peer, cb, priv);
 }
 
 const struct xmpp_stream_stat *xmpp_stream_stat(const struct xmpp_stream *xs)

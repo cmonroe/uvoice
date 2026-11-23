@@ -251,16 +251,24 @@ static int env_send(void *priv, unsigned int line, const char *text,
  * @text: the iq
  * @len: its length
  * @id: its id
+ * @peer: the JID that must answer, the address of the iq
  * @cb: the callback
  * @cb_priv: its pointer
  *
- * Return: 0 while the fake stream is ready.
+ * Return: 0 while the fake stream is ready, -EINVAL for a peer the iq does
+ * not address.
  */
 static int env_iq_send(void *priv, unsigned int line, const char *text,
-		       size_t len, const char *id, xcall_reply_cb cb,
-		       void *cb_priv)
+		       size_t len, const char *id, const char *peer,
+		       xcall_reply_cb cb, void *cb_priv)
 {
 	struct sent *rec = sent_add(text, len);
+	char to[ID_MAX + JID_MAX];
+	int to_len;
+
+	to_len = snprintf(to, sizeof(to), "to=\"%s\"", peer ? peer : "");
+	if (!peer || !peer[0] || !memmem(text, len, to, (size_t)to_len))
+		return -EINVAL;
 
 	if (rec) {
 		rec->iq = true;

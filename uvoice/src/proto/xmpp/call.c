@@ -443,7 +443,7 @@ static bool jingle_send(struct xcall *leg, struct xml_w *writer,
 		return false;
 
 	return xv.env.iq_send(xv.env.priv, leg->line, writer->mem, len, id,
-			      cb, leg) == 0;
+			      leg->peer, cb, leg) == 0;
 }
 
 /**
@@ -1381,7 +1381,11 @@ static void propose_take(unsigned int line, const struct jmi_msg *msg)
 	str_copy(leg->sid, sizeof(leg->sid), msg->id);
 	str_copy(leg->peer, sizeof(leg->peer), msg->from);
 	jid_text_bare(msg->from, leg->peer_bare, sizeof(leg->peer_bare));
-	jmi_send(leg, JMI_RINGING, leg->peer);
+	if (!jmi_send(leg, JMI_RINGING, leg->peer)) {
+		leg_fail(leg, PROTO_FAIL_QUIET);
+		return;
+	}
+
 	offer_announce(leg);
 }
 

@@ -332,8 +332,8 @@ static void services_ask(struct xmpp_account *acct)
 	xml_w_end(&writer);
 	len = xml_w_finish(&writer);
 	if (len)
-		xmpp_stream_iq_send(&acct->stream, mem, len, id, services_reply,
-				    acct);
+		xmpp_stream_iq_send(&acct->stream, mem, len, id, NULL,
+				    services_reply, acct);
 }
 
 /* ---------------------------------------------------------------- roster */
@@ -399,8 +399,8 @@ static void roster_ask(struct xmpp_account *acct)
 	xml_w_end(&writer);
 	len = xml_w_finish(&writer);
 	if (len)
-		xmpp_stream_iq_send(&acct->stream, mem, len, id, roster_reply,
-				    acct);
+		xmpp_stream_iq_send(&acct->stream, mem, len, id, NULL,
+				    roster_reply, acct);
 }
 
 /**
@@ -598,14 +598,15 @@ static int env_send(void *priv, unsigned int line, const char *text,
  * @text: the iq
  * @len: its length
  * @id: its id
+ * @peer: the full JID that must answer
  * @cb: the callback of the leg
  * @cb_priv: its pointer
  *
  * Return: 0, -EBUSY when the relay table is full, or the stream's errno.
  */
 static int env_iq_send(void *priv, unsigned int line, const char *text,
-		       size_t len, const char *id, xcall_reply_cb cb,
-		       void *cb_priv)
+		       size_t len, const char *id, const char *peer,
+		       xcall_reply_cb cb, void *cb_priv)
 {
 	struct xmpp_account *acct = acct_get(line);
 	struct xmpp_relay *relay;
@@ -618,8 +619,8 @@ static int env_iq_send(void *priv, unsigned int line, const char *text,
 	if (!relay)
 		return -EBUSY;
 
-	ret = xmpp_stream_iq_send(&acct->stream, text, len, id, relay_reply,
-				  relay);
+	ret = xmpp_stream_iq_send(&acct->stream, text, len, id, peer,
+				  relay_reply, relay);
 	if (ret)
 		memset(relay, 0, sizeof(*relay));
 

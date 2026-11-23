@@ -90,7 +90,8 @@ typedef void (*xcall_reply_cb)(void *priv, bool ok,
  *
  * ready        whether the stream of the line carries stanzas.
  * send         one stanza on the stream, 0 or a negative errno.
- * iq_send      an iq that awaits its answer through cb.
+ * iq_send      an iq that awaits its answer through cb, from the full JID
+ *              peer alone.
  * reply_result an empty result for an iq the leg took.
  * reply_error  a stanza error for an iq the leg refused.
  * id_next      a fresh stanza id.
@@ -113,8 +114,8 @@ struct xcall_env {
 	int (*send)(void *priv, unsigned int line, const char *text,
 		    size_t len);
 	int (*iq_send)(void *priv, unsigned int line, const char *text,
-		       size_t len, const char *id, xcall_reply_cb cb,
-		       void *cb_priv);
+		       size_t len, const char *id, const char *peer,
+		       xcall_reply_cb cb, void *cb_priv);
 	int (*reply_result)(void *priv, unsigned int line,
 			    const struct xml_doc *iq);
 	int (*reply_error)(void *priv, unsigned int line,

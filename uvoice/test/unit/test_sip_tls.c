@@ -63,6 +63,9 @@
 /* the client send buffer of the bulk case, small enough to fill */
 #define BULK_SNDBUF	32768
 
+/* one full record, so a write with partial writes on takes all or nothing */
+#define RECORD_CHUNK	16384
+
 static char fix_ca[PATH_MAX];
 static char fix_ca_key[PATH_MAX];
 static char fix_other_ca[PATH_MAX];
@@ -145,7 +148,8 @@ static bool pair_fail(struct pair *p)
 	return false;
 }
 
-static bool pair_open(struct sip_tls *t, struct pair *p, const char *sni)
+static bool pair_open_opts(struct sip_tls *t, struct pair *p,
+			   const struct sip_tls_client_opts *opts)
 {
 	memset(p, 0, sizeof(*p));
 	p->fd[0] = -1;
@@ -157,13 +161,20 @@ static bool pair_open(struct sip_tls *t, struct pair *p, const char *sni)
 	sock_nonblock(p->fd[0]);
 	sock_nonblock(p->fd[1]);
 
-	if (!sip_tls_conn_start(t, &p->cli, p->fd[0], false, sni))
+	if (!sip_tls_conn_connect(t, &p->cli, p->fd[0], opts))
 		return pair_fail(p);
 
 	if (!sip_tls_conn_start(t, &p->srv, p->fd[1], true, NULL))
 		return pair_fail(p);
 
 	return true;
+}
+
+static bool pair_open(struct sip_tls *t, struct pair *p, const char *sni)
+{
+	struct sip_tls_client_opts opts = { .sni = sni };
+
+	return pair_open_opts(t, p, &opts);
 }
 
 /* a connected pair over ::1, so the record layer runs on a real TCP socket */
@@ -860,6 +871,157 @@ static void t_bulk(void)
 	sip_tls_done(&t);
 }
 
+static enum sip_tls_io socket_fill(struct sip_tls_conn *c)
+{
+	enum sip_tls_io io = SIP_TLS_OK;
+	size_t n = 0;
+	int i;
+
+	for (i = 0; i < PUMP_MAX && io == SIP_TLS_OK; i++)
+		io = sip_tls_conn_write(c, bulk, RECORD_CHUNK, &n);
+
+	return io;
+}
+
+static bool pair_open_full(struct sip_tls *t, struct pair *p)
+{
+	int sndbuf = BULK_SNDBUF;
+
+	if (!pair_open(t, p, NULL))
+		return false;
+
+	setsockopt(p->fd[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
+	if (pair_handshake(p) != SIP_TLS_OK)
+		return false;
+
+	return socket_fill(&p->cli) == SIP_TLS_WANT_WRITE;
+}
+
+/*
+ * OpenSSL requires the retry of a write that answered a wait to use the same
+ * arguments. The wrapper refuses a retry with another length, so a stream
+ * that breaks the rule fails at once.
+ */
+static void t_write_retry(void)
+{
+	uint32_t hash = 2166136261u;
+	struct sip_tls_cfg cfg;
+	struct sip_tls t;
+	struct pair p;
+	size_t n = 42;
+
+	CASE("tls: a write retry with another length is an error");
+	cfg_server(&cfg);
+	sip_tls_init(&t);
+	CHECK(sip_tls_ctx_load(&t, &cfg));
+	CHECK(pair_open_full(&t, &p));
+	CHECK_UINT(sip_tls_conn_write(&p.cli, bulk, RECORD_CHUNK + 1, &n),
+		   SIP_TLS_ERR);
+	CHECK_UINT(n, 0);
+	CHECK(!strcmp(sip_tls_conn_error(&p.cli),
+		      "write retry changed its length"));
+	pair_close(&p);
+
+	CASE("tls: a write retry with the same length goes out after a drain");
+	CHECK(pair_open_full(&t, &p));
+	drain(&p.srv, &hash);
+	CHECK_UINT(sip_tls_conn_write(&p.cli, bulk, RECORD_CHUNK, &n),
+		   SIP_TLS_OK);
+	CHECK_UINT(n, RECORD_CHUNK);
+
+	CASE("tls: a write after a complete retry can have any length");
+	CHECK_UINT(sip_tls_conn_write(&p.cli, bulk, 10, &n), SIP_TLS_OK);
+	CHECK_UINT(n, 10);
+	CHECK(!strcmp(sip_tls_conn_error(&p.cli), ""));
+	pair_close(&p);
+
+	sip_tls_done(&t);
+}
+
+static void t_pending(void)
+{
+	struct sip_tls_cfg cfg;
+	struct sip_tls_conn c;
+	struct sip_tls t;
+	struct pair p;
+	char buf[100];
+	size_t n = 0;
+
+	CASE("tls: plaintext left in a record that was read is pending");
+	cfg_server(&cfg);
+	sip_tls_init(&t);
+	CHECK(sip_tls_ctx_load(&t, &cfg));
+	CHECK(pair_open(&t, &p, NULL));
+	CHECK_UINT(pair_handshake(&p), SIP_TLS_OK);
+	CHECK(!sip_tls_conn_pending(&p.cli));
+	memset(buf, 'x', sizeof(buf));
+	CHECK_UINT(sip_tls_conn_write(&p.srv, buf, sizeof(buf), &n),
+		   SIP_TLS_OK);
+	CHECK(read_exact(&p.cli, buf, 10));
+	CHECK(sip_tls_conn_pending(&p.cli));
+
+	CASE("tls: a record read to its end leaves nothing pending");
+	CHECK(read_exact(&p.cli, buf, sizeof(buf) - 10));
+	CHECK(!sip_tls_conn_pending(&p.cli));
+	pair_close(&p);
+	sip_tls_done(&t);
+
+	CASE("tls: a connection that never started has nothing pending");
+	memset(&c, 0, sizeof(c));
+	CHECK(!sip_tls_conn_pending(&c));
+	CHECK(!sip_tls_conn_pending(NULL));
+}
+
+static void t_verified(void)
+{
+	struct sip_tls_client_opts opts = {
+		.sni = "sip.example.test",
+		.host = "sip.example.test",
+	};
+	struct sip_tls_cfg cfg;
+	struct sip_tls t;
+	struct pair p;
+
+	CASE("tls: a trusted chain that names the host is verified");
+	cfg_server(&cfg);
+	cfg.verify = true;
+	cfg.ca_path = fix_ca;
+	sip_tls_init(&t);
+	CHECK(sip_tls_ctx_load(&t, &cfg));
+	CHECK(pair_open_opts(&t, &p, &opts));
+	CHECK(!sip_tls_conn_verified(&p.cli));
+	CHECK_UINT(pair_handshake(&p), SIP_TLS_OK);
+	CHECK(sip_tls_conn_verified(&p.cli));
+	CHECK(!sip_tls_conn_verified(&p.srv));
+	pair_close(&p);
+
+	CASE("tls: a trusted chain without a host is not verified");
+	opts.host = NULL;
+	CHECK(pair_open_opts(&t, &p, &opts));
+	CHECK_UINT(pair_handshake(&p), SIP_TLS_OK);
+	CHECK(!sip_tls_conn_verified(&p.cli));
+	pair_close(&p);
+
+	CASE("tls: a host the certificate does not name stops the handshake");
+	opts.host = "wrong.name.test";
+	CHECK(pair_open_opts(&t, &p, &opts));
+	CHECK_UINT(pair_handshake(&p), SIP_TLS_ERR);
+	CHECK(!sip_tls_conn_verified(&p.cli));
+	pair_close(&p);
+
+	CASE("tls: verify off does not verify a chain with the host");
+	cfg.verify = false;
+	opts.host = "sip.example.test";
+	CHECK(sip_tls_ctx_load(&t, &cfg));
+	CHECK(pair_open_opts(&t, &p, &opts));
+	CHECK_UINT(pair_handshake(&p), SIP_TLS_OK);
+	CHECK(!sip_tls_conn_verified(&p.cli));
+	pair_close(&p);
+
+	sip_tls_done(&t);
+}
+
 static void t_shutdown(void)
 {
 	struct sip_tls_cfg cfg;
@@ -1082,6 +1244,9 @@ int main(void)
 	t_verify();
 	t_sni();
 	t_bulk();
+	t_write_retry();
+	t_pending();
+	t_verified();
 	t_shutdown();
 	t_conn_refusals();
 	t_keylog();

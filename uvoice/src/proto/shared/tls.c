@@ -665,6 +665,7 @@ enum sip_tls_io sip_tls_conn_write(struct sip_tls_conn *c, const void *buf, size
 {
 	size_t wrote = 0;
 	int ret, err, sys_err;
+	enum sip_tls_io io;
 
 	if (done)
 		*done = 0;
@@ -672,10 +673,16 @@ enum sip_tls_io sip_tls_conn_write(struct sip_tls_conn *c, const void *buf, size
 	if (!c || !c->ssl)
 		return conn_none(c);
 
+	if (c->write_want && len != c->write_want) {
+		conn_fail(c, "write retry changed its length");
+		return SIP_TLS_ERR;
+	}
+
 	ERR_clear_error();
 
 	ret = SSL_write_ex(c->ssl, buf, len, &wrote);
 	if (ret == 1) {
+		c->write_want = 0;
 		if (done)
 			*done = wrote;
 		return SIP_TLS_OK;
@@ -684,7 +691,30 @@ enum sip_tls_io sip_tls_conn_write(struct sip_tls_conn *c, const void *buf, size
 	err = SSL_get_error(c->ssl, ret);
 	sys_err = errno;
 
-	return io_map(c, err, sys_err);
+	io = io_map(c, err, sys_err);
+	c->write_want = io == SIP_TLS_ERR ? 0 : len;
+
+	return io;
+}
+
+bool sip_tls_conn_pending(const struct sip_tls_conn *c)
+{
+	return c && c->ssl && SSL_has_pending(c->ssl);
+}
+
+/*
+ * SSL_get_verify_result() reads X509_V_OK for a peer that sent no certificate,
+ * and SSL_get0_peername() is NULL unless a host was set and matched, so all
+ * three answers are needed.
+ */
+bool sip_tls_conn_verified(const struct sip_tls_conn *c)
+{
+	if (!c || !c->ssl || !c->up)
+		return false;
+
+	return SSL_get0_peer_certificate(c->ssl) &&
+	       SSL_get_verify_result(c->ssl) == X509_V_OK &&
+	       SSL_get0_peername(c->ssl);
 }
 
 void sip_tls_conn_close(struct sip_tls_conn *c)
