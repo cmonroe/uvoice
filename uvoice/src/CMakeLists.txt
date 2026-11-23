@@ -290,9 +290,9 @@ if(UVOICE_PROTO_MGCP)
 	     uvoice_proto_mgcp_txn uvoice_proto_mgcp_ep uvoice_proto_mgcp)
 endif()
 # The XMPP half of the SIP unit, src/proto/xmpp, in two object sets. It
-# exists only with UVOICE_XMPP, and it rides the SIP unit: the line shell of
-# proto/sip hosts the Jingle legs beside the SIP legs. No source of either set
-# tests UVOICE_XMPP, so neither set takes the define.
+# exists only with UVOICE_XMPP, and it depends on the SIP unit: the line
+# shell of proto/sip hosts the Jingle legs beside the SIP legs. No source of
+# either set tests UVOICE_XMPP, so neither set takes the define.
 #
 # uvoice_xmpp_core: the stream parser and writer over expat, the SASL client
 # over OpenSSL, service discovery, the JID helpers, the Jingle session, the
@@ -321,7 +321,7 @@ if(UVOICE_XMPP)
 
 	# The c2s stream owns a socket, a uloop timer, a TLS connection of
 	# proto/shared/tls.c and queries of the shared resolver. uvoiced links
-	# it beside uvoice_sip_stream, which carries tls.c.
+	# it beside uvoice_sip_stream, which contains tls.c.
 	add_library(uvoice_xmpp OBJECT proto/xmpp/stream.c
 		    proto/xmpp/account.c)
 	target_include_directories(uvoice_xmpp PUBLIC
@@ -450,7 +450,8 @@ endif()
 if(UVOICE_PROTO_MGCP)
 	target_compile_definitions(uvoice_core PRIVATE UVOICE_PROTO_MGCP)
 endif()
-# The stub and the css backend carry the transport ops of an ICE_DTLS stream.
+# The stub and the css backend implement the transport ops of an ICE_DTLS
+# stream.
 if(UVOICE_XMPP)
 	target_compile_definitions(uvoice_core PRIVATE UVOICE_XMPP)
 endif()

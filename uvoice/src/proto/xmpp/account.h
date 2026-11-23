@@ -116,7 +116,7 @@ void xmpp_accounts_done(void);
 bool xmpp_account_active(unsigned int line);
 
 /**
- * xmpp_account_ready() - whether the stream of a line carries stanzas
+ * xmpp_account_ready() - whether the stream of a line exchanges stanzas
  * @line: the line
  *
  * Return: true in the ready state.

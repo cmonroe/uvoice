@@ -1071,7 +1071,7 @@ void xml_stream_done(struct xml_stream *xs)
 }
 
 /**
- * node_match() - whether a node carries a name and a namespace
+ * node_match() - whether a node has a name and a namespace
  * @node: the node
  * @name: the local name, NULL for any
  * @ns: the namespace URI, NULL for any
@@ -1152,7 +1152,7 @@ unsigned int xml_next(const struct xml_doc *doc, unsigned int node,
  * @node: the node
  * @name: the attribute name
  *
- * Return: the value, or NULL when the node carries no such attribute.
+ * Return: the value, or NULL when the node has no such attribute.
  */
 const char *xml_attr_get(const struct xml_doc *doc, unsigned int node,
 			 const char *name)
@@ -1190,7 +1190,7 @@ const char *xml_text_get(const struct xml_doc *doc, unsigned int node)
 }
 
 /**
- * xml_node_is() - whether a node carries a name and a namespace
+ * xml_node_is() - whether a node has a name and a namespace
  * @doc: the tree
  * @node: the node
  * @name: the local name, NULL for any

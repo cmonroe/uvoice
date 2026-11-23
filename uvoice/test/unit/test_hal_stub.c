@@ -1197,8 +1197,8 @@ static bool ev_transport_gen(struct probe *p, uint16_t *gen)
 	return found;
 }
 
-/**
- * test_transport() - the transport ops of an ICE_DTLS stream (hal.h)
+/*
+ * The transport ops of an ICE_DTLS stream (hal.h).
  *
  * A UDP stream refuses the three stream ops with HAL_UNSUPPORTED. An ICE_DTLS
  * stream answers its identity, takes remote candidates, pops the scripted
@@ -1316,8 +1316,8 @@ static uint16_t ice_gen_program(struct hal *hal, unsigned int stream,
 	return local.gen;
 }
 
-/**
- * test_transport_gen() - the generation of the ICE agent of a stream
+/*
+ * The generation of the ICE agent of a stream.
  *
  * A record that waits in the event socket can reach the core after its
  * stream took a new agent for the next call. The generation in the local

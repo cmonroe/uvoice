@@ -96,9 +96,10 @@ struct cfg_codec {
 };
 
 /*
- * The signalling of a channel. sip registers the line with the SIP account
+ * The signaling of a channel. sip registers the line with the SIP account
  * layer. xmpp binds it to an XMPP account (proto/xmpp/account.h), which
- * carries Jingle calls; the sip_* options of the channel are then unread.
+ * places and takes Jingle calls; the sip_* options of the channel are then
+ * unread.
  */
 enum cfg_account_type {
 	CFG_ACCOUNT_SIP = 0,

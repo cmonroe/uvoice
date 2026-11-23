@@ -35,8 +35,8 @@
 #include "../../str.h"
 #include "../../trace.h"
 
-/* Every codec this backend carries uses an 8 kHz RTP timestamp clock, G.722 by
- * the RFC 3551 convention. */
+/* Every codec this backend supports uses an 8 kHz RTP timestamp clock, G.722
+ * by the RFC 3551 convention. */
 #define CSS_RTP_CLOCK_HZ	8000u
 
 static struct css_stream *css_stream_get(struct hal *h, unsigned int line,

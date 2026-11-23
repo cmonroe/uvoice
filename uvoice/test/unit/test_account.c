@@ -3580,8 +3580,8 @@ static void test_early_reload(void)
 	CHECK(!account_unregister_cmd(0));
 }
 
-/**
- * test_type_fault() - an enabled xmpp line nothing registers reports once
+/*
+ * An enabled xmpp line nothing registers reports once.
  *
  * In an image without XMPP every enabled xmpp line has the fault. In an
  * XMPP image a line without its JID or its password has it.

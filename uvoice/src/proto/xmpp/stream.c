@@ -350,7 +350,7 @@ static void fd_drop(struct xmpp_stream *xs)
 }
 
 /**
- * conn_close() - end the connection and clear everything it carried
+ * conn_close() - end the connection and clear everything it held
  * @xs: the stream
  *
  * It runs no callback. The pending requests stay for the caller, which
@@ -2203,10 +2203,10 @@ int xmpp_stream_start(struct xmpp_stream *xs, const struct xmpp_stream_cfg *cfg)
 }
 
 /**
- * header_sent() - whether this document carries an open stream header
+ * header_sent() - whether this document holds an open stream header
  * @xs: the stream
  *
- * Return: true when a close tag is owed.
+ * Return: true when a close tag is due.
  */
 static bool header_sent(const struct xmpp_stream *xs)
 {

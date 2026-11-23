@@ -247,19 +247,21 @@ config channel 'channel1'
 	option xmpp_speed_dial_0 '1=alice@example.net'
 ```
 
-The stream resolves the SRV records of the domain, requires TLS (STARTTLS,
-or direct TLS with `xmpp_direct_tls`), verifies the server certificate
-against the domain (`xmpp_tls_verify`, the trust store of `xmpp_tls_ca` or
-the system one) and authenticates with SCRAM-SHA-256, SCRAM-SHA-1 or PLAIN.
-`xmpp_host` and `xmpp_port` name the server by hand. `xmpp_resource` picks
-the resource, `uvoice` by default.
+The stream resolves the SRV records of the domain and requires TLS:
+STARTTLS, or direct TLS with `xmpp_direct_tls`. It verifies the server
+certificate against the domain (`xmpp_tls_verify`). Its trust store is
+`xmpp_tls_ca` or the system store. It authenticates with SCRAM-SHA-256,
+SCRAM-SHA-1 or PLAIN. `xmpp_host` and `xmpp_port` name the server by hand.
+`xmpp_resource` picks the resource, `uvoice` by default.
 
 A call is a Jingle session (XEP-0166, XEP-0167) over ICE-UDP (XEP-0176) and
 DTLS-SRTP (XEP-0320). The codec list is the one the channel offers over
-SIP. Every call starts with Jingle Message Initiation (XEP-0353): an
-outbound call rings every device of the callee, an inbound call rings
-every device of the account, and the device that answers first takes the
-call. The other devices stop with the reason `answered_elsewhere`.
+SIP.
+
+Every call starts with Jingle Message Initiation (XEP-0353). An outbound
+call rings every device of the callee. An inbound call rings every device of
+the account. The device that answers first takes the call. Every other
+device stops with the reason `answered_elsewhere`.
 
 Any JID can call an xmpp line, as any caller can call a SIP line. The roster
 gives the name of a known caller and does not filter calls. Before an
@@ -282,7 +284,7 @@ An enabled xmpp line reports a line fault if the image has no XMPP, or if
 the line has no `xmpp_jid` or no `xmpp_password`. The `accounts` verb
 reports the configured type of each line.
 
-A dialled string with an `@` is a JID. Digits map through
+A dialed string with an `@` is a JID. Digits map through
 `xmpp_speed_dial_0` to `xmpp_speed_dial_9`, each `digits=jid`. The ubus
 verb `roster` lists the contacts of the account for a user interface.
 

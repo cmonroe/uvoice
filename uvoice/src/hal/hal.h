@@ -326,7 +326,7 @@ enum hal_feature {
 						 * keys. The core reads no
 						 * desk bit; the status reply
 						 * names it. */
-	HAL_FEAT_ICE_DTLS	= (1 << 21),	/* the backend carries a stream
+	HAL_FEAT_ICE_DTLS	= (1 << 21),	/* the backend supports a stream
 						 * of transport kind
 						 * HAL_TRANSPORT_ICE_DTLS: an
 						 * ICE agent with DTLS-SRTP on
@@ -891,7 +891,7 @@ enum hal_fp_hash {
 	HAL_FP_SHA256,
 };
 
-/* The ICE state a HAL_EVENT_TRANSPORT ICE_STATE record carries. */
+/* The ICE state a HAL_EVENT_TRANSPORT ICE_STATE record holds. */
 enum hal_ice_state {
 	HAL_ICE_DISCONNECTED = 0,
 	HAL_ICE_GATHERING,
@@ -907,7 +907,7 @@ enum hal_ice_state {
  * GATHERING_DONE: no more local candidates follow. ICE_STATE: u.transport.state
  * is the enum hal_ice_state. DTLS_UP: the handshake verified the far end and
  * keyed the stream, so media flows. DTLS_FAIL: the handshake failed or the far
- * end's fingerprint did not match, so the stream carries no media.
+ * end's fingerprint did not match, so no media flows.
  * DTLS_CLOSED: the far end ended the DTLS session in order, so no more media
  * flows; it is no failure, the signalling ends the call.
  */
@@ -939,7 +939,7 @@ struct hal_turn {
 
 /*
  * The ICE and DTLS half of a description (hal_media.transport). Remote
- * candidates are not in it: stream_candidate_add carries them one by one, so
+ * candidates are not in it: stream_candidate_add adds them one by one, so
  * a trickled candidate reaches a running stream without a reprogramming. An
  * empty remote_ufrag says the far end is not known yet (the initiator before
  * the answer): the backend gathers and waits for the re-application that
@@ -1227,7 +1227,7 @@ struct hal_media {
 	 * Appended after punch_interval_ms, by the same rule, so a backend
 	 * built against the older record keeps its layout. The transport of
 	 * the stream (enum hal_transport_kind and the ICE and DTLS half). A
-	 * zeroed block is the connected UDP pair every description carried
+	 * zeroed block is the connected UDP pair every description used
 	 * before it.
 	 */
 	struct hal_transport transport;

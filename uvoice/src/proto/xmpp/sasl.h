@@ -16,7 +16,7 @@
  *
  * SASLprep (RFC 4013) is not applied: the user name and the password travel
  * as the configuration spelled them, which is right for the ASCII accounts
- * this phone carries.
+ * this phone uses.
  */
 #ifndef UVOICE_XMPP_SASL_H
 #define UVOICE_XMPP_SASL_H
@@ -71,7 +71,7 @@ const char *sasl_mech_name(enum sasl_mech mech);
 
 /**
  * sasl_mech_of() - the mechanism of an IANA name
- * @name: the name, as the server's <mechanism/> carries it
+ * @name: the name, as the server's <mechanism/> holds it
  *
  * Return: the mechanism, SASL_MECH_NONE for one this client lacks.
  */
@@ -142,7 +142,7 @@ int sasl_client_verify(struct sasl_client *client, const char *final,
 		       size_t flen);
 
 /**
- * sasl_client_wipe() - zeroise the password and the keys
+ * sasl_client_wipe() - zeroize the password and the keys
  * @client: the client
  */
 void sasl_client_wipe(struct sasl_client *client);

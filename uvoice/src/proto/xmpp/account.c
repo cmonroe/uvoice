@@ -1135,7 +1135,7 @@ static void relay_reply(struct xmpp_stream *xs, const struct xml_doc *reply,
 }
 
 /**
- * env_ready() - whether the stream of a line carries stanzas
+ * env_ready() - whether the stream of a line exchanges stanzas
  * @priv: unused
  * @line: the line
  *

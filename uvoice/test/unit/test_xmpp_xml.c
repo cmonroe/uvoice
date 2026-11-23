@@ -365,8 +365,8 @@ static bool dropped_check(struct xml_stream *xs, struct tctx *ctx,
 	       xml_child(&ctx->stanza, XML_NONE, "x", "urn:q") != XML_NONE;
 }
 
-/**
- * header_tests() - the stream header and the keepalive whitespace
+/*
+ * The stream header and the keepalive whitespace.
  */
 static void header_tests(void)
 {
@@ -406,8 +406,8 @@ static void header_tests(void)
 	xml_stream_done(&xs);
 }
 
-/**
- * stanza_tests() - the stanza trees and their namespaces
+/*
+ * The stanza trees and their namespaces.
  */
 static void stanza_tests(void)
 {
@@ -566,8 +566,8 @@ static bool fail_check(const char *input, const char *reason)
 	return ok;
 }
 
-/**
- * forbidden_tests() - the constructs RFC 6120 11.1 forbids
+/*
+ * The constructs RFC 6120 11.1 forbids.
  */
 static void forbidden_tests(void)
 {
@@ -606,8 +606,8 @@ static void forbidden_tests(void)
 	CHECK(fail_check("<message foo:bar='x'/>", "unbound namespace prefix"));
 }
 
-/**
- * bound_tests() - the arena and wire bounds of a stanza
+/*
+ * The arena and wire bounds of a stanza.
  */
 static void bound_tests(void)
 {
@@ -987,8 +987,8 @@ static void stop_tests(void)
 	xml_stream_done(&xs);
 }
 
-/**
- * reset_tests() - the stream restart after STARTTLS or SASL
+/*
+ * The stream restart after STARTTLS or SASL.
  */
 static void reset_tests(void)
 {
@@ -1045,8 +1045,8 @@ static void message_write(struct xml_w *writer)
 	xml_w_end(writer);
 }
 
-/**
- * writer_tests() - the stanza writer and the escaper
+/*
+ * The stanza writer and the escaper.
  */
 static void writer_tests(void)
 {
@@ -1132,8 +1132,8 @@ static void writer_tests(void)
 	CHECK_UINT(xml_escape("", small, 0), 0);
 }
 
-/**
- * round_trip_tests() - what the writer produced parses back as the same tree
+/*
+ * What the writer produced parses back as the same tree.
  */
 static void round_trip_tests(void)
 {

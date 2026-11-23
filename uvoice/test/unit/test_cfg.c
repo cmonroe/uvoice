@@ -6817,8 +6817,8 @@ static const struct blobmsg_policy xmpp_channel_policy[XMPP_CH_MAX] = {
 	},
 };
 
-/**
- * xmpp_options_test() - the XMPP account rows of a channel
+/*
+ * The XMPP account rows of a channel.
  *
  * The rows load into the channel, the enum word dumps as its word, the two
  * secrets stay out of the dump.

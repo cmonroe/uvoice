@@ -19064,7 +19064,7 @@ static void t_xmpp_legs(void)
 	      "</message>");
 	CHECK(!strcmp(notify_reason, "answered_elsewhere"));
 
-	/* the desk keeps the machine at rest, so a reload lands at once */
+	/* the desk keeps the machine at rest, so a reload applies at once */
 	CASE("desk: a call that is up ends through the table it started with");
 	cfg_default();
 	ui_desk_answer = true;

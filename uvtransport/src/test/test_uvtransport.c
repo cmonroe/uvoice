@@ -876,8 +876,8 @@ static void *flow_run(void *arg)
 	return NULL;
 }
 
-/**
- * test_local() - the process identity and the refusals of one stream
+/*
+ * The process identity and the refusals of one stream.
  */
 static void test_local(void)
 {
@@ -911,8 +911,8 @@ static void test_local(void)
 	lock_faults_check();
 }
 
-/**
- * test_credentials() - the ICE credentials keep to the ice-char set and length
+/*
+ * The ICE credentials keep to the ice-char set and length.
  */
 static void test_credentials(void)
 {
@@ -943,8 +943,8 @@ static void test_credentials(void)
 	lock_faults_check();
 }
 
-/**
- * test_remote_twice() - a second far end is refused while the first installs
+/*
+ * A second far end is refused while the first installs.
  */
 static void test_remote_twice(void)
 {
@@ -968,8 +968,8 @@ static void test_remote_twice(void)
 	lock_faults_check();
 }
 
-/**
- * test_timer_default() - the first DTLS timeout without the timer of the suite
+/*
+ * The first DTLS timeout without the timer of the suite.
  *
  * The callee is the DTLS client, so it sends the first flight. The case ends
  * after that flight and waits for no DTLS timer.
@@ -996,8 +996,8 @@ static void test_timer_default(void)
 	lock_faults_check();
 }
 
-/**
- * test_handshake_and_media() - two streams connect, handshake and carry media
+/*
+ * Two streams connect, complete the handshake and exchange media.
  */
 static void test_handshake_and_media(void)
 {
@@ -1053,8 +1053,8 @@ static void test_handshake_and_media(void)
 	lock_faults_check();
 }
 
-/**
- * test_lost_record() - the DTLS timer sends a lost record again
+/*
+ * The DTLS timer sends a lost record again.
  *
  * Each side loses its first DTLS datagram: the ClientHello of the callee and
  * the first record of the caller's answer.
@@ -1087,8 +1087,8 @@ static void test_lost_record(void)
 	lock_faults_check();
 }
 
-/**
- * test_fingerprint_mismatch() - a wrong fingerprint fails both sides once
+/*
+ * A wrong fingerprint fails both sides once.
  */
 static void test_fingerprint_mismatch(void)
 {
@@ -1124,8 +1124,8 @@ static void test_fingerprint_mismatch(void)
 	lock_faults_check();
 }
 
-/**
- * test_close() - a close_notify ends the media of both sides without a failure
+/*
+ * A close_notify ends the media of both sides without a failure.
  */
 static void test_close(void)
 {
@@ -1173,8 +1173,8 @@ static void test_close(void)
 	lock_faults_check();
 }
 
-/**
- * test_close_flow() - a close on one thread while another thread sends RTP
+/*
+ * A close on one thread while another thread sends RTP.
  */
 static void test_close_flow(void)
 {

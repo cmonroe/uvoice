@@ -23,7 +23,7 @@
  * more than XML_STANZA_MAX bytes between two parser events, which bounds an
  * unfinished tag and the work expat repeats on it at every feed.
  *
- * Namespaces are resolved here. The feed's expat carries no namespace mode,
+ * Namespaces are resolved here. The feed's expat has no namespace mode,
  * so the parser keeps the xmlns declarations of every open element and maps
  * each name onto its namespace URI itself. An element's ns is the URI in
  * scope for its prefix, or for the default namespace without a prefix. An
@@ -237,7 +237,7 @@ unsigned int xml_next(const struct xml_doc *doc, unsigned int node,
  * @node: the node
  * @name: the attribute name
  *
- * Return: the value, or NULL when the node carries no such attribute.
+ * Return: the value, or NULL when the node has no such attribute.
  */
 const char *xml_attr_get(const struct xml_doc *doc, unsigned int node,
 			 const char *name);
@@ -252,7 +252,7 @@ const char *xml_attr_get(const struct xml_doc *doc, unsigned int node,
 const char *xml_text_get(const struct xml_doc *doc, unsigned int node);
 
 /**
- * xml_node_is() - whether a node carries a name and a namespace
+ * xml_node_is() - whether a node has a name and a namespace
  * @doc: the tree
  * @node: the node
  * @name: the local name, NULL for any

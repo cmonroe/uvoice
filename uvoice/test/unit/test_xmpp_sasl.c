@@ -152,8 +152,8 @@ static const char *fill(char letter, size_t count)
 	return mem;
 }
 
-/**
- * mech_tests() - the name table and the pick order
+/*
+ * The name table and the pick order.
  */
 static void mech_tests(void)
 {
@@ -193,8 +193,8 @@ static void mech_tests(void)
 	CHECK(sasl_mech_pick(all, 0, true) == SASL_MECH_NONE);
 }
 
-/**
- * init_tests() - the refusals and the state after init
+/*
+ * The refusals and the state after init.
  */
 static void init_tests(void)
 {
@@ -254,8 +254,8 @@ static void init_tests(void)
 	CHECK_UINT(strlen(client.nonce), 24);
 }
 
-/**
- * sha1_tests() - the RFC 5802 section 5 exchange
+/*
+ * The RFC 5802 section 5 exchange.
  */
 static void sha1_tests(void)
 {
@@ -293,8 +293,8 @@ static void sha1_tests(void)
 				 strlen(RFC5802_SERVER_FINAL)) == -EINVAL);
 }
 
-/**
- * sha256_tests() - the RFC 7677 section 3 exchange
+/*
+ * The RFC 7677 section 3 exchange.
  */
 static void sha256_tests(void)
 {
@@ -330,8 +330,8 @@ static void sha256_tests(void)
 				 strlen(RFC7677_SERVER_FINAL ",x=1")) == 0);
 }
 
-/**
- * final_tests() - the refusals of the server-final message
+/*
+ * The refusals of the server-final message.
  */
 static void final_tests(void)
 {
@@ -375,8 +375,8 @@ static void final_tests(void)
 	CHECK(sasl_client_verify(&client, "v=!!!!", 6) == -EPROTO);
 }
 
-/**
- * challenge_tests() - the refusals of the server-first message
+/*
+ * The refusals of the server-first message.
  */
 static void challenge_tests(void)
 {
@@ -451,8 +451,8 @@ static void challenge_tests(void)
 			       sizeof(out)) == -EPROTO);
 }
 
-/**
- * order_tests() - calls out of sequence and short buffers
+/*
+ * Calls out of sequence and short buffers.
  */
 static void order_tests(void)
 {
@@ -502,8 +502,8 @@ static void order_tests(void)
 	CHECK(!strcmp(out, RFC5802_FINAL));
 }
 
-/**
- * plain_tests() - the PLAIN mechanism
+/*
+ * The PLAIN mechanism.
  */
 static void plain_tests(void)
 {
@@ -545,8 +545,8 @@ static void plain_tests(void)
 	CHECK(sasl_client_first(&client, out, 13) == 12);
 }
 
-/**
- * escape_tests() - the n= attribute escaping of RFC 5802 section 5.1
+/*
+ * The n= attribute escaping of RFC 5802 section 5.1.
  */
 static void escape_tests(void)
 {
@@ -581,8 +581,8 @@ static void escape_tests(void)
 	CHECK(!strncmp(out, "n,,n==2C=2C", 11));
 }
 
-/**
- * wipe_tests() - the zeroisation after an exchange
+/*
+ * The zeroization after an exchange.
  */
 static void wipe_tests(void)
 {

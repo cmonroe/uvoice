@@ -16,8 +16,8 @@
 #include "proto/xmpp/jid.h"
 #include "test_util.h"
 
-/**
- * test_jid_parse() - the three parts and the refusals
+/*
+ * The three parts and the refusals.
  */
 static void test_jid_parse(void)
 {
@@ -64,8 +64,8 @@ static void test_jid_parse(void)
 	CHECK(!jid_text_bare_eq("juliet@capulet.example", "bad@"));
 }
 
-/**
- * test_disco_ver() - the XEP-0115 section 5.2 example and the own set
+/*
+ * The XEP-0115 section 5.2 example and the own set.
  */
 static void test_disco_ver(void)
 {

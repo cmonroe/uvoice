@@ -1508,7 +1508,7 @@ static void test_hal_feature_names(void)
 	CHECK(array_has_string(field, "desk"));
 
 	/* the bit a Jingle call needs for its media; without the word an
-	 * operator cannot tell a backend that carries no ICE agent from a
+	 * operator cannot tell a backend that has no ICE agent from a
 	 * call that failed */
 	CASE("voice status names the ICE and DTLS-SRTP transport capability");
 	CHECK(array_has_string(field, "ice_dtls"));

@@ -44,7 +44,7 @@ enum jmi_kind {
 };
 
 /*
- * One parsed message. from and to are those of the message that carried
+ * One parsed message. from and to are those of the message that held
  * the element, the inner one for a carbon. audio says a propose named an
  * RTP description of media audio. carbon says the message arrived inside a
  * carbons copy, carbon_sent that the copy was of a message this account
@@ -78,7 +78,7 @@ const char *jmi_kind_name(enum jmi_kind kind);
  * A session id, a from or a to that does not fit its field refuses the
  * message, so two sessions never share a cut id.
  *
- * Return: true when the message, or the message a carbon wrapped, carries
+ * Return: true when the message, or the message a carbon wrapped, holds
  * one element of the family with an id.
  */
 bool jmi_parse(const struct xml_doc *message, struct jmi_msg *out);
@@ -89,7 +89,7 @@ bool jmi_parse(const struct xml_doc *message, struct jmi_msg *out);
  * @kind: the element
  * @to: the recipient, a bare or a full JID
  * @msg_id: the message id
- * @id: the session id the element carries
+ * @id: the session id the element holds
  *
  * A propose names an audio description. Every message asks for storage with
  * the hint of XEP-0334, so a device that is offline sees the call when it

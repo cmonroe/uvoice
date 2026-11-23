@@ -20,7 +20,7 @@
 #define UVT_CANDIDATE_MAX	256U
 /* SHA-256, the one fingerprint hash this library offers and verifies. */
 #define UVT_FINGERPRINT_LEN	32U
-/* The largest datagram a stream carries, before protection. */
+/* The largest datagram a stream sends or receives, before protection. */
 #define UVT_PACKET_MAX		1500U
 
 enum uvt_role {

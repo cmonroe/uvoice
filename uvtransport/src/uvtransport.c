@@ -595,7 +595,7 @@ static bool peer_fingerprint_ok(struct uvt_stream *stream)
  * @stream: the stream, after its handshake
  * @suite: receives the suite
  *
- * Return: true when the profile is one this library carries.
+ * Return: true when the profile is one this library supports.
  */
 static bool srtp_suite_of(struct uvt_stream *stream, enum uvsrtp_suite *suite)
 {

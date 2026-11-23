@@ -1,11 +1,12 @@
 # uvtransport
 
-`libuvtransport` carries one media stream over ICE with DTLS-SRTP, the
-transport every WebRTC peer and every Jingle client expects. It joins three
-libraries behind one API: libjuice runs the ICE agent with its STUN and TURN
-client, OpenSSL runs the DTLS handshake of RFC 5764 over the connected pair,
-and `libuvsrtp` protects the RTP and RTCP with the keys that handshake
-exported.
+`libuvtransport` sends and receives one media stream over ICE with
+DTLS-SRTP. Every WebRTC peer and every Jingle client expects ICE with
+DTLS-SRTP. `libuvtransport` joins three libraries behind one API:
+
+- libjuice runs an ICE agent with its STUN and TURN client;
+- OpenSSL runs a DTLS handshake of RFC 5764 over the connected pair;
+- `libuvsrtp` protects RTP and RTCP with the keys that handshake exported.
 
 ## Scope
 
@@ -13,8 +14,8 @@ exported.
 - DTLS 1.2 with the `use_srtp` extension; profiles
   `SRTP_AES128_CM_SHA1_80` and `SRTP_AES128_CM_SHA1_32`.
 - One self-signed EC P-256 certificate per process, SHA-256 fingerprint. The
-  far end's fingerprint is verified against the one the signalling carried.
-- No signalling, no SDP, no XML. The caller moves the credentials, the
+  far end's fingerprint is verified against the signaled one.
+- No signaling, no SDP, no XML. The caller moves the credentials, the
   fingerprints and the candidate lines.
 - A DSCP mark from the caller for RTP and one for RTCP. DTLS uses the RTP
   mark.
@@ -42,14 +43,14 @@ The public header is `uvtransport/uvtransport.h`.
 | Function | Purpose |
 |---|---|
 | `uvt_init` | Certificate, DTLS context and SRTP state of the process, once. |
-| `uvt_fingerprint_get` | The local certificate fingerprint for the signalling. |
+| `uvt_fingerprint_get` | The local certificate fingerprint for the signaling. |
 | `uvt_create` | One stream: the ICE agent, with the STUN and TURN servers. |
 | `uvt_remote_set` | The remote ufrag, pwd, fingerprint and DTLS setup. |
 | `uvt_candidate_add` / `uvt_remote_done` | Remote candidates, trickled. |
 | `uvt_local_get` / `uvt_candidate_next` | Local credentials and candidates. |
 | `uvt_send_rtp` / `uvt_send_rtcp` | Protect and send. |
 | `uvt_tick` | DTLS retransmissions. |
-| `uvt_destroy` | Release the stream and zeroise its keys. |
+| `uvt_destroy` | Release the stream and zeroize its keys. |
 
 ## Build on a host
 

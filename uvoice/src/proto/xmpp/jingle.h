@@ -11,7 +11,7 @@
  * values and written from them. No state lives here: the session machine
  * is the call layer's.
  *
- * One content. The phone carries one audio stream per call, so the parser
+ * One content. The phone uses one audio stream per call, so the parser
  * reads the first <content/> that holds an RTP description or an ICE-UDP
  * transport and counts the rest. The writer writes one.
  *
@@ -112,7 +112,7 @@ enum jingle_info {
 	JINGLE_INFO_MAX,
 };
 
-/* RFC 4145 section 4, as XEP-0320 carries it. */
+/* RFC 4145 section 4, as XEP-0320 uses it. */
 enum jingle_setup {
 	JINGLE_SETUP_NONE = 0,
 	JINGLE_SETUP_ACTPASS,
@@ -255,7 +255,7 @@ enum jingle_setup jingle_setup_of(const char *name);
  * @iq: the iq stanza
  * @out: receives the values, cleared first
  *
- * Return: true when the iq is of type set and carries a jingle element with
+ * Return: true when the iq is of type set and holds a jingle element with
  * an action this layer knows and a sid that fits JINGLE_SID_MAX.
  */
 bool jingle_parse(const struct xml_doc *iq, struct jingle_msg *out);
@@ -271,7 +271,7 @@ bool jingle_parse(const struct xml_doc *iq, struct jingle_msg *out);
  * or relay, with a port from 1 to 65535. It names a related address with a
  * port from 0 to 65535, or neither of the two.
  *
- * Return: true when the element carried what the line needs.
+ * Return: true when the element held what the line needs.
  */
 bool jingle_candidate_sdp(const struct xml_doc *doc, unsigned int node,
 			  char *out, size_t len);

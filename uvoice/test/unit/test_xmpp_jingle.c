@@ -154,8 +154,9 @@ static bool parse(const char *xml)
 	return stanzas == 1;
 }
 
-/**
- * test_parse_initiate() - a session-initiate as Conversations sends one
+/*
+ * A session-initiate with three payload types, rtcp-mux, an ICE-UDP
+ * transport, a DTLS fingerprint and two candidates.
  */
 static void test_parse_initiate(void)
 {
@@ -230,8 +231,8 @@ static void test_parse_initiate(void)
 	CHECK(!jm_ok);
 }
 
-/**
- * test_candidates() - the two directions of the candidate conversion
+/*
+ * The two directions of the candidate conversion.
  */
 static void test_candidates(void)
 {
@@ -278,8 +279,8 @@ static void test_candidates(void)
 		      "a=candidate:3 1 udp 1 1.2.3.4 7 typ host"));
 }
 
-/**
- * test_fingerprint() - the hex text both ways
+/*
+ * The hex text both ways.
  */
 static void test_fingerprint(void)
 {
@@ -301,8 +302,8 @@ static void test_fingerprint(void)
 				       "8C:5E:FF:F4:FB:F6:76:F2", fp));
 }
 
-/**
- * test_write_round_trip() - what the writer builds parses back
+/*
+ * What the writer builds parses back.
  */
 static void test_write_round_trip(void)
 {
@@ -397,8 +398,8 @@ static void test_write_round_trip(void)
 	CHECK(!strcmp(jingle_setup_name(JINGLE_SETUP_NONE), ""));
 }
 
-/**
- * test_jmi() - the messages of XEP-0353, plain and as carbons
+/*
+ * The messages of XEP-0353, plain and as carbons.
  */
 static void test_jmi(void)
 {
@@ -494,8 +495,8 @@ static bool candidate_taken(const char *attrs)
 	return parse(xml) && jm_ok && jm.content.ice.candidates == 1;
 }
 
-/**
- * test_candidate_rules() - a candidate element the conversion refuses
+/*
+ * A candidate element the conversion refuses.
  */
 static void test_candidate_rules(void)
 {
@@ -540,8 +541,8 @@ static void test_candidate_rules(void)
 			       "type='srflx' rel-addr='10.0.0.1' rel-port='x'"));
 }
 
-/**
- * test_fit() - a value longer than its field refuses the element
+/*
+ * A value longer than its field refuses the element.
  */
 static void test_fit(void)
 {

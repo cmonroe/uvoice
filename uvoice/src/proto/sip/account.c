@@ -2907,7 +2907,7 @@ static uint32_t acct_listen_take(struct account *a, int family)
 /*
  * A listener that did not open is not always a failure: a TLS line with no
  * server context is client only, and it registers and takes no inbound
- * connection until the bundle lands (shared/tls.h).
+ * connection until the bundle arrives (shared/tls.h).
  */
 static bool acct_listen_optional(const struct account *a)
 {

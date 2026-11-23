@@ -8,7 +8,7 @@
  * Jingle call legs (src/proto/xmpp/call.c): the XMPP side of one call of a
  * line, beside the SIP legs of sip/call.c. The line shell drives both
  * through the same commands and hears both through the same struct call_cb,
- * so the desk machine never learns which protocol carries a call.
+ * so the desk machine never learns which protocol runs a call.
  *
  * One leg is one Jingle session (XEP-0166) with one audio content
  * (XEP-0167) over ICE-UDP (XEP-0176) and DTLS-SRTP (XEP-0320). Every call
@@ -59,7 +59,7 @@
 #define XCALL_SETUP_MS		20000U
 /* How long an offered call may ring here before the caller is told. */
 #define XCALL_OFFER_MS		120000U
-/* How long the transport may take to carry media once both sides spoke. */
+/* How long the transport may take to pass media once both sides spoke. */
 #define XCALL_ICE_MS		30000U
 /* How long a session-terminate is awaited once the peer closed the media. */
 #define XCALL_CLOSE_MS		5000U
@@ -70,7 +70,7 @@ enum xcall_state {
 	XCALL_FREE = 0,
 	XCALL_PROPOSED,		/* outbound, the propose rings the callee */
 	XCALL_OFFERED,		/* inbound, this phone rings */
-	XCALL_PROCEEDED,	/* inbound, proceed sent, the session is owed */
+	XCALL_PROCEEDED,	/* inbound, proceed sent, awaits the initiate */
 	XCALL_INITIATED,	/* outbound, the initiate awaits its accept */
 	XCALL_ACTIVE,
 	XCALL_STATE_MAX,
@@ -88,7 +88,7 @@ typedef void (*xcall_reply_cb)(void *priv, bool ok,
 /*
  * The services of the account layer, per line.
  *
- * ready        whether the stream of the line carries stanzas.
+ * ready        whether the stream of the line exchanges stanzas.
  * send         one stanza on the stream, 0 or a negative errno.
  * iq_send      an iq that awaits its answer through cb, from the full JID
  *              peer alone.
@@ -301,7 +301,7 @@ bool xcall_dtmf(unsigned int line, unsigned int slot, char digit,
 		uint16_t duration_ms, bool measured);
 
 /**
- * xcall_jingle_rx() - an iq of type set that may carry a jingle element
+ * xcall_jingle_rx() - an iq of type set that may hold a jingle element
  * @line: the line
  * @iq: the stanza
  *
@@ -310,7 +310,7 @@ bool xcall_dtmf(unsigned int line, unsigned int slot, char digit,
 bool xcall_jingle_rx(unsigned int line, const struct xml_doc *iq);
 
 /**
- * xcall_jmi_rx() - a message that may carry a Jingle Message Initiation
+ * xcall_jmi_rx() - a message that may hold a Jingle Message Initiation
  * @line: the line
  * @message: the stanza
  *

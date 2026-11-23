@@ -10,7 +10,7 @@
  *
  * What it does. It resolves the server, connects, secures the connection
  * with TLS, authenticates with SASL, binds the resource, enables stream
- * management, enables message carbons and then carries stanzas both ways
+ * management, enables message carbons and then passes stanzas both ways
  * until the connection breaks. When it breaks, the stream reconnects on its
  * own after a backoff that doubles up to XMPP_BACKOFF_MAX_MS. The owner
  * starts it once and stops it once.
@@ -181,7 +181,7 @@ struct xmpp_stream_cb {
 /*
  * host       the trace sink and the log, NULL for neither.
  * dns        the shared resolver. Its done callback hands the answers of
- *            queries that carry dns_owner to xmpp_stream_dns_done().
+ *            queries that name dns_owner to xmpp_stream_dns_done().
  * tls        the client context the owner loaded with the trust store and
  *            the verify flag of the account.
  */
@@ -300,7 +300,7 @@ struct xmpp_stream {
 
 	struct xmpp_iq_pending iq[XMPP_IQ_MAX];
 
-	size_t rx_untraced;		/* bytes of the read the trace owes */
+	size_t rx_untraced;		/* bytes of the read not yet traced */
 	size_t tx_len;
 	size_t tx_off;
 	size_t tx_span;			/* the TLS write a retry must repeat */
@@ -408,7 +408,7 @@ int xmpp_stream_send(struct xmpp_stream *xs, const char *text, size_t len);
  * @xs: the stream
  * @text: the serialized iq
  * @len: its length
- * @id: the id the iq carries
+ * @id: the id the iq holds
  * @peer: the full JID that must answer, NULL for the server of the account
  * @cb: runs once with the answer, or with NULL on a timeout or a close
  * @priv: handed to @cb

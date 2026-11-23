@@ -7,7 +7,7 @@
  *
  * Service discovery of the XMPP unit (src/proto/xmpp/disco.c): the
  * disco#info answer of XEP-0030 with the fixed feature set of this phone,
- * and the entity capabilities hash of XEP-0115 that the presence carries,
+ * and the entity capabilities hash of XEP-0115 that the presence includes,
  * so a peer learns the set without a query.
  *
  * The feature set is what the calling clients look for before they offer a

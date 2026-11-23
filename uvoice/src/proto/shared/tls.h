@@ -41,9 +41,9 @@
  * sip_tls_server_ready() reports which mode the load produced.
  *
  * No hostname verification on the SIP path. sip_tls_conn_start() never checks
- * the peer certificate against the name uvoice dialled, not with
+ * the peer certificate against the name uvoice dialed, not with
  * X509_check_host() and not through SSL_set1_host(). This deviates from
- * RFC 5922 section 7.3 on purpose: a carrier whose certificate carries a name
+ * RFC 5922 section 7.3 on purpose: a carrier whose certificate holds a name
  * the SRV chain does not produce would stop registering. cfg
  * tls_server_verification_enabled turns on chain verification alone
  * (SSL_VERIFY_PEER plus the configured ca.crt); the name stays unchecked in
@@ -210,7 +210,7 @@ bool sip_tls_conn_start(struct sip_tls *t, struct sip_tls_conn *c, int fd, bool 
 
 /*
  * sni   the server_name, NULL for none ("Server name indication" above).
- * host  the name the peer certificate must carry when the client context
+ * host  the name the peer certificate must hold when the client context
  *       verifies the chain, NULL leaves the name unchecked.
  * alpn  one application protocol name for the ALPN extension, NULL sends
  *       none.

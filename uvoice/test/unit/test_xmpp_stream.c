@@ -11,7 +11,7 @@
  * IPv4 loopback, accepts the one connection the stream opens and walks a
  * script: each step waits for a substring in what the client sent, answers
  * with a canned text and may switch the connection to TLS or close it. The
- * SASL steps carry the RFC 5802 section 5 exchange, so the client nonce
+ * SASL steps follow the RFC 5802 section 5 exchange, so the client nonce
  * comes from the entropy hook of the stream configuration. The server queues
  * what the client does not take at once and writes it when the socket
  * drains, so no callback runs the loop.
@@ -142,7 +142,7 @@ enum step_action {
 struct step {
 	const char *wait;
 	const char *reply;		/* NULL sends nothing */
-	bool with_id;			/* reply carries %s for the iq id */
+	bool with_id;			/* reply holds %s for the iq id */
 	enum step_action action;
 };
 
@@ -904,7 +904,7 @@ static void on_state(struct xmpp_stream *stream, enum xmpp_stream_state state,
  * @stream: the stream
  * @doc: the stanza
  *
- * Return: true for an iq that carried the test element.
+ * Return: true for an iq that held the test element.
  */
 static bool on_stanza(struct xmpp_stream *stream, const struct xml_doc *doc)
 {
@@ -1122,8 +1122,8 @@ static void trace_take(enum trace_domain dom, const char *msg)
 
 /* ---------------------------------------------------------------- cases */
 
-/**
- * test_full_session() - STARTTLS, SCRAM, bind, sm, carbons, then traffic
+/*
+ * STARTTLS, SCRAM, bind, sm, carbons, then traffic.
  */
 static void test_full_session(void)
 {
@@ -1268,8 +1268,8 @@ static void test_full_session(void)
 	client_end();
 }
 
-/**
- * test_direct_tls_plain() - XEP-0368 with PLAIN and a mandatory session
+/*
+ * XEP-0368 with PLAIN and a mandatory session.
  */
 static void test_direct_tls_plain(void)
 {
@@ -1314,8 +1314,8 @@ static void test_direct_tls_plain(void)
 	client_end();
 }
 
-/**
- * test_refusals() - the server shapes that end an attempt
+/*
+ * The server shapes that end an attempt.
  */
 static void test_refusals(void)
 {
@@ -2165,8 +2165,8 @@ static void test_rx_trace(void)
 	client_end();
 }
 
-/**
- * test_names() - the state words
+/*
+ * The state words.
  */
 static void test_names(void)
 {

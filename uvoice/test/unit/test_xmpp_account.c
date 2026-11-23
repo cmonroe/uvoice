@@ -656,8 +656,8 @@ static struct iq_rec *refresh_waiting(void)
 
 /* ----------------------------------------------------------------- cases */
 
-/**
- * test_relays() - the relays of the server, their credentials and expiry
+/*
+ * The relays of the server, their credentials and expiry.
  */
 static void test_relays(void)
 {
@@ -733,8 +733,8 @@ static void test_relays(void)
 	xmpp_accounts_done();
 }
 
-/**
- * test_refresh() - the layer asks again before the credentials expire
+/*
+ * The layer asks again before the credentials expire.
  */
 static void test_refresh(void)
 {
@@ -1139,8 +1139,8 @@ static void test_expiry_unreadable(void)
 	xmpp_accounts_done();
 }
 
-/**
- * test_generations() - answers of an earlier configuration are dropped
+/*
+ * The layer drops answers of an earlier configuration.
  */
 static void test_generations(void)
 {
@@ -1196,8 +1196,8 @@ static void test_generations(void)
 	xmpp_accounts_done();
 }
 
-/**
- * test_legs_env() - what the layer gives the legs
+/*
+ * The environment that the layer gives the legs.
  */
 static void test_legs_env(void)
 {

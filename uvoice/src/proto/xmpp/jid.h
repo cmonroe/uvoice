@@ -9,7 +9,7 @@
  * is localpart@domainpart/resourcepart with the first and the last part
  * optional. The domainpart is lower-cased here. The localpart and the
  * resourcepart keep their spelling: the servers this phone talks to
- * normalise the localpart before they route, so an exact compare on what
+ * normalize the localpart before they route, so an exact compare on what
  * they deliver is the compare they make.
  */
 #ifndef UVOICE_XMPP_JID_H
