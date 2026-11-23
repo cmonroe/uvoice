@@ -3815,7 +3815,8 @@ void sip_line_event(unsigned int line, const struct proto_line_event *ev)
 	case PROTO_EV_TRANSPORT:
 #ifdef UVOICE_XMPP
 		xcall_transport_event(line, ev->stream, ev->u.transport.what,
-				      ev->u.transport.state);
+				      ev->u.transport.state,
+				      ev->u.transport.gen);
 #endif
 		return;
 	case PROTO_EV_RING_END:

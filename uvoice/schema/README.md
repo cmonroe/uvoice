@@ -187,7 +187,11 @@ absent, so it adds no required key to a capture. Sources:
 **Stub dump.** A stub line entry carries the three loop keys `loop_mode`,
 `loop_peer` and `loop_delay_ms` whatever the mode is, as it carries `conf`. A
 capture of a board that runs no loop test therefore validates with the three
-keys at 0. Sources: `stub_ubus_dump()` in `src/hal/stub/stub.c`.
+keys at 0. In a build with `UVOICE_XMPP`, a stream entry also holds
+`transport`, and an `ice-dtls` stream holds `remote_candidates` and
+`remote_known`. No other stream holds them. Sources: `stub_ubus_dump()` and
+`stream_dump()` in
+`src/hal/stub/stub.c`.
 
 **Call trace reply.** The three methods of `voice.calltrace` answer the
 same reply, so one definition serves them: `$defs/CalltraceStatus`. Their

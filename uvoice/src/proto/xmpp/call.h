@@ -313,9 +313,15 @@ bool xcall_jmi_rx(unsigned int line, const struct xml_doc *message);
  * @stream: the stream
  * @what: the enum hal_transport_ev
  * @state: the enum hal_ice_state of an ICE_STATE record
+ * @gen: the generation of the agent that made the record (hal.h
+ *	 hal_ice_local)
+ *
+ * A record whose generation is not the one the leg read with the local ICE
+ * identity comes from an earlier agent of the stream and changes nothing.
  */
 void xcall_transport_event(unsigned int line, unsigned int stream,
-			   unsigned int what, unsigned int state);
+			   unsigned int what, unsigned int state,
+			   unsigned int gen);
 
 /**
  * xcalls_stream_down() - the stream of a line went

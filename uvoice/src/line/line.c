@@ -4948,12 +4948,14 @@ static void transport_forward(struct line *l, const struct hal_event *ev)
 {
 	struct proto_line_event fwd = { .type = PROTO_EV_TRANSPORT };
 
-	TRACE(TRACE_HAL, "line %u stream %u transport event %u state %u",
-	      l->index, ev->stream, ev->u.transport.what, ev->u.transport.state);
+	TRACE(TRACE_HAL, "line %u stream %u transport event %u state %u gen %u",
+	      l->index, ev->stream, ev->u.transport.what, ev->u.transport.state,
+	      ev->u.transport.gen);
 
 	fwd.stream = ev->stream;
 	fwd.u.transport.what = ev->u.transport.what;
 	fwd.u.transport.state = ev->u.transport.state;
+	fwd.u.transport.gen = ev->u.transport.gen;
 	line_event_forward(l, &fwd);
 }
 

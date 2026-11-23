@@ -102,6 +102,9 @@ struct css_stream {
 	unsigned int line;
 	unsigned int stream;
 	bool remote_known;
+	/* hal_ice_local.gen of uvt. It outlives the transport, so the next
+	 * one of this stream takes the following value. */
+	uint16_t gen;
 #endif
 };
 

@@ -21,11 +21,11 @@ option(UVOICE_PROTO_SIP "SIP signaling" ON)
 option(UVOICE_PROTO_MGCP "MGCP signaling" OFF)
 # XMPP accounts with Jingle calls over ICE and DTLS-SRTP, an opt-in of the SIP
 # unit. It gates the transport ops of the backends, the xmpp unit and their
-# suites, and pulls expat, libjuice and libuvtransport into the image.
+# suites, and pulls expat, libjuice and libuvtransport into the image. The
+# define goes to each target that compiles a source which tests it, the way
+# UVOICE_PROTO_SIP does. Every target that compiles one of those sources gets
+# the same answer, because css_int.h changes struct css_stream with it.
 option(UVOICE_XMPP "XMPP and Jingle calls with ICE and DTLS-SRTP media" OFF)
-if(UVOICE_XMPP)
-	add_definitions(-DUVOICE_XMPP)
-endif()
 # The guard refuses a configure that selects no protocol unit: the image
 # needs at least one of the two options.
 if(NOT UVOICE_PROTO_SIP AND NOT UVOICE_PROTO_MGCP)
@@ -239,6 +239,10 @@ if(UVOICE_PROTO_SIP)
 	target_include_directories(uvoice_proto_sip PRIVATE
 				   ${CMAKE_CURRENT_SOURCE_DIR}
 				   ${UBOX_INCLUDE_DIR} ${UBUS_INCLUDE_DIR})
+	# The line shell and the ops table dispatch to the Jingle legs.
+	if(UVOICE_XMPP)
+		target_compile_definitions(uvoice_proto_sip PRIVATE UVOICE_XMPP)
+	endif()
 
 	list(APPEND UVOICE_PROTO_OBJECTS uvoice_sdp uvoice_sip uvoice_sip_txn
 	     uvoice_sip_udp uvoice_sip_stream uvoice_proto_sip)
@@ -287,15 +291,18 @@ if(UVOICE_PROTO_MGCP)
 endif()
 # The XMPP half of the SIP unit, src/proto/xmpp, in two object sets. It
 # exists only with UVOICE_XMPP, and it rides the SIP unit: the line shell of
-# proto/sip hosts the Jingle legs beside the SIP legs.
+# proto/sip hosts the Jingle legs beside the SIP legs. No source of either set
+# tests UVOICE_XMPP, so neither set takes the define.
 #
 # uvoice_xmpp_core: the stream parser and writer over expat, the SASL client
 # over OpenSSL, service discovery, the JID helpers, the Jingle session, the
-# RTP description and JMI. Pure: no socket, no uloop, so a suite drives each
-# of them without a daemon.
+# RTP description, JMI and the Jingle call legs. No socket and no uloop: the
+# legs reach the clock, the media and the stream through the environment
+# that their caller gives, so a suite drives each of them without a daemon.
 #
-# uvoice_xmpp: the c2s stream, the account and the Jingle legs. Only uvoiced
-# links it.
+# uvoice_xmpp: the c2s stream and the account, which own a socket and uloop
+# handles. uvoiced links it, and so do the suites of the stream and of the
+# line shell.
 if(UVOICE_XMPP AND NOT UVOICE_PROTO_SIP)
 	message(FATAL_ERROR "UVOICE_XMPP needs UVOICE_PROTO_SIP")
 endif()
@@ -442,6 +449,10 @@ if(UVOICE_PROTO_SIP)
 endif()
 if(UVOICE_PROTO_MGCP)
 	target_compile_definitions(uvoice_core PRIVATE UVOICE_PROTO_MGCP)
+endif()
+# The stub and the css backend carry the transport ops of an ICE_DTLS stream.
+if(UVOICE_XMPP)
+	target_compile_definitions(uvoice_core PRIVATE UVOICE_XMPP)
 endif()
 # the link dependencies of the backend ride the object library
 target_link_libraries(uvoice_core PRIVATE ${HAL_LIBRARIES})
@@ -783,7 +794,11 @@ if(UVOICE_TESTS)
 				      ${UBOX_LIBRARY})
 		# The shell dispatches to the Jingle legs on an xmpp line, so
 		# the XMPP unit joins with the TLS wrapper its stream reads.
+		# The wrap lets the suite read what the shell hands the legs.
 		if(UVOICE_XMPP)
+			target_compile_definitions(test_line PRIVATE UVOICE_XMPP)
+			target_link_options(test_line PRIVATE
+					    -Wl,--wrap=xcall_transport_event)
 			target_sources(test_line PRIVATE proto/shared/tls.c)
 			target_link_libraries(test_line uvoice_xmpp
 					      uvoice_xmpp_core OpenSSL::SSL
@@ -965,6 +980,9 @@ if(UVOICE_TESTS)
 				   ${CMAKE_CURRENT_SOURCE_DIR}
 				   ${UBOX_INCLUDE_DIR} ${UBUS_INCLUDE_DIR})
 	target_compile_definitions(test_hal_stub PRIVATE UVOICE_HAL_STUB)
+	if(UVOICE_XMPP)
+		target_compile_definitions(test_hal_stub PRIVATE UVOICE_XMPP)
+	endif()
 	target_link_libraries(test_hal_stub ${UBOX_LIBRARY} ${UBUS_LIBRARY})
 	add_test(NAME test_hal_stub COMMAND test_hal_stub)
 
@@ -989,6 +1007,24 @@ if(UVOICE_TESTS)
 		target_link_libraries(test_hal_css ${UBOX_LIBRARY}
 				      PkgConfig::CSS_TEST_SRTP2 PkgConfig::CSS_TEST_ALSA
 				      m pthread)
+		# The ICE_DTLS half of the backend links libuvtransport. A host
+		# without it builds the suite as a build without UVOICE_XMPP
+		# does. The suite wraps uvt_create() to read the configuration
+		# that the backend hands to the library.
+		if(UVOICE_XMPP)
+			pkg_check_modules(CSS_TEST_UVTRANSPORT IMPORTED_TARGET
+					  uvtransport)
+		endif()
+		if(UVOICE_XMPP AND CSS_TEST_UVTRANSPORT_FOUND)
+			target_compile_definitions(test_hal_css PRIVATE UVOICE_XMPP)
+			target_link_libraries(test_hal_css
+					      PkgConfig::CSS_TEST_UVTRANSPORT)
+			target_link_options(test_hal_css PRIVATE
+					    -Wl,--wrap=uvt_create)
+		elseif(UVOICE_XMPP)
+			message(STATUS "test_hal_css builds without its ICE_DTLS "
+				"cases: uvtransport not found")
+		endif()
 		add_test(NAME test_hal_css COMMAND test_hal_css)
 	else()
 		message(STATUS "test_hal_css skipped: needs the libuvsrtp source, "

@@ -46,6 +46,7 @@ static const struct {
 	{ HAL_FEAT_LOOP, "loop" },
 	{ HAL_FEAT_SLIC_DUMP, "slic_dump" },
 	{ HAL_FEAT_DESK, "desk" },
+	{ HAL_FEAT_ICE_DTLS, "ice_dtls" },
 };
 
 static const char * const codec_names[] = {

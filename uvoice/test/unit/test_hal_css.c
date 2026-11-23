@@ -25,6 +25,9 @@
 #include <unistd.h>
 
 #include <libubox/uloop.h>
+#ifdef UVOICE_XMPP
+#include <uvtransport/uvtransport.h>
+#endif
 
 #include "hal/hal.h"
 #include "hal/css/css_int.h"
@@ -130,15 +133,18 @@ static bool ev_read(struct probe *p, struct hal_event *out)
 
 static void test_caps(void)
 {
-	const uint32_t want = HAL_FEAT_DESK | HAL_FEAT_CONF | HAL_FEAT_SRTP |
-			      HAL_FEAT_WIDEBAND | HAL_FEAT_G729 | HAL_FEAT_G726 |
-			      HAL_FEAT_IPV6_MEDIA | HAL_FEAT_RTCP_ADDR;
+	uint32_t want = HAL_FEAT_DESK | HAL_FEAT_CONF | HAL_FEAT_SRTP |
+			HAL_FEAT_WIDEBAND | HAL_FEAT_G729 | HAL_FEAT_G726 |
+			HAL_FEAT_IPV6_MEDIA | HAL_FEAT_RTCP_ADDR;
 	const uint32_t codecs = (1u << HAL_CODEC_PCMU) | (1u << HAL_CODEC_PCMA) |
 				(1u << HAL_CODEC_G722) | (1u << HAL_CODEC_G729) |
 				(1u << HAL_CODEC_G726_32);
 	const struct hal_cap *cap;
 	struct probe p;
 
+#ifdef UVOICE_XMPP
+	want |= HAL_FEAT_ICE_DTLS;
+#endif
 	CASE("open attaches and publishes the desk capability");
 	CHECK(probe_open(&p));
 	if (!p.h)
@@ -501,6 +507,144 @@ static void test_media_srtp(void)
 	probe_close(&p);
 }
 
+#ifdef UVOICE_XMPP
+/* --- the ICE_DTLS transport, against the fake device and libuvtransport --- */
+
+/*
+ * The configuration of the last transport the backend made. The wrap calls
+ * the library, so the transport is real, and the suite can call on_event as
+ * the library thread does.
+ */
+struct uvt_stream *__real_uvt_create(const struct uvt_cfg *cfg);
+struct uvt_stream *__wrap_uvt_create(const struct uvt_cfg *cfg);
+
+static struct uvt_cfg uvt_cfg_last;
+static unsigned int uvt_creates;
+
+struct uvt_stream *__wrap_uvt_create(const struct uvt_cfg *cfg)
+{
+	uvt_cfg_last = *cfg;
+	uvt_creates++;
+
+	return __real_uvt_create(cfg);
+}
+
+static void ev_ready(struct uloop_fd *fd, unsigned int events)
+{
+	uloop_end();
+}
+
+/*
+ * The generation of the transport record of this kind that reaches the core
+ * end of the event socket. The relay forwards each record on the loop, so
+ * the loop runs until one arrives, to a deadline of one second.
+ */
+static bool ev_transport_wait(struct probe *p, uint8_t what, uint16_t *gen)
+{
+	struct uloop_fd ufd = { .fd = p->rx_fd, .cb = ev_ready };
+	struct hal_event ev;
+	unsigned int round;
+
+	uloop_fd_add(&ufd, ULOOP_READ);
+	for (round = 0; round < 10; round++) {
+		while (ev_read(p, &ev)) {
+			if (ev.type != HAL_EVENT_TRANSPORT ||
+			    ev.u.transport.what != what)
+				continue;
+			*gen = ev.u.transport.gen;
+			uloop_fd_delete(&ufd);
+			return true;
+		}
+		uloop_pump(100);
+	}
+	uloop_fd_delete(&ufd);
+
+	return false;
+}
+
+static void tm_ice_media(struct hal_media *m)
+{
+	tm_media(m, HAL_CODEC_PCMU, HAL_MEDIA_SENDRECV);
+	m->remote.port = 0;
+	m->transport.kind = HAL_TRANSPORT_ICE_DTLS;
+	m->transport.ice_role = HAL_ICE_CONTROLLING;
+	m->transport.dtls_setup = HAL_DTLS_ACTPASS;
+}
+
+static void test_ice_dscp(void)
+{
+	struct hal_media m;
+	struct probe p;
+
+	CASE("an ice-dtls stream hands its two DSCP code points to the "
+	     "transport unchanged");
+	if (!media_probe(&p))
+		return;
+	tm_ice_media(&m);
+	m.rtp_dscp = 46;
+	m.rtcp_dscp = 26;
+	uvt_creates = 0;
+	CHECK(hal_backend_ops.stream_config_set(p.h, 0, 0, &m) == HAL_OK);
+	CHECK_UINT(uvt_creates, 1);
+	CHECK_UINT(uvt_cfg_last.rtp_dscp, 46);
+	CHECK_UINT(uvt_cfg_last.rtcp_dscp, 26);
+	probe_close(&p);
+}
+
+/*
+ * A record that the transport of one call queued can reach the core after
+ * the stream took the transport of the next call. The generation in the
+ * local identity and in each record tells the two apart.
+ */
+static void test_ice_gen(void)
+{
+	struct hal_ice_local local;
+	struct hal_media m;
+	uint16_t first, gen = 0;
+	struct probe p;
+
+	CASE("the first transport of a stream names a generation other "
+	     "than 0");
+	if (!media_probe(&p))
+		return;
+	tm_ice_media(&m);
+	uvt_creates = 0;
+	CHECK(hal_backend_ops.stream_config_set(p.h, 0, 0, &m) == HAL_OK);
+	CHECK(hal_backend_ops.stream_ice_local_get(p.h, 0, 0, &local) ==
+	      HAL_OK);
+	first = local.gen;
+	CHECK(first != 0);
+
+	CASE("a record of the transport carries its generation");
+	CHECK(uvt_cfg_last.on_event != NULL);
+	if (uvt_cfg_last.on_event)
+		uvt_cfg_last.on_event(uvt_cfg_last.user, UVT_EV_DTLS_CLOSED, 0);
+	CHECK(ev_transport_wait(&p, HAL_TRANSPORT_EV_DTLS_CLOSED, &gen));
+	CHECK_UINT(gen, first);
+
+	CASE("a new description of the transport keeps its generation");
+	m.direction = HAL_MEDIA_SENDONLY;
+	CHECK(hal_backend_ops.stream_config_set(p.h, 0, 0, &m) == HAL_OK);
+	CHECK_UINT(uvt_creates, 1);
+	CHECK(hal_backend_ops.stream_ice_local_get(p.h, 0, 0, &local) ==
+	      HAL_OK);
+	CHECK_UINT(local.gen, first);
+
+	CASE("the transport after a stop takes the next generation");
+	CHECK(hal_backend_ops.stream_stop(p.h, 0, 0) == HAL_OK);
+	CHECK(hal_backend_ops.stream_config_set(p.h, 0, 0, &m) == HAL_OK);
+	CHECK_UINT(uvt_creates, 2);
+	CHECK(hal_backend_ops.stream_ice_local_get(p.h, 0, 0, &local) ==
+	      HAL_OK);
+	CHECK_UINT(local.gen, (uint16_t)(first + 1));
+	if (uvt_cfg_last.on_event)
+		uvt_cfg_last.on_event(uvt_cfg_last.user, UVT_EV_DTLS_FAIL, 0);
+	CHECK(ev_transport_wait(&p, HAL_TRANSPORT_EV_DTLS_FAIL, &gen));
+	CHECK_UINT(gen, (uint16_t)(first + 1));
+	probe_close(&p);
+}
+#endif
+
 /* --- the packet thread, against a socketpair device and a loopback peer ---- */
 
 struct thread_fake {
@@ -681,6 +825,10 @@ int main(void)
 	test_media_stats();
 	test_media_refusals();
 	test_media_srtp();
+#ifdef UVOICE_XMPP
+	test_ice_dscp();
+	test_ice_gen();
+#endif
 	test_pkt_forward();
 	test_jitter();
 

@@ -93,6 +93,7 @@ struct xcall {
 	bool dtls_up;
 	bool dtls_closed;
 	bool relay;
+	uint16_t transport_gen;		/* hal_ice_local.gen of the stream */
 	uint64_t answered_ms;
 	uint64_t cleared_ms;
 	struct proto_timer guard;
@@ -851,6 +852,7 @@ static bool ice_local_take(struct xcall *leg)
 	memcpy(leg->local.fp, local.fp, sizeof(leg->local.fp));
 	leg->local.fp_present = local.fp_hash == HAL_FP_SHA256;
 	leg->local.setup = setup_to_jingle(setup_of_remote(leg));
+	leg->transport_gen = local.gen;
 
 	return leg->local.ufrag[0] && leg->local.fp_present;
 }
@@ -1493,11 +1495,12 @@ bool xcall_jmi_rx(unsigned int line, const struct xml_doc *message)
 /* ------------------------------------------------------------ transport */
 
 void xcall_transport_event(unsigned int line, unsigned int stream,
-			   unsigned int what, unsigned int state)
+			   unsigned int what, unsigned int state,
+			   unsigned int gen)
 {
 	struct xcall *leg = leg_get(line, stream);
 
-	if (!leg)
+	if (!leg || gen != leg->transport_gen)
 		return;
 
 	switch (what) {

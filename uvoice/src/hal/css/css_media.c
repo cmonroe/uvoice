@@ -382,6 +382,7 @@ static void css_uvt_event(void *user, enum uvt_event event, int arg)
 
 	ev.line = (uint16_t)stream->line;
 	ev.stream = (uint16_t)stream->stream;
+	ev.u.transport.gen = stream->gen;
 	switch (event) {
 	case UVT_EV_CANDIDATE:
 		ev.u.transport.what = HAL_TRANSPORT_EV_CANDIDATE;
@@ -455,6 +456,8 @@ static void css_uvt_cfg_fill(struct css_stream *stream,
 	cfg->turns = i;
 	cfg->port_min = transport->port_min;
 	cfg->port_max = transport->port_max;
+	cfg->rtp_dscp = media->rtp_dscp;
+	cfg->rtcp_dscp = media->rtcp_dscp;
 	if (inet_ntop(addr_family(&media->local), media->local.addr, addr,
 		      sizeof(addr)) &&
 	    strcmp(addr, "0.0.0.0") && strcmp(addr, "::"))
@@ -537,6 +540,10 @@ static enum hal_status css_ice_config_set(struct hal *hal,
 	}
 
 	if (!stream->uvt) {
+		/* uvt_create() can run the event callback before it returns,
+		 * so the generation of the new transport is set first. */
+		if (!++stream->gen)
+			++stream->gen;
 		css_uvt_cfg_fill(stream, media, &transport);
 		stream->uvt = uvt_create(&transport);
 		if (!stream->uvt) {
@@ -616,6 +623,7 @@ enum hal_status css_stream_ice_local_get(struct hal *h, unsigned int line,
 	    uvt_fingerprint_get(out->fp))
 		return HAL_FATAL;
 	out->fp_hash = HAL_FP_SHA256;
+	out->gen = record->gen;
 
 	return HAL_OK;
 }

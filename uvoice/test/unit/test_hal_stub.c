@@ -1179,6 +1179,24 @@ static void test_ring_cap(void)
 }
 
 #ifdef UVOICE_XMPP
+/* The generation of the last transport record waiting on the core end, and
+ * whether one waited. The drain reads every record. */
+static bool ev_transport_gen(struct probe *p, uint16_t *gen)
+{
+	struct hal_event ev;
+	bool found = false;
+
+	while (recv(p->rx_fd, &ev, sizeof(ev), MSG_DONTWAIT) ==
+	       (ssize_t)sizeof(ev)) {
+		if (ev.type != HAL_EVENT_TRANSPORT)
+			continue;
+		*gen = ev.u.transport.gen;
+		found = true;
+	}
+
+	return found;
+}
+
 /**
  * test_transport() - the transport ops of an ICE_DTLS stream (hal.h)
  *
@@ -1266,10 +1284,11 @@ static void test_transport(void)
 	      HAL_TRANSIENT);
 
 	CASE("a scripted move goes out as a transport record");
-	CHECK(stub_transport_event(0, 0, HAL_TRANSPORT_EV_DTLS_UP, 0));
-	CHECK(stub_transport_event(0, 0, HAL_TRANSPORT_EV_DTLS_CLOSED, 0));
-	CHECK(!stub_transport_event(0, 0, HAL_TRANSPORT_EV_DTLS_CLOSED + 1, 0));
-	CHECK(!stub_transport_event(0, 0, 99, 0));
+	CHECK(stub_transport_event(0, 0, HAL_TRANSPORT_EV_DTLS_UP, 0, -1));
+	CHECK(stub_transport_event(0, 0, HAL_TRANSPORT_EV_DTLS_CLOSED, 0, -1));
+	CHECK(!stub_transport_event(0, 0, HAL_TRANSPORT_EV_DTLS_CLOSED + 1, 0,
+				    -1));
+	CHECK(!stub_transport_event(0, 0, 99, 0, -1));
 	CHECK(ev_drain_has(&probe, HAL_EVENT_TRANSPORT));
 
 	CASE("the stop empties the ring");
@@ -1278,6 +1297,100 @@ static void test_transport(void)
 	CHECK(hal_backend_ops.stream_candidate_next(hal, 0, 0, line,
 						    sizeof(line)) ==
 	      HAL_TRANSIENT);
+
+	probe_close(&probe);
+}
+
+/* One ICE_DTLS description of a stream, and the generation the backend names
+ * with its local identity afterwards, 0 when either op refused. */
+static uint16_t ice_gen_program(struct hal *hal, unsigned int stream,
+				const struct hal_media *media)
+{
+	struct hal_ice_local local;
+
+	if (hal_backend_ops.stream_config_set(hal, 0, stream, media) != HAL_OK ||
+	    hal_backend_ops.stream_ice_local_get(hal, 0, stream, &local) !=
+	    HAL_OK)
+		return 0;
+
+	return local.gen;
+}
+
+/**
+ * test_transport_gen() - the generation of the ICE agent of a stream
+ *
+ * A record that waits in the event socket can reach the core after its
+ * stream took a new agent for the next call. The generation in the local
+ * identity and in each record tells the two agents apart. The script can
+ * name an earlier generation, so a suite of the core can inject such a
+ * record.
+ */
+static void test_transport_gen(void)
+{
+	static const char *const host =
+		"a=candidate:1 1 UDP 2130706431 10.0.0.2 6000 typ host";
+	struct hal_channel_cfg ccfg;
+	struct hal_media media;
+	struct probe probe;
+	uint16_t first, gen = 0;
+	struct hal *hal;
+
+	if (!probe_open(&probe)) {
+		CASE("the generation case needs an open backend");
+		CHECK(false);
+		return;
+	}
+	hal = probe.h;
+	chan_build(&ccfg, true, true);
+	CHECK(hal_backend_ops.channel_config_set(hal, 0, &ccfg) == HAL_OK);
+	media_build(&media, HAL_CODEC_PCMU, HAL_PASSTHROUGH_OFF,
+		    HAL_JB_ADAPTIVE);
+	media.transport.kind = HAL_TRANSPORT_ICE_DTLS;
+	media.remote.port = 0;
+
+	CASE("the first agent of a stream names a generation other than 0");
+	first = ice_gen_program(hal, 0, &media);
+	CHECK(first != 0);
+
+	CASE("each transport record of the agent carries its generation");
+	CHECK(stub_transport_candidate(0, 0, host));
+	CHECK(ev_transport_gen(&probe, &gen));
+	CHECK_UINT(gen, first);
+	CHECK(stub_transport_event(0, 0, HAL_TRANSPORT_EV_DTLS_UP, 0, -1));
+	CHECK(ev_transport_gen(&probe, &gen));
+	CHECK_UINT(gen, first);
+
+	CASE("a new description of the running agent keeps its generation");
+	CHECK(hal_backend_ops.stream_start(hal, 0, 0) == HAL_OK);
+	media.tx_silence = true;
+	CHECK_UINT(ice_gen_program(hal, 0, &media), first);
+	media.tx_silence = false;
+
+	CASE("the agent after a stop takes the next generation");
+	CHECK(hal_backend_ops.stream_stop(hal, 0, 0) == HAL_OK);
+	CHECK_UINT(ice_gen_program(hal, 0, &media), (uint16_t)(first + 1));
+	CHECK(stub_transport_event(0, 0, HAL_TRANSPORT_EV_DTLS_FAIL, 0, -1));
+	CHECK(ev_transport_gen(&probe, &gen));
+	CHECK_UINT(gen, (uint16_t)(first + 1));
+
+	CASE("a script can name the generation of the agent before");
+	CHECK(stub_transport_event(0, 0, HAL_TRANSPORT_EV_DTLS_FAIL, 0, first));
+	CHECK(ev_transport_gen(&probe, &gen));
+	CHECK_UINT(gen, first);
+	CHECK(!stub_transport_event(0, 0, HAL_TRANSPORT_EV_DTLS_FAIL, 0,
+				    UINT16_MAX + 1));
+	CHECK(!stub_transport_event(0, 0, HAL_TRANSPORT_EV_DTLS_FAIL, 0, -2));
+
+	CASE("a udp description ends the agent, the next one counts on");
+	media.transport.kind = HAL_TRANSPORT_UDP;
+	media.remote.port = 40002;
+	CHECK(hal_backend_ops.stream_config_set(hal, 0, 0, &media) == HAL_OK);
+	media.transport.kind = HAL_TRANSPORT_ICE_DTLS;
+	media.remote.port = 0;
+	CHECK_UINT(ice_gen_program(hal, 0, &media), (uint16_t)(first + 2));
+
+	CASE("each stream counts the generations of its own agents");
+	CHECK_UINT(ice_gen_program(hal, 1, &media), first);
 
 	probe_close(&probe);
 }
@@ -1303,6 +1416,7 @@ int main(void)
 	test_ring_cap();
 #ifdef UVOICE_XMPP
 	test_transport();
+	test_transport_gen();
 #endif
 
 	uloop_done();

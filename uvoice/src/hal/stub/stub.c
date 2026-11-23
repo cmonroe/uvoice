@@ -70,6 +70,9 @@ struct stub_stream {
 	unsigned int cand_count;
 	unsigned int remote_candidates;
 	char remote_last[HAL_CANDIDATE_MAX];
+	/* hal_ice_local.gen of the scripted agent. It outlives the stop, so
+	 * the next agent of this stream takes the following value. */
+	uint16_t gen;
 #endif
 };
 
@@ -679,6 +682,23 @@ static void stub_stream_configured_mark(struct hal *h, unsigned int line,
 		h->line[line].lec_made = true;
 }
 
+#ifdef UVOICE_XMPP
+/* An ICE_DTLS description of a stream that holds no ICE agent makes one, as
+ * the first description does in a backend that runs ICE. */
+static void stub_ice_gen_take(struct stub_stream *s,
+			      const struct hal_media *media)
+{
+	if (media->transport.kind != HAL_TRANSPORT_ICE_DTLS)
+		return;
+	if (s->configured &&
+	    s->media.transport.kind == HAL_TRANSPORT_ICE_DTLS)
+		return;
+
+	if (!++s->gen)
+		++s->gen;
+}
+#endif
+
 static enum hal_status stub_stream_config_set(struct hal *h, unsigned int line,
 					      unsigned int stream,
 					      const struct hal_media *media)
@@ -697,6 +717,9 @@ static enum hal_status stub_stream_config_set(struct hal *h, unsigned int line,
 	if (!s)
 		return HAL_FATAL;
 
+#ifdef UVOICE_XMPP
+	stub_ice_gen_take(s, media);
+#endif
 	s->media = *media;
 	/* The description carries the kind of every later programming (hal.h
 	 * fax_profile_apply), so it replaces what the profile asked for. */
@@ -1724,6 +1747,7 @@ static enum hal_status stub_stream_ice_local_get(struct hal *hal,
 	str_copy(out->pwd, sizeof(out->pwd), STUB_ICE_PWD);
 	out->fp_hash = HAL_FP_SHA256;
 	stub_fingerprint_fill(out->fp);
+	out->gen = record->gen;
 
 	return HAL_OK;
 }
@@ -1754,10 +1778,11 @@ stub_transport_fingerprint_get(struct hal *hal, struct hal_fingerprint *out)
  * @stream: the stream index
  * @what: the enum hal_transport_ev
  * @state: the enum hal_ice_state of an ICE_STATE record, else 0
+ * @gen: the generation the record names
  */
 static void stub_transport_event_push(struct hal *hal, unsigned int line,
 				      unsigned int stream, uint8_t what,
-				      uint8_t state)
+				      uint8_t state, uint16_t gen)
 {
 	struct hal_event ev = { .type = HAL_EVENT_TRANSPORT };
 
@@ -1765,6 +1790,7 @@ static void stub_transport_event_push(struct hal *hal, unsigned int line,
 	ev.stream = (uint16_t)stream;
 	ev.u.transport.what = what;
 	ev.u.transport.state = state;
+	ev.u.transport.gen = gen;
 	event_push(hal, &ev);
 }
 
@@ -1794,7 +1820,7 @@ bool stub_transport_candidate(unsigned int line, unsigned int stream,
 	str_copy(record->cand[slot], sizeof(record->cand[slot]), sdp);
 	record->cand_count++;
 	stub_transport_event_push(stub_dev, line, stream,
-				  HAL_TRANSPORT_EV_CANDIDATE, 0);
+				  HAL_TRANSPORT_EV_CANDIDATE, 0, record->gen);
 
 	return true;
 }
@@ -1805,22 +1831,29 @@ bool stub_transport_candidate(unsigned int line, unsigned int stream,
  * @stream: the stream index
  * @what: the enum hal_transport_ev
  * @state: the enum hal_ice_state of an ICE_STATE record, else 0
+ * @gen: the generation the record names, or -1 for the generation of the
+ *	 agent the stream holds
+ *
+ * A generation of an earlier agent scripts a record that was still queued
+ * when its stream moved on.
  *
  * Return: true when the record went out.
  */
 bool stub_transport_event(unsigned int line, unsigned int stream,
-			  unsigned int what, unsigned int state)
+			  unsigned int what, unsigned int state, int gen)
 {
 	struct stub_stream *record = NULL;
 	bool ice = false;
 
 	if (stub_dev)
 		record = stub_ice_stream_get(stub_dev, line, stream, &ice);
-	if (!record || !ice || what > HAL_TRANSPORT_EV_DTLS_CLOSED)
+	if (!record || !ice || what > HAL_TRANSPORT_EV_DTLS_CLOSED ||
+	    gen < -1 || gen > UINT16_MAX)
 		return false;
 
 	stub_transport_event_push(stub_dev, line, stream, (uint8_t)what,
-				  (uint8_t)state);
+				  (uint8_t)state,
+				  gen < 0 ? record->gen : (uint16_t)gen);
 
 	return true;
 }
@@ -2833,6 +2866,7 @@ enum {
 	STUB_TRANSPORT_CANDIDATE,
 	STUB_TRANSPORT_WHAT,
 	STUB_TRANSPORT_STATE,
+	STUB_TRANSPORT_GEN,
 	__STUB_TRANSPORT_MAX,
 };
 
@@ -2842,6 +2876,7 @@ static const struct blobmsg_policy stub_transport_policy[] = {
 	[STUB_TRANSPORT_CANDIDATE] = { "candidate", BLOBMSG_TYPE_STRING },
 	[STUB_TRANSPORT_WHAT] = { "what", BLOBMSG_TYPE_INT32 },
 	[STUB_TRANSPORT_STATE] = { "state", BLOBMSG_TYPE_INT32 },
+	[STUB_TRANSPORT_GEN] = { "gen", BLOBMSG_TYPE_INT32 },
 };
 
 /**
@@ -2850,10 +2885,13 @@ static const struct blobmsg_policy stub_transport_policy[] = {
  * @obj: the voice.stub object
  * @req: the request
  * @method: the verb name
- * @msg: the arguments: line, stream, then candidate or what with state
+ * @msg: the arguments: line, stream, then candidate or what with state and
+ *	 gen
  *
  * A candidate scripts one local candidate with its CANDIDATE record. A what
  * word emits that transport record with its state. A UDP stream refuses both.
+ * gen names the generation of the record, by default the one of the agent
+ * that the stream holds.
  *
  * Return: 0, or a ubus status.
  */
@@ -2885,7 +2923,9 @@ static int stub_ubus_transport(struct ubus_context *ctx,
 		ok = stub_transport_event(line, stream,
 			blobmsg_get_u32(tb[STUB_TRANSPORT_WHAT]),
 			tb[STUB_TRANSPORT_STATE] ?
-			blobmsg_get_u32(tb[STUB_TRANSPORT_STATE]) : 0);
+			blobmsg_get_u32(tb[STUB_TRANSPORT_STATE]) : 0,
+			tb[STUB_TRANSPORT_GEN] ?
+			(int)blobmsg_get_u32(tb[STUB_TRANSPORT_GEN]) : -1);
 	else
 		return UBUS_STATUS_INVALID_ARGUMENT;
 

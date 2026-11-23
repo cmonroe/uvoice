@@ -18787,6 +18787,59 @@ static void t_proto_streams(void)
 	blob_buf_free(&args);
 }
 
+#ifdef UVOICE_XMPP
+void __real_xcall_transport_event(unsigned int line, unsigned int stream,
+				  unsigned int what, unsigned int state,
+				  unsigned int gen);
+void __wrap_xcall_transport_event(unsigned int line, unsigned int stream,
+				  unsigned int what, unsigned int state,
+				  unsigned int gen);
+
+static struct {
+	unsigned int count;
+	unsigned int line, stream, what, state, gen;
+} xcall_transport_last;
+
+void __wrap_xcall_transport_event(unsigned int line, unsigned int stream,
+				  unsigned int what, unsigned int state,
+				  unsigned int gen)
+{
+	xcall_transport_last.count++;
+	xcall_transport_last.line = line;
+	xcall_transport_last.stream = stream;
+	xcall_transport_last.what = what;
+	xcall_transport_last.state = state;
+	xcall_transport_last.gen = gen;
+	__real_xcall_transport_event(line, stream, what, state, gen);
+}
+
+static void t_transport_forward(void)
+{
+	struct hal_event ev = {
+		.type = HAL_EVENT_TRANSPORT,
+		.line = 1,
+		.stream = 1,
+	};
+
+	cfg_default();
+	fixture_start();
+	region_ready();
+
+	CASE("a transport record reaches the Jingle legs with its generation");
+	ev.u.transport.what = HAL_TRANSPORT_EV_ICE_STATE;
+	ev.u.transport.state = HAL_ICE_FAILED;
+	ev.u.transport.gen = 0x1234;
+	memset(&xcall_transport_last, 0, sizeof(xcall_transport_last));
+	line_hal_event(&ev);
+	CHECK_UINT(xcall_transport_last.count, 1);
+	CHECK_UINT(xcall_transport_last.line, 1);
+	CHECK_UINT(xcall_transport_last.stream, 1);
+	CHECK_UINT(xcall_transport_last.what, HAL_TRANSPORT_EV_ICE_STATE);
+	CHECK_UINT(xcall_transport_last.state, HAL_ICE_FAILED);
+	CHECK_UINT(xcall_transport_last.gen, 0x1234);
+}
+#endif
+
 /* Whether both lines of the fixture read out of service. */
 static bool lines_both_oos(void)
 {
@@ -19023,6 +19076,9 @@ int main(void)
 	t_proto_service();
 	t_proto_staging();
 	t_proto_streams();
+#ifdef UVOICE_XMPP
+	t_transport_forward();
+#endif
 	t_proto_null();
 	t_proto_host();
 	t_proto_oos();

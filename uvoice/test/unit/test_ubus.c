@@ -1453,7 +1453,7 @@ static void test_hal_feature_names(void)
 	field = nested_field_get(field_get(reply, "hal", BLOBMSG_TYPE_TABLE),
 				 "features", BLOBMSG_TYPE_ARRAY);
 	CHECK(field != NULL);
-	CHECK_UINT(array_len(field), 21);
+	CHECK_UINT(array_len(field), 22);
 	CHECK(array_has_string(field, "g729"));
 	CHECK(array_has_string(field, "g726"));
 	CHECK(array_has_string(field, "t38"));
@@ -1507,6 +1507,12 @@ static void test_hal_feature_names(void)
 	CASE("voice status names the desk capability");
 	CHECK(array_has_string(field, "desk"));
 
+	/* the bit a Jingle call needs for its media; without the word an
+	 * operator cannot tell a backend that carries no ICE agent from a
+	 * call that failed */
+	CASE("voice status names the ICE and DTLS-SRTP transport capability");
+	CHECK(array_has_string(field, "ice_dtls"));
+
 	/* it is a bit of its own: a board with Annex A alone names g729 and
 	 * not g729b, which is what makes the word worth reading */
 	CASE("and it leaves with its own bit, not with the G.729 one");
@@ -1539,6 +1545,16 @@ static void test_hal_feature_names(void)
 	CHECK(field != NULL);
 	CHECK_UINT(array_len(field), 1);
 	CHECK(array_has_string(field, "slic_dump"));
+
+	CASE("the ICE and DTLS-SRTP word leaves with its own bit");
+	fake_cap.features = HAL_FEAT_ICE_DTLS;
+	CHECK_UINT(voice_status(&request_context, NULL, &request, "status",
+				NULL), 0);
+	field = nested_field_get(field_get(reply, "hal", BLOBMSG_TYPE_TABLE),
+				 "features", BLOBMSG_TYPE_ARRAY);
+	CHECK(field != NULL);
+	CHECK_UINT(array_len(field), 1);
+	CHECK(array_has_string(field, "ice_dtls"));
 
 	fake_cap.features = 0;
 }

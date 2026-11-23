@@ -1841,6 +1841,29 @@ schema_mutant_check 'schema/a loop test table without its mode is refused' \
 looptest_stub=$(ubus -t 5 call voice.stub dump 2>/dev/null |
 	jq '{object: "voice.stub", method: "dump", reply: .}')
 schema_valid_check 'schema/an armed stub dump validates' "$looptest_stub"
+
+# The remote ICE fields of a stream row arrive with an ice-dtls transport
+# alone, both of them, and in no other row.
+schema_mutant_check \
+	'schema/a stream row that is not ice-dtls with remote ICE fields is refused' \
+	"$looptest_stub" '
+	if (.reply.line[0].stream | length) == 0 then
+		error("the capture holds no stream row")
+	elif .reply.line[0].stream[0].transport == "ice-dtls" then
+		error("the first stream row is already ice-dtls")
+	else
+		.reply.line[0].stream[0] += {remote_candidates: 0,
+					     remote_known: false}
+	end'
+schema_mutant_check \
+	'schema/an ice-dtls stream row without its remote ICE fields is refused' \
+	"$looptest_stub" '
+	if (.reply.line[0].stream | length) == 0 then
+		error("the capture holds no stream row")
+	else
+		.reply.line[0].stream[0] |= (.transport = "ice-dtls" |
+					     del(.remote_candidates, .remote_known))
+	end'
 check_eq 'looptest/the stub dump carries the three loop keys' '0 0 0' \
 	"$(printf '%s' "$looptest_stub" |
 		jq -r '.reply.line[0] | "\(.loop_mode) \(.loop_peer) \(.loop_delay_ms)"')"

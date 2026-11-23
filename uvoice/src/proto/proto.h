@@ -255,6 +255,7 @@ struct proto_line_event {
 		struct {
 			uint8_t what;		/* enum hal_transport_ev */
 			uint8_t state;		/* enum hal_ice_state */
+			uint16_t gen;		/* hal_ice_local.gen */
 		} transport;
 	} u;
 };

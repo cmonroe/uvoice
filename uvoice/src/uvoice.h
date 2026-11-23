@@ -311,7 +311,7 @@ void stub_ubus_attach(struct ubus_context *ctx);
 bool stub_transport_candidate(unsigned int line, unsigned int stream,
 			      const char *sdp);
 bool stub_transport_event(unsigned int line, unsigned int stream,
-			  unsigned int what, unsigned int state);
+			  unsigned int what, unsigned int state, int gen);
 #endif
 #endif
 

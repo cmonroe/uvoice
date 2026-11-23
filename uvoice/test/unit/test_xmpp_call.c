@@ -659,6 +659,7 @@ static void reset(void)
 		 "mypasswordmypasswordxx");
 	phf.ice_local.fp_hash = HAL_FP_SHA256;
 	memset(phf.ice_local.fp, 0xab, sizeof(phf.ice_local.fp));
+	phf.ice_local.gen = 1;
 
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.channels = CFG_CHANNEL_MAX;
@@ -680,6 +681,13 @@ static void reset(void)
 
 	xml_stream_reset(&parser);
 	xml_stream_feed(&parser, STREAM_OPEN, strlen(STREAM_OPEN));
+}
+
+/* A transport record of line 0, stream 0, from the agent that the fake
+ * backend holds now. */
+static void transport_now(unsigned int what, unsigned int state)
+{
+	xcall_transport_event(0, 0, what, state, phf.ice_local.gen);
 }
 
 /**
@@ -842,9 +850,8 @@ static void test_outbound(void)
 	CHECK(strstr(phf.candidate, "192.0.2.3 45664 typ srflx") != NULL);
 
 	CASE("the media comes up, a digit goes out as a telephone event");
-	xcall_transport_event(0, 0, HAL_TRANSPORT_EV_ICE_STATE,
-			      HAL_ICE_CONNECTED);
-	xcall_transport_event(0, 0, HAL_TRANSPORT_EV_DTLS_UP, 0);
+	transport_now(HAL_TRANSPORT_EV_ICE_STATE, HAL_ICE_CONNECTED);
+	transport_now(HAL_TRANSPORT_EV_DTLS_UP, 0);
 	CHECK(fake.timers == 0);
 	CHECK(xcall_dtmf(0, 0, '5', 100, false));
 	CHECK(phf.n[PHF_MEDIA_DTMF_SEND] == 1);
@@ -908,7 +915,7 @@ static void dtls_close_call(char *sid, size_t len)
 		 TRANSPORT_PEER("active") "</content></jingle></iq>", sid);
 	CHECK(rx(xml));
 	CHECK(cbl.answered == 1);
-	xcall_transport_event(0, 0, HAL_TRANSPORT_EV_DTLS_UP, 0);
+	transport_now(HAL_TRANSPORT_EV_DTLS_UP, 0);
 	CHECK(fake.timers == 0);
 }
 
@@ -925,7 +932,7 @@ static void test_dtls_close(void)
 	CASE("a close of the media waits for the session-terminate of the peer");
 	dtls_close_call(sid, sizeof(sid));
 	fake.sends = 0;
-	xcall_transport_event(0, 0, HAL_TRANSPORT_EV_DTLS_CLOSED, 0);
+	transport_now(HAL_TRANSPORT_EV_DTLS_CLOSED, 0);
 	CHECK(fake.timers == 1);
 	CHECK(fake.sends == 0);
 	CHECK(cbl.remote_bye == 0);
@@ -945,8 +952,8 @@ static void test_dtls_close(void)
 
 	CASE("a close of the media without a session-terminate ends the call");
 	dtls_close_call(sid, sizeof(sid));
-	xcall_transport_event(0, 0, HAL_TRANSPORT_EV_DTLS_CLOSED, 0);
-	xcall_transport_event(0, 0, HAL_TRANSPORT_EV_DTLS_CLOSED, 0);
+	transport_now(HAL_TRANSPORT_EV_DTLS_CLOSED, 0);
+	transport_now(HAL_TRANSPORT_EV_DTLS_CLOSED, 0);
 	CHECK(fake.timers == 1);
 	advance(XCALL_CLOSE_MS);
 	CHECK(sent_find("<success/>") != NULL);
@@ -955,6 +962,69 @@ static void test_dtls_close(void)
 	CHECK(cbl.failed == 0);
 	CHECK(cbl.ended == 1 && !cbl.ended_info.failed);
 	CHECK(cbl.ended_info.cleared);
+	CHECK(!xcalls_line_busy(0));
+}
+
+/**
+ * test_transport_gen() - a record of the agent of an earlier call in the slot
+ *
+ * The backend can queue a record of an agent before the stream stops. The
+ * record can reach the legs after a new call took the same slot and a new
+ * agent. Its generation differs from the one the new leg read, so it changes
+ * nothing.
+ */
+static void test_transport_gen(void)
+{
+	char sid[JINGLE_SID_MAX];
+	char xml[2048];
+	uint16_t old_gen;
+
+	reset();
+	old_gen = phf.ice_local.gen;
+	dtls_close_call(sid, sizeof(sid));
+	CHECK(xcall_hangup(0, 0));
+	CHECK(!xcalls_line_busy(0));
+	phf.ice_local.gen = (uint16_t)(old_gen + 1);
+
+	CASE("an old record before the new leg programs its stream changes "
+	     "nothing");
+	CHECK(xcall_dial(0, 0, PEER_BARE));
+	CHECK(sid_take(sid, sizeof(sid)));
+	xcall_transport_event(0, 0, HAL_TRANSPORT_EV_DTLS_FAIL, 0, old_gen);
+	CHECK(xcalls_line_busy(0));
+	CHECK(cbl.failed == 0);
+
+	snprintf(xml, sizeof(xml), "<message from='" PEER "' type='chat'>"
+		 "<proceed xmlns='" JMI_NS "' id='%s'/></message>", sid);
+	CHECK(rx(xml));
+	snprintf(xml, sizeof(xml), "<iq from='" PEER "' type='set' id='a2'>"
+		 "<jingle xmlns='" JINGLE_NS "' action='session-accept' "
+		 "sid='%s'><content creator='initiator' name='audio'>" DESC_PEER
+		 TRANSPORT_PEER("active") "</content></jingle></iq>", sid);
+	CHECK(rx(xml));
+	CHECK(cbl.answered == 2);
+	CHECK(fake.timers == 1);
+
+	CASE("an old record after the new leg took its agent changes nothing");
+	fake.sends = 0;
+	xcall_transport_event(0, 0, HAL_TRANSPORT_EV_DTLS_UP, 0, old_gen);
+	CHECK(fake.timers == 1);
+	xcall_transport_event(0, 0, HAL_TRANSPORT_EV_DTLS_FAIL, 0, old_gen);
+	xcall_transport_event(0, 0, HAL_TRANSPORT_EV_ICE_STATE, HAL_ICE_FAILED,
+			      old_gen);
+	xcall_transport_event(0, 0, HAL_TRANSPORT_EV_DTLS_CLOSED, 0, old_gen);
+	CHECK(fake.timers == 1);
+	CHECK(fake.sends == 0);
+	CHECK(fake.relay_missing == 0);
+	CHECK(cbl.failed == 0);
+	CHECK(xcalls_line_busy(0));
+
+	CASE("a record of the agent of the new leg still moves it");
+	transport_now(HAL_TRANSPORT_EV_DTLS_UP, 0);
+	CHECK(fake.timers == 0);
+	transport_now(HAL_TRANSPORT_EV_DTLS_FAIL, 0);
+	CHECK(sent_find("<security-error/>") != NULL);
+	CHECK(cbl.failed == 1);
 	CHECK(!xcalls_line_busy(0));
 }
 
@@ -1062,7 +1132,7 @@ static void test_outbound_refusals(void)
 		 TRANSPORT_PEER("active") "</content></jingle></iq>", sid);
 	CHECK(rx(xml));
 	CHECK(cbl.answered == 1);
-	xcall_transport_event(0, 0, HAL_TRANSPORT_EV_ICE_STATE, HAL_ICE_FAILED);
+	transport_now(HAL_TRANSPORT_EV_ICE_STATE, HAL_ICE_FAILED);
 	CHECK(fake.relay_missing == 1);
 	CHECK(sent_find("<connectivity-error/>") != NULL);
 	CHECK(cbl.failed == 9);
@@ -1270,6 +1340,7 @@ int main(void)
 	test_outbound();
 	test_outbound_refusals();
 	test_dtls_close();
+	test_transport_gen();
 	test_inbound();
 	test_inbound_ends();
 

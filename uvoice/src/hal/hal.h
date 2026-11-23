@@ -963,12 +963,20 @@ struct hal_transport {
 	uint16_t port_max;
 };
 
-/* The local ICE identity of one stream (stream_ice_local_get). */
+/*
+ * The local ICE identity of one stream (stream_ice_local_get). gen is the
+ * generation of the ICE agent that holds the identity. Each new agent of a
+ * (line, stream) gets the next generation, and a backend skips 0 on wrap. The
+ * backend stamps every HAL_EVENT_TRANSPORT record of the agent with it
+ * (u.transport.gen), so a caller can tell a record of an earlier agent in the
+ * same slot. 0 says the backend keeps no generation.
+ */
 struct hal_ice_local {
 	char ufrag[HAL_ICE_UFRAG_MAX];
 	char pwd[HAL_ICE_PWD_MAX];
 	uint8_t fp_hash;		/* enum hal_fp_hash */
 	uint8_t fp[HAL_FP_MAX];
+	uint16_t gen;
 };
 
 /* The DTLS certificate fingerprint of a backend (transport_fingerprint_get). */
@@ -1985,6 +1993,9 @@ struct hal_event {
 			uint8_t what;		/* enum hal_transport_ev */
 			uint8_t state;		/* enum hal_ice_state on
 						 * ICE_STATE, else 0 */
+			uint16_t gen;		/* hal_ice_local.gen of the
+						 * agent that made the record,
+						 * 0 for no generation */
 		} transport;
 	} u;
 };
