@@ -491,13 +491,14 @@ static void simple_expect(const char *iso3, enum udsp_tone tone, uint16_t hz,
  * The national number unobtainable tone of each shipped file. USA plays its
  * reorder tone. The other files take the tone from the E.180 annex of ITU
  * Operational Bulletin No. 781 (1 February 2003); ETS and SRB have no such
- * row, so they play their special information tone.
+ * row, so they play their special information tone. NZL takes the 75 ms
+ * bursts of TNA 102 section 8.1 in place of the 0.75 s of its OB 781 row.
  */
 static void unobtainable_golden_test(void)
 {
 	static const struct udsp_cadence aus[] = { { 2500, 500 } };
 	static const struct udsp_cadence nzl[] = {
-		{ 750, 100 }, { 750, 100 }, { 750, 100 }, { 750, 400 },
+		{ 75, 100 }, { 75, 100 }, { 75, 100 }, { 75, 400 },
 	};
 	static const struct segment_want sit[] = {
 		{ { 950 }, 1, -10, 330 },
@@ -553,8 +554,8 @@ static void unobtainable_golden_test(void)
 	CASE("AUS number unobtainable is 425 Hz at 2.5 s on 0.5 s off");
 	simple_expect("AUS", tone, 425, -13, aus, 1);
 
-	CASE("NZL number unobtainable is 3 x 750/100 ms, then 750/400 ms");
-	simple_expect("NZL", tone, 400, -9, nzl, 4);
+	CASE("NZL number unobtainable is 3 x 75/100 ms, then 75/400 ms");
+	simple_expect("NZL", tone, 400, -14, nzl, 4);
 
 	CASE("AUT number unobtainable is the 950, 1400 and 1800 Hz triple");
 	segments_expect("AUT", tone, sit, 3, 1000);
@@ -574,7 +575,7 @@ static void ob781_golden_test(void)
 	};
 	static const struct udsp_cadence srb_special[] = { { 500, 50 } };
 	static const struct udsp_cadence nzl_nu[] = {
-		{ 750, 100 }, { 750, 100 }, { 750, 100 }, { 750, 400 },
+		{ 75, 100 }, { 75, 100 }, { 75, 100 }, { 75, 400 },
 	};
 	const struct udsp_region_tone *t;
 	struct line_region_error err;
@@ -591,7 +592,7 @@ static void ob781_golden_test(void)
 	simple_expect("SRB", UDSP_TONE_STUTTER, 425, -10, srb_special, 1);
 
 	CASE("NZL sit plays the number unobtainable tone");
-	simple_expect("NZL", UDSP_TONE_SIT, 400, -9, nzl_nu, 4);
+	simple_expect("NZL", UDSP_TONE_SIT, 400, -14, nzl_nu, 4);
 
 	snprintf(path, sizeof(path), "%s/NZL.conf", region_dir);
 	memset(&r, 0, sizeof(r));
