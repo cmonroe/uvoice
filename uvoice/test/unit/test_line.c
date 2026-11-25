@@ -28,14 +28,6 @@
  * fire at 300 ms and must fire by 1300 ms, which checks the conversion from
  * seconds to milliseconds.
  *
- * The stub define is on. A cmake build with -DUVOICE_HAL=stub compiles every
- * suite with UVOICE_HAL_STUB (src/CMakeLists.txt add_definitions).
- * LINE_DIAL_TONE_DEFER_MS is therefore 0, and the dial tone defer itself is
- * invisible in this build. The defer cases check the class through
- * line_tone_is_dial() instead. src/CMakeLists.txt adds the stub define only
- * for the stub backend. The timing half therefore compiles only in a build
- * with the udsp backend.
- *
  * State is read through the dump. The line array is static to line/line.c, so a
  * case reads the machine state through lines_status_dump(). That also keeps the
  * status keys under test.
@@ -2503,16 +2495,11 @@ static void cw_cid_pump(void)
 #define DIGIT_STEP_LATE_MS	150
 
 /*
- * LINE_DIAL_TONE_DEFER_MS plus a margin, for a case that waits for a dial
- * class tone or checks that none leaves. The window covers the defer of the
- * non-stub build. The stub build compiles the defer to 0, so a tone leaves
- * inside the event and one loop pass proves its arrival or its absence.
+ * For a case that waits for a dial class tone or checks that none leaves. A
+ * dial tone with no confirm tone in front of it leaves inside the event, so
+ * one loop pass proves its arrival or its absence.
  */
-#ifdef UVOICE_HAL_STUB
 #define DIAL_TONE_PUMP_MS	50
-#else
-#define DIAL_TONE_PUMP_MS	700
-#endif
 
 /* ------------------------------------------------------------- the fixture */
 
@@ -2889,21 +2876,13 @@ static void t_hook_intake(void)
 
 	CASE("the detector is armed BEFORE any tone reaches the line");
 	CHECK(hop_index(H_CHAN_CFG) == 0);
-#ifdef UVOICE_HAL_STUB
-	/* the stub defer is 0 ms, so the tone lands in the same event, still
-	 * behind the detector */
-	CHECK(hop_index(H_TONE) > 0);
-#else
-	CHECK_UINT(hop_count(H_TONE), 0);
-#endif
 
-	CASE("the dial tone is deferred, not dropped");
-	uloop_pump(DIAL_TONE_PUMP_MS);
-	CHECK(hop_has(H_TONE));
+	CASE("the dial tone leaves in the seize event, behind the detector");
+	CHECK(hop_index(H_TONE) > 0);
 	CHECK_UINT(hop_last(H_TONE)->val, HAL_TONE_DIAL);
 	CHECK_UINT(hop_last(H_TONE)->line, 0);
 
-	CASE("a release before the deferred tone cancels it");
+	CASE("a release leaves no dial tone behind");
 	inject_hook(0, HAL_HOOK_RELEASE, 0);
 	inject_hook(0, HAL_HOOK_SEIZE, 0);
 	inject_hook(0, HAL_HOOK_RELEASE, 0);
@@ -6462,11 +6441,7 @@ static void t_inject(void)
 		   HAL_DETECT_DTMF | HAL_DETECT_PULSE | HAL_DETECT_MODEM);
 	CHECK(hop_index(H_CHAN_CFG) == 0);
 
-	/* the tone rides LINE_DIAL_TONE_DEFER_MS, which the stub build compiles
-	 * to 0, so the case pins the order the rule is about and lets the pump
-	 * cover both windows */
 	CASE("an injected seize plays the dial tone, behind the detector");
-	uloop_pump(DIAL_TONE_PUMP_MS);
 	CHECK(hop_has(H_TONE));
 	CHECK_UINT(hop_last(H_TONE)->val, HAL_TONE_DIAL);
 	CHECK(hop_index(H_TONE) > hop_index(H_CHAN_CFG));
@@ -7559,8 +7534,8 @@ static void t_region(void)
 
 /*
  * The tone the subscriber asked for before the DSP had a tone table. The
- * region job can take seconds and the dial tone defer is half a second, so
- * the request has to survive until the profiles exist.
+ * region job can take seconds and the dial tone is due at the seize, so the
+ * request has to survive until the profiles exist.
  */
 static void t_tone_replay(void)
 {
@@ -7578,7 +7553,7 @@ static void t_tone_replay(void)
 	CASE("the replay consumes the record, so nothing repeats it");
 	hops_reset();
 	uloop_pump(DIAL_TONE_PUMP_MS);
-	CHECK(hop_count(H_TONE) <= 1);		/* at most the deferred original */
+	CHECK_UINT(hop_count(H_TONE), 0);
 
 	CASE("a handset back on hook before the region lands gets no replay");
 	cfg_default();
@@ -8123,9 +8098,6 @@ static void t_features(void)
 	inject_digits(0, "*43");
 	CHECK(state_is(0, "COLLECTING"));
 
-	/* the confirmation is immediate, the dial tone behind it takes the same
-	 * defer every OFFHOOK_DIAL entry takes, so the order is asserted rather
-	 * than the timing */
 	CASE("the completed code confirms");
 	hops_reset();
 	inject_digit(0, '#', false);
@@ -9410,15 +9382,6 @@ static void t_xfer(void)
 	hops_reset();
 	rec_cb.xfer_done(0, 0, true, 202);
 	CHECK(state_is(0, "OFFHOOK_DIAL"));
-#ifdef UVOICE_HAL_STUB
-	CHECK_UINT(hop_last(H_TONE)->val, HAL_TONE_DIAL);
-#else
-	/* line/line.c tone_set(): a dial class tone waits
-	 * LINE_DIAL_TONE_DEFER_MS on every real HAL, so no tone leaves in this
-	 * event */
-	CHECK_UINT(hop_count(H_TONE), 0);
-#endif
-	uloop_pump(DIAL_TONE_PUMP_MS);
 	CHECK_UINT(hop_last(H_TONE)->val, HAL_TONE_DIAL);
 	CHECK_UINT(hop_last(H_TONE)->line, 0);
 
@@ -18246,16 +18209,7 @@ static void t_mwi(void)
 	CHECK_UINT(hop_last(H_TONE)->val, HAL_TONE_STUTTER);
 	inject_hook(0, HAL_HOOK_RELEASE, 0);
 
-	/*
-	 * The first digit, pinned as a class. The deferral itself is invisible
-	 * in this build: cmake compiles every suite with UVOICE_HAL_STUB, which
-	 * sets LINE_DIAL_TONE_DEFER_MS to 0, so the two branches of tone_set()
-	 * do the same thing here. The class is what decides, and line/line.h
-	 * exports it for exactly that reason. src/CMakeLists.txt adds the stub
-	 * define only for the stub backend, so the timing half compiles only in
-	 * a build with the udsp backend.
-	 */
-	CASE("the stutter belongs to the first dial tone class, which waits for the detector");
+	CASE("the stutter belongs to the first dial tone class");
 	CHECK(line_tone_is_dial(HAL_TONE_STUTTER));
 	CHECK(line_tone_is_dial(HAL_TONE_DIAL));
 	CHECK(!line_tone_is_dial(HAL_TONE_RINGBACK));
@@ -18263,14 +18217,7 @@ static void t_mwi(void)
 	CHECK(!line_tone_is_dial(HAL_TONE_CALL_WAITING));
 	CHECK(!line_tone_is_dial(HAL_TONE_NONE));
 
-	/*
-	 * The first digit. The stutter takes the same detector defer the plain
-	 * dial tone takes, so nothing reaches the line inside the seize event
-	 * and a digit dialled during that window still reaches the machine.
-	 * Without the defer the tone leaves before the detector is armed and
-	 * the first digit of every line with a message is lost.
-	 */
-	CASE("the stutter is deferred like the dial tone, so the first digit survives");
+	CASE("the stutter leaves behind the detector, so the first digit survives");
 	cfg_default();
 	fixture_start();
 	region_ready();
@@ -18279,25 +18226,20 @@ static void t_mwi(void)
 	inject_hook(0, HAL_HOOK_SEIZE, 0);
 	CHECK(hop_has(H_CHAN_CFG));
 	CHECK(hop_index(H_CHAN_CFG) == 0);
-#ifdef UVOICE_HAL_STUB
 	CHECK(hop_index(H_TONE) > 0);
-#else
-	CHECK_UINT(hop_count(H_TONE), 0);
-#endif
 	inject_digit(0, '5', false);
 	CHECK(state_is(0, "COLLECTING"));
 	view_get(0, &v);
 	CHECK(strcmp(v.digits, "5") == 0);
 	inject_hook(0, HAL_HOOK_RELEASE, 0);
 
-	CASE("the deferred stutter reaches the line when the window ends");
+	CASE("the stutter reaches the line in the seize event");
 	cfg_default();
 	fixture_start();
 	region_ready();
 	mwi_notify(0, true, 1, 0);
 	hops_reset();
 	inject_hook(0, HAL_HOOK_SEIZE, 0);
-	uloop_pump(DIAL_TONE_PUMP_MS);
 	CHECK(hop_has(H_TONE));
 	CHECK_UINT(hop_last(H_TONE)->val, HAL_TONE_STUTTER);
 	inject_hook(0, HAL_HOOK_RELEASE, 0);

@@ -20,10 +20,9 @@
  * tone plus type 2 CID), the message waiting store and its visual record, the
  * forward disconnect signal, the service state of every line, and the
  * detector-before-dial-tone ordering: channel_config_set with the
- * HAL_DETECT_DTMF and HAL_DETECT_PULSE bits runs on seize before the dial
- * tone op, deferred by LINE_DIAL_TONE_DEFER_MS, 0 for the stub and 500 on
- * hardware, so the first digit is never lost. A dial tone behind a star code
- * confirm tone waits for the region length of that tone instead
+ * HAL_DETECT_DTMF and HAL_DETECT_PULSE bits runs on seize and returns before
+ * the dial tone op, so the first digit is never lost. A dial tone behind a
+ * star code confirm tone waits for the region length of that tone
  * (line/line.c dial_tone_set()).
  *
  * A line whose channel is disabled or absent is out of service: the protocol
@@ -167,16 +166,9 @@ enum line_inject line_inject_dial(unsigned int line, const char *number,
 
 /*
  * Whether a tone belongs to the first dial tone class, which is the class that
- * waits for the digit detector before it reaches the line. Both members
- * qualify: the message waiting stutter is a dial tone the subscriber dials over
- * exactly like the plain one in OFFHOOK_DIAL, so a stutter that reached the
- * line inside the seize event would lose the first digit of every line that
- * holds a message.
- *
- * It is exported because the window beside it is a compile time constant that
- * the stub build sets to 0 (line/line.c, LINE_DIAL_TONE_DEFER_MS), which makes
- * the deferral itself unobservable in that build. The class is the half a suite
- * can pin whatever the constant says.
+ * waits for the end of a star code confirm tone before it reaches the line.
+ * Both members qualify: the message waiting stutter is a dial tone the
+ * subscriber dials over exactly like the plain one in OFFHOOK_DIAL.
  */
 bool line_tone_is_dial(enum hal_tone tone);
 

@@ -26,18 +26,6 @@
 #include "net/ports.h"
 #include "str.h"
 
-/*
- * The dial tone waits this long behind the start of digit collection, so the
- * detector is live before the subscriber hears the tone and the first digit
- * is not lost in OFFHOOK_DIAL. The stub has no detector to wait for, so the
- * stub suites see the tone in the same event.
- */
-#ifdef UVOICE_HAL_STUB
-#define LINE_DIAL_TONE_DEFER_MS	0
-#else
-#define LINE_DIAL_TONE_DEFER_MS	500
-#endif
-
 /* GR-30 type 1 CID sits in the silence after the first ring cycle, where the
  * FSK families put it; cid_after_ring() decides which do, and ring_first_bursts()
  * sets the break index to the first cycle burst count so the record lands after
@@ -140,8 +128,7 @@
  * sends digits faster than the line can ever play, so the newest digit goes.
  *
  * None of the five is compiled to 0 in the stub build, which is what lets the
- * timed cases prove the values (the LINE_DIAL_TONE_DEFER_MS precedent above
- * is not followed here).
+ * timed cases prove the values.
  */
 #define LINE_DIGIT_PLAY_MIN_MS		100
 #define LINE_DIGIT_PLAY_MAX_MS		500
@@ -441,7 +428,7 @@ static bool region_busy;
  * GR-506 flash window and the drop flash service the US seed carried, empty
  * templates (the built-in GR-506 table answers for them), no alert bound
  * (the fsm keeps its constant offer) and no confirm length (the dial tone
- * behind a confirm tone keeps LINE_DIAL_TONE_DEFER_MS). An empty iso3 means
+ * behind a confirm tone starts at once). An empty iso3 means
  * this default and nothing else: udsp_region_get refuses on an empty iso3, so
  * no read-back carries one. Two objects from one initializer, because a
  * static cannot initialize another and the status dump reads region_hal
@@ -2402,7 +2389,7 @@ static void dial_tone_expire(struct uloop_timeout *t)
 
 /*
  * Replay. The DSP tone profiles do not exist until region_apply completes,
- * and that job can take seconds while the dial tone defer is half a second,
+ * and that job can take seconds while the dial tone is due at the seize,
  * so a subscriber who lifts the handset during bring-up would hold a silent
  * line until the next transition asked for a tone again. The shell therefore
  * remembers the last tone requested while no region is applied, one slot per
@@ -2468,8 +2455,8 @@ static void confirm_start(struct line *l)
  *   - a confirm tone that repeats until stopped gets no dial tone, and the
  *     start-digit timer ends it;
  *   - a bound defers the dial tone to that length after the confirm start;
- *   - with no bound known, LINE_DIAL_TONE_DEFER_MS applies, as it does to
- *     every other dial tone.
+ *   - with no bound known, the dial tone starts at once, as every other
+ *     dial tone does.
  * False means that no dial tone plays. The library swaps its tone table before
  * region_done() takes the read-back, so a confirm tone that starts between the
  * two gets the length of the previous region.
@@ -2479,7 +2466,7 @@ static bool dial_tone_wait_get(const struct line *l, uint32_t *wait_ms)
 	uint32_t bound = l->confirm_total_ms;
 	uint32_t elapsed;
 
-	*wait_ms = LINE_DIAL_TONE_DEFER_MS;
+	*wait_ms = 0;
 	if (!l->confirm_on)
 		return true;
 	if (l->confirm_endless)
@@ -2517,8 +2504,8 @@ static enum hal_status dial_tone_set(struct line *l, enum hal_tone tone)
 
 /*
  * One tone request, for duration_ms (0 until stopped). A dial tone and the
- * confirm tone take their own lengths: the dial tone class waits for the
- * detector, and the confirm tone plays its region length.
+ * confirm tone take their own lengths: the dial tone class waits for the end
+ * of a confirm tone, and the confirm tone plays its region length.
  */
 static enum hal_status tone_set_ms(struct line *l, enum hal_tone tone,
 				   uint32_t duration_ms)
@@ -2526,13 +2513,6 @@ static enum hal_status tone_set_ms(struct line *l, enum hal_tone tone,
 	uloop_timeout_cancel(&l->dial_tone);
 	tone_pending_take(l, tone, duration_ms);
 
-	/*
-	 * The class is the exported predicate and the constant stays private:
-	 * the stub build compiles the constant to 0 on purpose, so a suite that
-	 * asserts the deferral proves nothing about which tones belong to the
-	 * class. The suite checks line_tone_is_dial() instead, which is the
-	 * half that decides.
-	 */
 	if (line_tone_is_dial(tone))
 		return dial_tone_set(l, tone);
 
